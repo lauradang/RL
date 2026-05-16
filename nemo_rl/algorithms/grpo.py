@@ -2481,8 +2481,6 @@ def async_grpo_train(
     from nemo_rl.algorithms.async_utils import (
         AsyncTrajectoryCollector,
         ReplayBuffer,
-        UnforcedAsyncTrajectoryCollector,
-        UnforcedReplayBuffer,
     )
 
     async_cfg = master_config.grpo["async_grpo"]
@@ -2543,17 +2541,6 @@ def async_grpo_train(
     print(f"   - train_global_batch_size: {train_gbs}")
     print(f"   - min_trajectories_needed: {min_trajectories_needed} (async mode)")
 
-    if lag_mode == "unforced":
-        replay_buffer_cls = UnforcedReplayBuffer
-        collector_cls = UnforcedAsyncTrajectoryCollector
-    else:
-        replay_buffer_cls = ReplayBuffer
-        collector_cls = AsyncTrajectoryCollector
-
-    # Reuse the forced-lag FQNs for venv naming/lookup: the unforced and forced
-    # actors require an identical Python environment (same vLLM/workers), so
-    # sharing the venv directory avoids triggering a fresh `uv sync` for a new
-    # venv name (which would otherwise re-run the broken editable-vllm build).
     replay_buffer_fqn = "nemo_rl.algorithms.async_utils.ReplayBuffer"
     collector_fqn = "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
 
@@ -2607,8 +2594,9 @@ def async_grpo_train(
             f"(default would be (max_age+1)*P = {derived_parallel})"
         )
 
-    replay_buffer = replay_buffer_cls.options(runtime_env=_replay_runtime_env).remote(
-        max_size=optimal_buffer_size
+    replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
+        max_size=optimal_buffer_size,
+        lag_mode=lag_mode,
     )
 
     _tc_py_exec = get_actor_python_env(collector_fqn)
@@ -2637,13 +2625,14 @@ def async_grpo_train(
         task_to_env=task_to_env,
         master_config=master_config,
         replay_buffer=replay_buffer,
+        lag_mode=lag_mode,
         start_step=step,
     )
     if lag_mode == "unforced":
         collector_kwargs["num_parallel_generations"] = num_parallel_generations
 
     # Initialize trajectory collector with synchronized collection
-    trajectory_collector = collector_cls.options(
+    trajectory_collector = AsyncTrajectoryCollector.options(
         runtime_env=_tc_runtime_env
     ).remote(**collector_kwargs)
 

@@ -16,7 +16,12 @@ from typing import Any, Optional, Protocol
 
 
 class ReplayBufferProtocol(Protocol):
-    """Interface for the replay buffer used in async RL training."""
+    """Interface for the replay buffer used in async RL training.
+
+    The concrete `ReplayBuffer` class supports two `lag_mode` values
+    (``"forced"`` and ``"unforced"``); this protocol covers the surface area
+    used by the trajectory collector and trainer in either mode.
+    """
 
     def add(
         self,
@@ -29,9 +34,10 @@ class ReplayBufferProtocol(Protocol):
         Args:
             trajectory: data dict
             weight_version: version of the model weights used for generation
-            target_weight_version: version of the model weights this trajectory is intended for training.
-                Required by forced-lag buffers; ignored by unforced-lag (FIFO) buffers, which
-                accept `None` to support a uniform collector contract.
+            target_weight_version: version of the model weights this trajectory
+                is intended for training. Required when the buffer is in
+                ``lag_mode="forced"``; ignored in ``lag_mode="unforced"``,
+                which stamps trajectories only with ``weight_version``.
         """
         ...
 
@@ -41,15 +47,20 @@ class ReplayBufferProtocol(Protocol):
         current_weight_version: int,
         max_age_steps: int,
     ) -> Optional[dict[str, Any]]:
-        """Sample per-prompt trajectory groups intended for the current training step.
+        """Sample per-prompt trajectory groups for the current training step.
 
-        Only returns trajectories with target_weight_version == current_weight_version.
-        If insufficient trajectories are available, returns None to stall training
-        until the remaining trajectories are generated. This ensures no trajectory
-        loses its last chance to be used for its intended training step.
+        Behaviour depends on the buffer's ``lag_mode``:
+
+        - Forced lag: returns trajectories whose ``target_weight_version``
+          matches ``current_weight_version``; otherwise stalls (returns
+          ``None``) so no trajectory loses its last-chance step.
+        - Unforced lag: pops the oldest ``num_prompt_groups`` trajectories in
+          FIFO order, lazily evicting any older than
+          ``current_weight_version - max_age_steps``.
 
         Returns:
-            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
+            Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or
+            ``None`` if insufficient data is available.
         """
         ...
 
