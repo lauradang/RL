@@ -44,15 +44,21 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         self,
         trajectory: dict[str, Any],
         weight_version: int,
-        target_weight_version: int,
+        target_weight_version: Optional[int] = None,
     ) -> str:
         """Add a per-prompt trajectory group with metadata.
 
         Args:
             trajectory: data dict
             weight_version: version of the model weights used for generation
-            target_weight_version: version of the model weights this trajectory is intended for training
+            target_weight_version: version of the model weights this trajectory is intended for training.
+                Required for the forced-lag buffer.
         """
+        if target_weight_version is None:
+            raise ValueError(
+                "ReplayBuffer (forced lag) requires `target_weight_version`. "
+                "Use `UnforcedReplayBuffer` for FIFO/unforced-lag mode."
+            )
         with self._lock:
             if len(self.trajectories) >= self.max_size:
                 return "full"
@@ -233,6 +239,143 @@ class ReplayBuffer(ReplayBufferImpl):
     pass
 
 
+class UnforcedReplayBufferImpl(ReplayBufferProtocol):
+    """FIFO replay buffer for unforced-lag async GRPO.
+
+    Stores per-prompt trajectory groups stamped only with the generation
+    `weight_version`. Trajectories are not pre-assigned to a particular
+    training step; the trainer consumes them FIFO. Trajectories older than
+    `current_weight_version - max_age_steps` are evicted at sample time.
+
+    This mirrors Megatron-LM's `enforce_order=False` / unforced-lag path in
+    `megatron/rl/agent/api.py`.
+    """
+
+    def __init__(self, max_size: int):
+        if max_size <= 0:
+            raise ValueError(f"max_size must be positive, got {max_size}")
+        self.max_size = max_size
+        self.trajectories: list[dict[str, Any]] = []
+        self.trajectory_versions: list[int] = []
+        self._lock = _threading.Lock()
+
+    def add(
+        self,
+        trajectory: dict[str, Any],
+        weight_version: int,
+        target_weight_version: Optional[int] = None,
+    ) -> str:
+        """Append a trajectory in FIFO order. `target_weight_version` is ignored."""
+        with self._lock:
+            if len(self.trajectories) >= self.max_size:
+                return "full"
+
+            self.trajectories.append(trajectory)
+            self.trajectory_versions.append(weight_version)
+            print(
+                f"🔍 UnforcedReplayBuffer.add: size={len(self.trajectories)}, "
+                f"weight_version={weight_version}, "
+                f"versions_in_buffer={self.trajectory_versions}"
+            )
+            return "success"
+
+    def get_debug_info(self) -> dict:
+        """Get debug information about buffer state."""
+        return {
+            "total_trajectories": len(self.trajectories),
+            "trajectory_versions": list(self.trajectory_versions),
+            "target_weight_versions": [],
+            "max_size": self.max_size,
+        }
+
+    def get_last_target_weight_already_generated(self) -> int:
+        return -1
+
+    def get_existing_target_weights(self) -> set[int]:
+        return set()
+
+    def sample(
+        self,
+        num_prompt_groups: int,
+        current_weight_version: int,
+        max_age_steps: int,
+    ) -> Optional[dict[str, Any]]:
+        """Pop the oldest `num_prompt_groups` valid trajectories in FIFO order.
+
+        Trajectories with `weight_version < current_weight_version - max_age_steps`
+        are evicted before sampling. Returns `None` (stall) if fewer than
+        `num_prompt_groups` valid trajectories remain.
+        """
+        with self._lock:
+            min_valid_version = max(0, current_weight_version - max_age_steps)
+
+            evicted = 0
+            while self.trajectory_versions and self.trajectory_versions[0] < min_valid_version:
+                self.trajectories.pop(0)
+                self.trajectory_versions.pop(0)
+                evicted += 1
+            if evicted:
+                print(
+                    f"🗑️ UnforcedReplayBuffer evicted {evicted} stale trajectories "
+                    f"(older than weight_version {min_valid_version})"
+                )
+
+            available = len(self.trajectories)
+            print(
+                f"🔍 UnforcedReplayBuffer.sample: requested={num_prompt_groups}, "
+                f"available={available}, current_weight_version={current_weight_version}, "
+                f"max_age_steps={max_age_steps}, min_valid_version={min_valid_version}"
+            )
+
+            if available < num_prompt_groups:
+                print(
+                    f"   ⏸️ STALLING: have {available}, need {num_prompt_groups}"
+                )
+                return None
+
+            sampled_trajectories = self.trajectories[:num_prompt_groups]
+            sampled_versions = self.trajectory_versions[:num_prompt_groups]
+            del self.trajectories[:num_prompt_groups]
+            del self.trajectory_versions[:num_prompt_groups]
+
+            avg_trajectory_age = current_weight_version - (
+                sum(sampled_versions) / len(sampled_versions)
+            )
+
+            from collections import Counter
+
+            print(
+                f"   ✅ Sampled FIFO counts by generation weight-version: "
+                f"{Counter(sampled_versions)}"
+            )
+            print(
+                f"📊 Average trajectory age: {avg_trajectory_age:.2f} steps "
+                f"(buffer size now: {len(self.trajectories)})"
+            )
+
+            return {
+                "trajectories": sampled_trajectories,
+                "avg_trajectory_age": avg_trajectory_age,
+            }
+
+    def evict(self) -> None:
+        """No-op: eviction happens lazily at sample time."""
+        pass
+
+    def size(self) -> int:
+        with self._lock:
+            return len(self.trajectories)
+
+    def clear(self) -> None:
+        with self._lock:
+            self.trajectories.clear()
+            self.trajectory_versions.clear()
+
+
 @ray.remote  # pragma: no cover
-class ReplayBufferNew(ReplayBufferImpl):
+class UnforcedReplayBuffer(UnforcedReplayBufferImpl):
     pass
+
+
+# Kept for backward compatibility with existing imports.
+ReplayBufferNew = UnforcedReplayBuffer

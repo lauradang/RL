@@ -17,7 +17,7 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, Literal, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -120,6 +120,20 @@ class AsyncGRPOConfig(TypedDict):
     in_flight_weight_updates: NotRequired[bool]
     # Recomputes the KV cache after the in-flight weight updates.
     recompute_kv_cache_after_weight_updates: NotRequired[bool]
+    # Selects how trajectory lag is managed.
+    # - "forced" (default, current behaviour): each prompt batch is reserved for
+    #   a specific future training step at generation time, and the trainer
+    #   stalls until trajectories tagged for the current step are ready. This
+    #   matches Megatron-LM's `--rl-num-parallel-generation-batches=L+1` mode.
+    # - "unforced": trajectories are not pre-assigned to a target step. The
+    #   collector keeps up to `num_parallel_generations` rollouts in flight and
+    #   the trainer consumes them FIFO subject to `max_trajectory_age_steps`.
+    #   Matches Megatron-LM's `--rl-num-parallel-generations=(L+1)*P*G` mode.
+    lag_mode: NotRequired[Literal["forced", "unforced"]]
+    # Only used when `lag_mode == "unforced"`. Caps the number of in-flight
+    # rollouts (in rollout units, i.e. prompt-groups). When unset, defaults to
+    # `(max_trajectory_age_steps + 1) * num_prompts_per_step`.
+    num_parallel_generations: NotRequired[int]
 
 
 class AdvEstimatorConfig(TypedDict):
@@ -2464,7 +2478,20 @@ def async_grpo_train(
             )
 
     # Import async utilities only when needed
-    from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+    from nemo_rl.algorithms.async_utils import (
+        AsyncTrajectoryCollector,
+        ReplayBuffer,
+        UnforcedAsyncTrajectoryCollector,
+        UnforcedReplayBuffer,
+    )
+
+    async_cfg = master_config.grpo["async_grpo"]
+    lag_mode = async_cfg.get("lag_mode", "forced")
+    if lag_mode not in ("forced", "unforced"):
+        raise ValueError(
+            f"Unknown async_grpo.lag_mode={lag_mode!r}; expected 'forced' or 'unforced'."
+        )
+    print(f"📐 Async GRPO lag mode: {lag_mode}")
 
     timer = Timer()
     timeout = TimeoutChecker(
@@ -2516,14 +2543,26 @@ def async_grpo_train(
     print(f"   - train_global_batch_size: {train_gbs}")
     print(f"   - min_trajectories_needed: {min_trajectories_needed} (async mode)")
 
-    _replay_py_exec = get_actor_python_env(
-        "nemo_rl.algorithms.async_utils.ReplayBuffer"
-    )
+    if lag_mode == "unforced":
+        replay_buffer_cls = UnforcedReplayBuffer
+        collector_cls = UnforcedAsyncTrajectoryCollector
+    else:
+        replay_buffer_cls = ReplayBuffer
+        collector_cls = AsyncTrajectoryCollector
+
+    # Reuse the forced-lag FQNs for venv naming/lookup: the unforced and forced
+    # actors require an identical Python environment (same vLLM/workers), so
+    # sharing the venv directory avoids triggering a fresh `uv sync` for a new
+    # venv name (which would otherwise re-run the broken editable-vllm build).
+    replay_buffer_fqn = "nemo_rl.algorithms.async_utils.ReplayBuffer"
+    collector_fqn = "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
+
+    _replay_py_exec = get_actor_python_env(replay_buffer_fqn)
     if _replay_py_exec.startswith("uv"):
         # Lazily build a dedicated venv across all Ray nodes on-demand.
         _replay_py_exec = create_local_venv_on_each_node(
             _replay_py_exec,
-            "nemo_rl.algorithms.async_utils.ReplayBuffer",
+            replay_buffer_fqn,
         )
 
     _replay_py_venv = os.path.dirname(
@@ -2547,18 +2586,36 @@ def async_grpo_train(
     optimal_buffer_size = (
         num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
     )
+    if lag_mode == "unforced":
+        # In unforced mode the in-flight cap (num_parallel_generations) bounds how
+        # much can sit in the buffer; size the buffer to hold (cap + slack) entries
+        # so that "full" backpressure only fires when truly saturated.
+        derived_parallel = (max_trajectory_age_steps + 1) * num_prompts_per_step
+        num_parallel_generations = async_cfg.get(
+            "num_parallel_generations", derived_parallel
+        )
+        if num_parallel_generations <= 0:
+            raise ValueError(
+                f"async_grpo.num_parallel_generations must be positive, got {num_parallel_generations}"
+            )
+        optimal_buffer_size = max(
+            optimal_buffer_size,
+            num_parallel_generations + num_prompts_per_step,
+        )
+        print(
+            f"📐 Unforced lag: num_parallel_generations={num_parallel_generations} "
+            f"(default would be (max_age+1)*P = {derived_parallel})"
+        )
 
-    replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
+    replay_buffer = replay_buffer_cls.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size
     )
 
-    _tc_py_exec = get_actor_python_env(
-        "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
-    )
+    _tc_py_exec = get_actor_python_env(collector_fqn)
     if _tc_py_exec.startswith("uv"):
         _tc_py_exec = create_local_venv_on_each_node(
             _tc_py_exec,
-            "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
+            collector_fqn,
         )
 
     _tc_py_venv = os.path.dirname(
@@ -2574,10 +2631,7 @@ def async_grpo_train(
         },
     }
 
-    # Initialize trajectory collector with synchronized collection
-    trajectory_collector = AsyncTrajectoryCollector.options(
-        runtime_env=_tc_runtime_env
-    ).remote(
+    collector_kwargs = dict(
         policy_generation=policy_generation,
         tokenizer=tokenizer,
         task_to_env=task_to_env,
@@ -2585,6 +2639,13 @@ def async_grpo_train(
         replay_buffer=replay_buffer,
         start_step=step,
     )
+    if lag_mode == "unforced":
+        collector_kwargs["num_parallel_generations"] = num_parallel_generations
+
+    # Initialize trajectory collector with synchronized collection
+    trajectory_collector = collector_cls.options(
+        runtime_env=_tc_runtime_env
+    ).remote(**collector_kwargs)
 
     # Start trajectory collection in background
     collection_task = trajectory_collector.start_collection.remote(dataloader)
@@ -2595,7 +2656,8 @@ def async_grpo_train(
     print("📦 Started continuous background trajectory collection")
 
     print(
-        f"🚀 Starting async GRPO training with buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
+        f"🚀 Starting async GRPO training with lag_mode={lag_mode}, "
+        f"buffer_size={optimal_buffer_size}, max_age={max_trajectory_age_steps} steps"
     )
 
     print("⏳ Preparing policy generation for training...")
