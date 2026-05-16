@@ -22,14 +22,16 @@ class ReplayBufferProtocol(Protocol):
         self,
         trajectory: dict[str, Any],
         weight_version: int,
-        target_weight_version: int,
+        target_weight_version: Optional[int] = None,
     ) -> str:
         """Add a per-prompt trajectory group with metadata.
 
         Args:
             trajectory: data dict
             weight_version: version of the model weights used for generation
-            target_weight_version: version of the model weights this trajectory is intended for training
+            target_weight_version: version of the model weights this trajectory is intended for training.
+                Required by forced-lag buffers; ignored by unforced-lag (FIFO) buffers, which
+                accept `None` to support a uniform collector contract.
         """
         ...
 
