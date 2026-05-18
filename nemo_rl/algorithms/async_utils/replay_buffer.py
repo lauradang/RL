@@ -396,12 +396,19 @@ class UnforcedReplayBufferImpl(ReplayBufferProtocol):
         with self._lock:
             min_valid_version = max(0, current_weight_version - max_age_steps)
 
-            evicted = 0
-            while self.trajectory_versions and self.trajectory_versions[0] < min_valid_version:
-                self.trajectories.pop(0)
-                self.trajectory_versions.pop(0)
-                evicted += 1
+            # Evict ALL stale entries, not just from the front. With
+            # in_flight_weight_updates, faster rollouts can land ahead of slower
+            # ones started at older weight versions, so stale entries can appear
+            # anywhere in the FIFO queue.
+            valid_pairs = [
+                (t, v)
+                for t, v in zip(self.trajectories, self.trajectory_versions)
+                if v >= min_valid_version
+            ]
+            evicted = len(self.trajectories) - len(valid_pairs)
             if evicted:
+                self.trajectories = [p[0] for p in valid_pairs]
+                self.trajectory_versions = [p[1] for p in valid_pairs]
                 print(
                     f"🗑️ UnforcedReplayBuffer evicted {evicted} stale trajectories "
                     f"(older than weight_version {min_valid_version})"
