@@ -2590,7 +2590,7 @@ def async_grpo_train(
         # In unforced mode the in-flight cap (num_parallel_generations) bounds how
         # much can sit in the buffer; size the buffer to hold (cap + slack) entries
         # so that "full" backpressure only fires when truly saturated.
-        derived_parallel = (max_trajectory_age_steps + 1) * num_prompts_per_step
+        derived_parallel = max_trajectory_age_steps * num_prompts_per_step
         num_parallel_generations = async_cfg.get(
             "num_parallel_generations", derived_parallel
         )
@@ -2604,7 +2604,7 @@ def async_grpo_train(
         )
         print(
             f"📐 Unforced lag: num_parallel_generations={num_parallel_generations} "
-            f"(default would be (max_age+1)*P = {derived_parallel})"
+            f"(default would be max_age*P = {derived_parallel})"
         )
 
     replay_buffer = replay_buffer_cls.options(runtime_env=_replay_runtime_env).remote(
