@@ -32,7 +32,10 @@ from nemo_rl.algorithms.async_utils import (
     AsyncTrajectoryCollector,
     ReplayBuffer,
 )
-from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferNew
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    ReplayBufferNew,
+    UnforcedReplayBufferImpl,
+)
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
     add_grpo_token_loss_masks_and_generation_logprobs,
@@ -510,6 +513,81 @@ class TestReplayBufferNew:
 
         assert ray.get(buf.size.remote()) == 1
         ray.kill(buf)
+
+
+class TestUnforcedReplayBuffer:
+    """Tests for UnforcedReplayBufferImpl (unforced-lag FIFO buffer)."""
+
+    def _traj(self):
+        return {"batch": {}, "rollout_metrics": {}, "timestamp": 0.0}
+
+    def test_eviction_removes_stale_entries_from_entire_buffer(self):
+        """Out-of-order arrivals must not let stale entries survive past the front.
+
+        With in_flight_weight_updates, a fast rollout from weight N+1 can land
+        in the buffer before a slow rollout from weight N-3. The previous
+        front-only eviction loop would stop at the valid N+1 entry and leave
+        the stale N-3 entry buried at index 1 to be sampled.
+        """
+        buf = UnforcedReplayBufferImpl(max_size=10)
+
+        # Out-of-order arrivals: fast rollout at weight 5 lands before slow one at weight 2
+        buf.add(self._traj(), weight_version=5)  # valid at step 7 (age=2)
+        buf.add(self._traj(), weight_version=2)  # STALE at step 7 (age=5 > max_age=2)
+        buf.add(self._traj(), weight_version=6)  # valid at step 7 (age=1)
+        buf.add(self._traj(), weight_version=3)  # STALE at step 7 (age=4 > max_age=2)
+
+        # min_valid_version = 7 - 2 = 5; versions 2 and 3 must be evicted
+        result = buf.sample(num_prompt_groups=2, current_weight_version=7, max_age_steps=2)
+
+        assert result is not None, "Should return 2 valid trajectories"
+        assert len(result["trajectories"]) == 2
+        assert result["avg_trajectory_age"] <= 2.0, (
+            f"avg_trajectory_age={result['avg_trajectory_age']:.3f} exceeds max_age_steps=2; "
+            "stale trajectories were not fully evicted"
+        )
+        assert buf.size() == 0  # versions 5 and 6 sampled; 2 and 3 evicted
+
+    def test_eviction_still_works_when_stale_entries_are_at_front(self):
+        """Regression: eviction must also work for the ordinary in-order case."""
+        buf = UnforcedReplayBufferImpl(max_size=10)
+
+        buf.add(self._traj(), weight_version=1)  # stale at step 5 (age=4)
+        buf.add(self._traj(), weight_version=2)  # stale at step 5 (age=3)
+        buf.add(self._traj(), weight_version=4)  # valid (age=1)
+        buf.add(self._traj(), weight_version=5)  # valid (age=0)
+
+        result = buf.sample(num_prompt_groups=2, current_weight_version=5, max_age_steps=2)
+
+        assert result is not None
+        assert len(result["trajectories"]) == 2
+        assert result["avg_trajectory_age"] <= 2.0
+
+    def test_sample_returns_none_when_all_entries_are_stale(self):
+        """After evicting all stale entries, None is returned if buffer is empty."""
+        buf = UnforcedReplayBufferImpl(max_size=10)
+
+        buf.add(self._traj(), weight_version=0)
+        buf.add(self._traj(), weight_version=1)
+
+        result = buf.sample(num_prompt_groups=1, current_weight_version=5, max_age_steps=2)
+
+        assert result is None
+        assert buf.size() == 0
+
+    def test_avg_trajectory_age_never_exceeds_max_age_steps(self):
+        """avg_trajectory_age in returned sample must be <= max_age_steps."""
+        buf = UnforcedReplayBufferImpl(max_size=20)
+
+        # Mix of valid and stale, out of order
+        for v in [8, 3, 9, 2, 7, 1, 10, 4]:
+            buf.add(self._traj(), weight_version=v)
+
+        # min_valid = 10 - 2 = 8; valid are 8, 9, 10; stale are 1, 2, 3, 4, 7
+        result = buf.sample(num_prompt_groups=3, current_weight_version=10, max_age_steps=2)
+
+        assert result is not None
+        assert result["avg_trajectory_age"] <= 2.0
 
 
 class TestAsyncTrajectoryCollector:
