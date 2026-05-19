@@ -126,14 +126,12 @@ class AsyncGRPOConfig(TypedDict):
     #   stalls until trajectories tagged for the current step are ready. This
     #   matches Megatron-LM's `--rl-num-parallel-generation-batches=L+1` mode.
     # - "unforced": trajectories are not pre-assigned to a target step. The
-    #   collector keeps up to `num_parallel_generations` rollouts in flight and
-    #   the trainer consumes them FIFO subject to `max_trajectory_age_steps`.
-    #   Matches Megatron-LM's `--rl-num-parallel-generations=(L+1)*P*G` mode.
+    #   collector keeps up to
+    #   `(max_trajectory_age_steps + 1) * num_prompts_per_step` rollouts in
+    #   flight (in rollout units, i.e. prompt-groups) and the trainer consumes
+    #   them FIFO subject to `max_trajectory_age_steps`. Matches Megatron-LM's
+    #   `--rl-num-parallel-generations=(L+1)*P*G` mode.
     lag_mode: NotRequired[Literal["forced", "unforced"]]
-    # Only used when `lag_mode == "unforced"`. Caps the number of in-flight
-    # rollouts (in rollout units, i.e. prompt-groups). When unset, defaults to
-    # `(max_trajectory_age_steps + 1) * num_prompts_per_step`.
-    num_parallel_generations: NotRequired[int]
 
 
 class AdvEstimatorConfig(TypedDict):
@@ -2590,21 +2588,21 @@ def async_grpo_train(
         # In unforced mode the in-flight cap (num_parallel_generations) bounds how
         # much can sit in the buffer; size the buffer to hold (cap + slack) entries
         # so that "full" backpressure only fires when truly saturated.
-        derived_parallel = max_trajectory_age_steps * num_prompts_per_step
-        num_parallel_generations = async_cfg.get(
-            "num_parallel_generations", derived_parallel
-        )
-        if num_parallel_generations <= 0:
-            raise ValueError(
-                f"async_grpo.num_parallel_generations must be positive, got {num_parallel_generations}"
-            )
+        # The cap is hardcoded to (max_trajectory_age_steps + 1) * num_prompts_per_step
+        # to match Megatron-LM's `--rl-num-parallel-generations=(L+1)*P*G` semantics.
+        # In NeMo-RL rollout/prompt-group units the per-prompt G factor is already
+        # implicit in a single rollout entry, so we only multiply by P.
+        num_parallel_generations = (
+            max_trajectory_age_steps + 1
+        ) * num_prompts_per_step
         optimal_buffer_size = max(
             optimal_buffer_size,
             num_parallel_generations + num_prompts_per_step,
         )
         print(
             f"📐 Unforced lag: num_parallel_generations={num_parallel_generations} "
-            f"(default would be max_age*P = {derived_parallel})"
+            f"= (max_trajectory_age_steps + 1) * num_prompts_per_step "
+            f"= ({max_trajectory_age_steps} + 1) * {num_prompts_per_step}"
         )
 
     replay_buffer = replay_buffer_cls.options(runtime_env=_replay_runtime_env).remote(
