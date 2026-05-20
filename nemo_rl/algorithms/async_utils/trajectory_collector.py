@@ -311,10 +311,18 @@ class AsyncTrajectoryCollector:
     def get_weight_version(self) -> int:
         return self.current_weight_version
 
-    def pause(self) -> None:
-        """Pause trajectory collection."""
+    def pause(self) -> int:
+        """Pause trajectory collection. Returns the number of in-flight threads at pause time."""
         self._manual_pause_cleared.clear()  # Signal collection to pause
-        print("Trajectory collection paused")
+        with self._threads_lock:
+            inflight = len(self._inflight_threads)
+        print(f"Trajectory collection paused ({inflight} threads still in flight)")
+        return inflight
+
+    def get_inflight_count(self) -> int:
+        """Return the current number of in-flight generation threads."""
+        with self._threads_lock:
+            return len(self._inflight_threads)
 
     def resume(self) -> None:
         """Resume trajectory collection."""
@@ -611,10 +619,18 @@ class UnforcedAsyncTrajectoryCollector:
     def get_weight_version(self) -> int:
         return self.current_weight_version
 
-    def pause(self) -> None:
-        """Pause trajectory collection."""
+    def pause(self) -> int:
+        """Pause trajectory collection. Returns the number of in-flight threads at pause time."""
         self._manual_pause_cleared.clear()
-        print("[unforced] Trajectory collection paused")
+        with self._threads_lock:
+            inflight = len(self._inflight_threads)
+        print(f"[unforced] Trajectory collection paused ({inflight} threads still in flight)")
+        return inflight
+
+    def get_inflight_count(self) -> int:
+        """Return the current number of in-flight generation threads."""
+        with self._threads_lock:
+            return len(self._inflight_threads)
 
     def resume(self) -> None:
         """Resume trajectory collection."""
