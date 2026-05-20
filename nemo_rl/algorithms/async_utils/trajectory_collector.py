@@ -548,9 +548,14 @@ class UnforcedAsyncTrajectoryCollector:
     - No per-batch ``target_weight_version`` reservation; each rollout is
       stamped only with the generation ``weight_version`` snapshotted when its
       worker thread starts.
-    - In-flight parallelism is capped by ``num_parallel_generations`` rollouts
-      (default ``(max_trajectory_age_steps + 1) * num_prompts_per_step``)
-      instead of being implicitly partitioned across future training steps.
+    - Conceptually there are no "batches" in unforced lag: the unit of work
+      is a single prompt-group. The collector iterates over upstream
+      dataloader batches transparently and dispatches one rollout per
+      prompt regardless of upstream batching (single dataloader,
+      multi-dataloader wrapper, any ``batch_size``).
+    - In-flight parallelism is capped purely by ``num_parallel_generations``
+      rollouts via ``_inflight_sema``. Dataloader prefetching (with
+      ``num_workers > 0``) overlaps fetch work with semaphore waits.
     - Backpressure comes purely from the in-flight semaphore plus the replay
       buffer's ``max_size`` (with exponential backoff on ``"full"`` adds);
       there is no "all targets generated, pause" path.
@@ -696,7 +701,12 @@ class UnforcedAsyncTrajectoryCollector:
         return {}
 
     def start_collection(self, dataloader: StatefulDataLoader) -> None:
-        """Start collecting trajectories from dataloader."""
+        """Start collecting trajectories from dataloader.
+
+        The dataloader can yield batches of any size; the collector walks
+        each batch one prompt at a time and dispatches each prompt as its
+        own rollout group.
+        """
         self.running = True
         self.dataloader = dataloader
 
@@ -712,8 +722,16 @@ class UnforcedAsyncTrajectoryCollector:
         print("[unforced] Collection thread started, start_collection returning")
 
     def _collection_loop(self) -> None:
-        """Run the unforced-lag collection loop in background thread."""
+        """Run the unforced-lag collection loop in background thread.
+
+        Walks the upstream dataloader batch-by-batch, but the collector has
+        no batch abstraction: each prompt is sliced out, repeat-interleaved
+        into a group, and dispatched as its own rollout worker. The
+        in-flight semaphore alone caps how many groups can run at once.
+        """
         try:
+            num_generations = self.master_config.grpo["num_generations_per_prompt"]
+
             for batch in self.dataloader:
                 if not self.running:
                     break
@@ -729,7 +747,47 @@ class UnforcedAsyncTrajectoryCollector:
                 if not self.running:
                     break
 
-                self._process_batch(batch)
+                for prompt_idx in range(batch.size):
+                    if not self.running:
+                        break
+
+                    if not self._manual_pause_cleared.is_set() and self.running:
+                        self._manual_pause_cleared.wait()
+
+                    if not self._refit_pause_cleared.is_set() and self.running:
+                        with self._threads_lock:
+                            active_threads = len(self._inflight_threads)
+                        print(
+                            f"⏸️ [unforced] Waiting for refit before starting new generation "
+                            f"({active_threads} threads still active)"
+                        )
+                        self._refit_pause_cleared.wait()
+
+                    if not self.running:
+                        break
+
+                    repeated_batch = batch.slice(
+                        prompt_idx, prompt_idx + 1
+                    ).repeat_interleave(num_generations)
+
+                    self._inflight_sema.acquire()
+
+                    if not self.running:
+                        self._inflight_sema.release()
+                        break
+
+                    generation_weight_version = self.current_weight_version
+
+                    worker = _threading.Thread(
+                        target=self._run_prompt_group_worker,
+                        args=(repeated_batch, generation_weight_version),
+                        daemon=True,
+                    )
+                    with self._threads_lock:
+                        self._inflight_threads.add(worker)
+                    worker.start()
+
+                self._cleanup_finished_threads()
 
         except Exception as e:
             print(f"❌ Error in unforced trajectory collection: {e}")
@@ -746,55 +804,10 @@ class UnforcedAsyncTrajectoryCollector:
             for t in finished:
                 self._inflight_threads.remove(t)
 
-    def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
-        """Spawn one worker per prompt; each worker stamps its own weight version."""
-        try:
-            num_generations = self.master_config.grpo["num_generations_per_prompt"]
-            num_prompts = batch.size
-
-            for prompt_idx in range(num_prompts):
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    with self._threads_lock:
-                        active_threads = len(self._inflight_threads)
-                    print(
-                        f"⏸️ [unforced] Waiting for refit before starting new generation "
-                        f"({active_threads} threads still active)"
-                    )
-                    self._refit_pause_cleared.wait()
-
-                single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
-                repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
-
-                self._inflight_sema.acquire()
-
-                if not self.running:
-                    self._inflight_sema.release()
-                    return
-
-                generation_weight_version = self.current_weight_version
-
-                worker = _threading.Thread(
-                    target=self._run_prompt_group_worker,
-                    args=(repeated_batch, generation_weight_version, prompt_idx),
-                    daemon=True,
-                )
-                with self._threads_lock:
-                    self._inflight_threads.add(worker)
-                worker.start()
-
-            self._cleanup_finished_threads()
-
-        except Exception as e:
-            print(f"❌ [unforced] Error processing batch: {e}")
-            import traceback
-
-            traceback.print_exc()
-
     def _run_prompt_group_worker(
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
         generation_weight_version: int,
-        prompt_idx: int,
     ) -> None:
         try:
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
@@ -846,7 +859,7 @@ class UnforcedAsyncTrajectoryCollector:
                     if status == "success":
                         print(
                             f"📦 [unforced] Buffered prompt group "
-                            f"(prompt_idx {prompt_idx}, weight_version {generation_weight_version})"
+                            f"(weight_version {generation_weight_version})"
                         )
                         break
                     elif status == "full":
