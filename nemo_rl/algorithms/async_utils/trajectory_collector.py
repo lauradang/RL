@@ -79,7 +79,7 @@ class AsyncTrajectoryCollector:
         # This value limits the parallelism of the generation requests.
         max_inflight = (
             int(self.master_config.grpo["num_prompts_per_step"])
-            * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
+            * (int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]) + 1)
         ) or 1
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
