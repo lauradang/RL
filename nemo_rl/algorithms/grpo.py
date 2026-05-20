@@ -2592,9 +2592,7 @@ def async_grpo_train(
         # to match Megatron-LM's `--rl-num-parallel-generations=(L+1)*P*G` semantics.
         # In NeMo-RL rollout/prompt-group units the per-prompt G factor is already
         # implicit in a single rollout entry, so we only multiply by P.
-        num_parallel_generations = (
-            max_trajectory_age_steps + 1
-        ) * num_prompts_per_step
+        num_parallel_generations = max_trajectory_age_steps * num_prompts_per_step
         optimal_buffer_size = max(
             optimal_buffer_size,
             num_parallel_generations + num_prompts_per_step,
