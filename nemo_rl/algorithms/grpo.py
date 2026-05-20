@@ -2689,7 +2689,10 @@ def async_grpo_train(
     if val_at_start and step == 0:
         print("\n🔍 Running initial validation...")
         # Pause trajectory collection during initial validation
-        trajectory_collector.pause.remote()
+        inflight_at_pause = ray.get(trajectory_collector.pause.remote())
+        logger.log_metrics(
+            {"collector_inflight_at_pause": inflight_at_pause}, step, prefix="timing/validation"
+        )
 
         try:
             val_metrics, validation_timings = validate(
@@ -3040,7 +3043,12 @@ def async_grpo_train(
                     val_at_end and is_last_step
                 ):
                     # Pause trajectory collection during validation to reduce memory pressure
-                    trajectory_collector.pause.remote()
+                    inflight_at_pause = ray.get(trajectory_collector.pause.remote())
+                    logger.log_metrics(
+                        {"collector_inflight_at_pause": inflight_at_pause},
+                        step + 1,
+                        prefix="timing/validation",
+                    )
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
@@ -3309,6 +3317,9 @@ def async_grpo_train(
             )
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
+            )
+            performance_metrics["generation_concurrent_workers"] = ray.get(
+                trajectory_collector.get_inflight_count.remote()
             )
 
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
