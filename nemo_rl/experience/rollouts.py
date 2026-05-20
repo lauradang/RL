@@ -1004,6 +1004,7 @@ def run_async_multi_turn_rollout(
         # Aggregate metrics across all samples
         rollout_metrics = {
             # Overall metrics
+            "timing/rollout/concurrent_requests": batch_size,
             "total_turns": sum(m["turn_count"] for m in all_sample_metrics),
             "avg_turns_per_sample": sum(m["turn_count"] for m in all_sample_metrics)
             / batch_size,
@@ -1196,6 +1197,7 @@ def run_async_nemo_gym_rollout(
     with timer.time(f"{timer_prefix}/aggregate_metrics"):
         rollout_metrics = {
             **rollout_loop_timing_metrics,
+            "timing/rollout/concurrent_requests": batch_size,
             **_calculate_single_metric(
                 [m["turn_count"] for m in all_sample_metrics],
                 batch_size,
