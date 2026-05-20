@@ -2842,6 +2842,11 @@ def async_grpo_train(
         logger.log_metrics(
             {"collector_inflight_at_pause": inflight_at_pause}, step, prefix="timing/validation"
         )
+        _drain_start = time.time()
+        ray.get(trajectory_collector.wait_for_pending_generations.remote())
+        logger.log_metrics(
+            {"collector_drain_time": time.time() - _drain_start}, step, prefix="timing/validation"
+        )
 
         try:
             val_metrics, validation_timings = validate(
@@ -3199,6 +3204,13 @@ def async_grpo_train(
                     inflight_at_pause = ray.get(trajectory_collector.pause.remote())
                     logger.log_metrics(
                         {"collector_inflight_at_pause": inflight_at_pause},
+                        step + 1,
+                        prefix="timing/validation",
+                    )
+                    _drain_start = time.time()
+                    ray.get(trajectory_collector.wait_for_pending_generations.remote())
+                    logger.log_metrics(
+                        {"collector_drain_time": time.time() - _drain_start},
                         step + 1,
                         prefix="timing/validation",
                     )
