@@ -85,6 +85,7 @@ submit_job() {
 
     COMMAND="$command" \
     CONTAINER="$CONTAINER" \
+    GPUS_PER_NODE="$GPUS_PER_NODE" \
     MOUNTS="$MOUNTS" \
     sbatch \
         --nodes="$NUM_NODES" \
