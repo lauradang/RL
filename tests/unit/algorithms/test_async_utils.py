@@ -29,7 +29,7 @@ os.environ["RAY_TMPDIR"] = _temp_dir  # Alternative env var
 os.environ["TMPDIR"] = _temp_dir  # System temp dir
 
 from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
-from nemo_rl.algorithms.async_utils.replay_buffer import UnforcedReplayBufferImpl
+from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -350,9 +350,39 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
+    def test_replay_buffer_unforced_actor_fifo_sampling(self):
+        """Test unforced-lag behavior through the ReplayBuffer Ray actor."""
+        buffer = ReplayBuffer.remote(max_size=10, lag_mode="unforced")
 
-class TestUnforcedReplayBuffer:
-    """Tests for UnforcedReplayBufferImpl (unforced-lag FIFO buffer)."""
+        trajectory1 = {"batch": {"data": "test1"}, "rollout_metrics": {"reward": 1.0}}
+        trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
+
+        status1 = ray.get(buffer.add.remote(trajectory1, weight_version=5))
+        status2 = ray.get(buffer.add.remote(trajectory2, weight_version=6))
+
+        assert status1 == "success"
+        assert status2 == "success"
+
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=2,
+                current_weight_version=7,
+                max_age_steps=2,
+            )
+        )
+
+        assert sample_result is not None
+        assert [t["batch"]["data"] for t in sample_result["trajectories"]] == [
+            "test1",
+            "test2",
+        ]
+        assert ray.get(buffer.get_existing_target_weights.remote()) == set()
+
+        ray.kill(buffer)
+
+
+class TestReplayBufferUnforcedMode:
+    """Tests for ReplayBufferImpl in unforced-lag FIFO mode."""
 
     def _traj(self):
         return {"batch": {}, "rollout_metrics": {}, "timestamp": 0.0}
@@ -365,7 +395,7 @@ class TestUnforcedReplayBuffer:
         front-only eviction loop would stop at the valid N+1 entry and leave
         the stale N-3 entry buried at index 1 to be sampled.
         """
-        buf = UnforcedReplayBufferImpl(max_size=10)
+        buf = ReplayBufferImpl(max_size=10, lag_mode="unforced")
 
         # Out-of-order arrivals: fast rollout at weight 5 lands before slow one at weight 2
         buf.add(self._traj(), weight_version=5)  # valid at step 7 (age=2)
@@ -374,7 +404,9 @@ class TestUnforcedReplayBuffer:
         buf.add(self._traj(), weight_version=3)  # STALE at step 7 (age=4 > max_age=2)
 
         # min_valid_version = 7 - 2 = 5; versions 2 and 3 must be evicted
-        result = buf.sample(num_prompt_groups=2, current_weight_version=7, max_age_steps=2)
+        result = buf.sample(
+            num_prompt_groups=2, current_weight_version=7, max_age_steps=2
+        )
 
         assert result is not None, "Should return 2 valid trajectories"
         assert len(result["trajectories"]) == 2
@@ -386,14 +418,16 @@ class TestUnforcedReplayBuffer:
 
     def test_eviction_still_works_when_stale_entries_are_at_front(self):
         """Regression: eviction must also work for the ordinary in-order case."""
-        buf = UnforcedReplayBufferImpl(max_size=10)
+        buf = ReplayBufferImpl(max_size=10, lag_mode="unforced")
 
         buf.add(self._traj(), weight_version=1)  # stale at step 5 (age=4)
         buf.add(self._traj(), weight_version=2)  # stale at step 5 (age=3)
         buf.add(self._traj(), weight_version=4)  # valid (age=1)
         buf.add(self._traj(), weight_version=5)  # valid (age=0)
 
-        result = buf.sample(num_prompt_groups=2, current_weight_version=5, max_age_steps=2)
+        result = buf.sample(
+            num_prompt_groups=2, current_weight_version=5, max_age_steps=2
+        )
 
         assert result is not None
         assert len(result["trajectories"]) == 2
@@ -401,26 +435,30 @@ class TestUnforcedReplayBuffer:
 
     def test_sample_returns_none_when_all_entries_are_stale(self):
         """After evicting all stale entries, None is returned if buffer is empty."""
-        buf = UnforcedReplayBufferImpl(max_size=10)
+        buf = ReplayBufferImpl(max_size=10, lag_mode="unforced")
 
         buf.add(self._traj(), weight_version=0)
         buf.add(self._traj(), weight_version=1)
 
-        result = buf.sample(num_prompt_groups=1, current_weight_version=5, max_age_steps=2)
+        result = buf.sample(
+            num_prompt_groups=1, current_weight_version=5, max_age_steps=2
+        )
 
         assert result is None
         assert buf.size() == 0
 
     def test_avg_trajectory_age_never_exceeds_max_age_steps(self):
         """avg_trajectory_age in returned sample must be <= max_age_steps."""
-        buf = UnforcedReplayBufferImpl(max_size=20)
+        buf = ReplayBufferImpl(max_size=20, lag_mode="unforced")
 
         # Mix of valid and stale, out of order
         for v in [8, 3, 9, 2, 7, 1, 10, 4]:
             buf.add(self._traj(), weight_version=v)
 
         # min_valid = 10 - 2 = 8; valid are 8, 9, 10; stale are 1, 2, 3, 4, 7
-        result = buf.sample(num_prompt_groups=3, current_weight_version=10, max_age_steps=2)
+        result = buf.sample(
+            num_prompt_groups=3, current_weight_version=10, max_age_steps=2
+        )
 
         assert result is not None
         assert result["avg_trajectory_age"] <= 2.0
@@ -480,6 +518,32 @@ class TestAsyncTrajectoryCollector:
         )
 
         # Test basic functionality
+        weight_version = ray.get(collector.get_weight_version.remote())
+        assert weight_version == 0
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_async_trajectory_collector_unforced_initialization(self):
+        """Test AsyncTrajectoryCollector initialization in unforced-lag mode."""
+        buffer = ReplayBuffer.remote(max_size=10, lag_mode="unforced")
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+            lag_mode="unforced",
+        )
+
         weight_version = ray.get(collector.get_weight_version.remote())
         assert weight_version == 0
 

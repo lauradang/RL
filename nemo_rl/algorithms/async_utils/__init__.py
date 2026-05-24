@@ -14,18 +14,12 @@
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     ReplayBuffer,
-    ReplayBufferNew,
-    UnforcedReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.trajectory_collector import (
     AsyncTrajectoryCollector,
-    UnforcedAsyncTrajectoryCollector,
 )
 
 __all__ = [
     "ReplayBuffer",
-    "ReplayBufferNew",
-    "UnforcedReplayBuffer",
     "AsyncTrajectoryCollector",
-    "UnforcedAsyncTrajectoryCollector",
 ]
