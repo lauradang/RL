@@ -28,6 +28,8 @@ WANDB_PROJECT=${WANDB_PROJECT:-nano-v3-megatron-inference}
 CHECKPOINT_ROOT=${CHECKPOINT_ROOT:-/lustre/fsw/portfolios/nemotron/users/laurad}
 TS=${TS:-$(date +%Y%m%d_%H%M%S)}
 DRYRUN=${DRYRUN:-0}
+NRL_FORCE_REBUILD_VENVS=${NRL_FORCE_REBUILD_VENVS:-true}
+NRL_IGNORE_VERSION_MISMATCH=${NRL_IGNORE_VERSION_MISMATCH:-1}
 
 if [[ "$DRYRUN" != "1" ]]; then
     : "${CONTAINER:?Set CONTAINER to the image used by ray.sub.}"
@@ -75,15 +77,22 @@ submit_job() {
     local command
     printf -v command "%q " "${cmd[@]}"
 
+    local launch_command
+    printf -v launch_command \
+        "cd /opt/nemo-rl && export PYTHONUNBUFFERED=1 && export NRL_FORCE_REBUILD_VENVS=%q && export NRL_IGNORE_VERSION_MISMATCH=%q && export PYTHONPATH=/opt/nemo-rl/3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM:\\\${PYTHONPATH:-} && %s" \
+        "$NRL_FORCE_REBUILD_VENVS" \
+        "$NRL_IGNORE_VERSION_MISMATCH" \
+        "$command"
+
     echo "[INFO] Prepared ${lag_mode} verification job: ${run_name}"
     echo "[INFO] Checkpoint dir: ${checkpoint_dir}"
-    echo "[INFO] Command: ${command}"
+    echo "[INFO] Command: ${launch_command}"
 
     if [[ "$DRYRUN" == "1" ]]; then
         return
     fi
 
-    COMMAND="$command" \
+    COMMAND="$launch_command" \
     CONTAINER="$CONTAINER" \
     GPUS_PER_NODE="$GPUS_PER_NODE" \
     MOUNTS="$MOUNTS" \
