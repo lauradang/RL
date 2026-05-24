@@ -14,7 +14,7 @@
 
 import threading as _threading
 import time
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import ray
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -30,6 +30,7 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import GenerationInterface
 
 TokenizerType = PreTrainedTokenizerBase
+LagMode = Literal["forced", "unforced"]
 
 
 @ray.remote  # pragma: no cover
@@ -44,13 +45,20 @@ class AsyncTrajectoryCollector:
         master_config: MasterConfig,
         replay_buffer: Any,
         start_step: int = 0,
+        lag_mode: LagMode = "forced",
     ):
+        if lag_mode not in ("forced", "unforced"):
+            raise ValueError(
+                f"lag_mode must be 'forced' or 'unforced', got {lag_mode!r}"
+            )
+
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
         self.task_to_env = task_to_env
         self.master_config = master_config
         self.replay_buffer = replay_buffer
         self.running = False
+        self.lag_mode = lag_mode
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -81,6 +89,7 @@ class AsyncTrajectoryCollector:
             int(self.master_config.grpo["num_prompts_per_step"])
             * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
         ) or 1
+        self.max_inflight_generations = max_inflight
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
         # Simple lock to prevent race conditions when checking/spawning workers
@@ -141,6 +150,10 @@ class AsyncTrajectoryCollector:
     def set_weight_version(self, version: int) -> None:
         self.current_weight_version = version
 
+        if self.lag_mode == "unforced":
+            print(f"🔄 [unforced] Updated weight version to {version}")
+            return
+
         # Resume collection if it was paused due to generation limits
         was_paused = not self._generation_limit_cleared.is_set()
         if was_paused:
@@ -151,6 +164,9 @@ class AsyncTrajectoryCollector:
 
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
+        if self.lag_mode == "unforced":
+            return False
+
         try:
             target_weights = self._calculate_target_weights(self.current_weight_version)
             last_target_weight_already_generated = ray.get(
@@ -178,16 +194,29 @@ class AsyncTrajectoryCollector:
         self.running = True
         self.dataloader = dataloader
 
-        print("Started continuous trajectory collection")
+        if self.lag_mode == "unforced":
+            print(
+                "[unforced] Started continuous trajectory collection "
+                f"(max in-flight rollouts={self.max_inflight_generations})"
+            )
+        else:
+            print("Started continuous trajectory collection")
 
         self.collection_thread = _threading.Thread(target=self._collection_loop)
         self.collection_thread.daemon = True
         self.collection_thread.start()
 
-        print("Collection thread started, start_collection returning")
+        if self.lag_mode == "unforced":
+            print("[unforced] Collection thread started, start_collection returning")
+        else:
+            print("Collection thread started, start_collection returning")
 
     def _collection_loop(self):
         """Run the collection loop in background thread."""
+        if self.lag_mode == "unforced":
+            self._collection_loop_unforced()
+            return
+
         try:
             for batch in self.dataloader:
                 if not self.running:
@@ -242,6 +271,77 @@ class AsyncTrajectoryCollector:
         finally:
             self.running = False
             print("🛑 Trajectory collection stopped")
+
+    def _collection_loop_unforced(self) -> None:
+        """Run the unforced-lag collection loop in the background thread."""
+        try:
+            num_generations = self.master_config.grpo["num_generations_per_prompt"]
+
+            for batch in self.dataloader:
+                if not self.running:
+                    break
+
+                if not self._manual_pause_cleared.is_set() and self.running:
+                    self._manual_pause_cleared.wait()
+
+                if not self._refit_pause_cleared.is_set() and self.running:
+                    print("⏸️ [unforced] Pausing collection for refit...")
+                    self._refit_pause_cleared.wait()
+                    print("▶️ [unforced] Refit completed, resuming collection")
+
+                if not self.running:
+                    break
+
+                for prompt_idx in range(batch.size):
+                    if not self.running:
+                        break
+
+                    if not self._manual_pause_cleared.is_set() and self.running:
+                        self._manual_pause_cleared.wait()
+
+                    if not self._refit_pause_cleared.is_set() and self.running:
+                        with self._threads_lock:
+                            active_threads = len(self._inflight_threads)
+                        print(
+                            f"⏸️ [unforced] Waiting for refit before starting new generation "
+                            f"({active_threads} threads still active)"
+                        )
+                        self._refit_pause_cleared.wait()
+
+                    if not self.running:
+                        break
+
+                    repeated_batch = batch.slice(
+                        prompt_idx, prompt_idx + 1
+                    ).repeat_interleave(num_generations)
+
+                    self._inflight_sema.acquire()
+
+                    if not self.running:
+                        self._inflight_sema.release()
+                        break
+
+                    generation_weight_version = self.current_weight_version
+
+                    worker = _threading.Thread(
+                        target=self._run_prompt_group_worker,
+                        args=(repeated_batch, generation_weight_version),
+                        daemon=True,
+                    )
+                    with self._threads_lock:
+                        self._inflight_threads.add(worker)
+                    worker.start()
+
+                self._cleanup_finished_threads()
+
+        except Exception as e:
+            print(f"❌ Error in unforced trajectory collection: {e}")
+            import traceback
+
+            traceback.print_exc()
+        finally:
+            self.running = False
+            print("🛑 [unforced] Trajectory collection stopped")
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Process a single batch and generate for one target weight."""
@@ -316,7 +416,12 @@ class AsyncTrajectoryCollector:
         self._manual_pause_cleared.clear()  # Signal collection to pause
         with self._threads_lock:
             inflight = len(self._inflight_threads)
-        print(f"Trajectory collection paused ({inflight} threads still in flight)")
+        if self.lag_mode == "unforced":
+            print(
+                f"[unforced] Trajectory collection paused ({inflight} threads still in flight)"
+            )
+        else:
+            print(f"Trajectory collection paused ({inflight} threads still in flight)")
         return inflight
 
     def get_inflight_count(self) -> int:
@@ -327,7 +432,10 @@ class AsyncTrajectoryCollector:
     def resume(self) -> None:
         """Resume trajectory collection."""
         self._manual_pause_cleared.set()  # Signal collection to resume
-        print("Trajectory collection resumed")
+        if self.lag_mode == "unforced":
+            print("[unforced] Trajectory collection resumed")
+        else:
+            print("Trajectory collection resumed")
 
     def prepare_for_refit(self) -> None:
         """Pause new generation starts and optionally wait for pending generations.
@@ -435,8 +543,8 @@ class AsyncTrajectoryCollector:
         self,
         repeated_batch: BatchedDataDict[DatumSpec],
         generation_weight_version: int,
-        target_weight_version: int,
-        prompt_idx: int,
+        target_weight_version: Optional[int] = None,
+        prompt_idx: Optional[int] = None,
     ) -> None:
         try:
             # Import here to avoid circular dependency
@@ -485,20 +593,39 @@ class AsyncTrajectoryCollector:
             try:
                 backoff_delay = 0.01
                 while self.running:
-                    status = ray.get(
-                        self.replay_buffer.add.remote(
-                            trajectory_group,
-                            generation_weight_version,
-                            target_weight_version,
+                    if self.lag_mode == "unforced":
+                        status = ray.get(
+                            self.replay_buffer.add.remote(
+                                trajectory_group,
+                                generation_weight_version,
+                            )
                         )
-                    )
-                    if status == "success":
-                        print(
-                            f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
+                    else:
+                        if target_weight_version is None:
+                            raise ValueError(
+                                "target_weight_version is required in forced-lag mode"
+                            )
+                        status = ray.get(
+                            self.replay_buffer.add.remote(
+                                trajectory_group,
+                                generation_weight_version,
+                                target_weight_version,
+                            )
                         )
 
+                    if status == "success":
+                        if self.lag_mode == "unforced":
+                            print(
+                                f"📦 [unforced] Buffered prompt group "
+                                f"(weight_version {generation_weight_version})"
+                            )
+                        else:
+                            print(
+                                f"📦 Buffered per-prompt group (prompt_idx {prompt_idx}, target_weight {target_weight_version})"
+                            )
+
                         # Release reservation when FIRST prompt group for this target is successfully buffered
-                        if prompt_idx == 0:
+                        if self.lag_mode == "forced" and prompt_idx == 0:
                             with self._generation_check_lock:
                                 if target_weight_version in self._generating_targets:
                                     self._generating_targets.discard(
@@ -527,373 +654,15 @@ class AsyncTrajectoryCollector:
             traceback.print_exc()
         finally:
             # Clean up reservation in case of error (if not already cleaned up)
-            with self._generation_check_lock:
-                if target_weight_version in self._generating_targets:
-                    self._generating_targets.discard(target_weight_version)
-                    print(
-                        f"🧹 Emergency cleanup: Released reservation for target weight {target_weight_version}"
-                    )
+            if self.lag_mode == "forced" and target_weight_version is not None:
+                with self._generation_check_lock:
+                    if target_weight_version in self._generating_targets:
+                        self._generating_targets.discard(target_weight_version)
+                        print(
+                            f"🧹 Emergency cleanup: Released reservation for target weight {target_weight_version}"
+                        )
 
             # Detach thread record when finished
-            with self._threads_lock:
-                current = _threading.current_thread()
-                if current in self._inflight_threads:
-                    self._inflight_threads.remove(current)
-            try:
-                self._inflight_sema.release()
-            except Exception:
-                import traceback
-
-                traceback.print_exc()
-
-
-@ray.remote  # pragma: no cover
-class UnforcedAsyncTrajectoryCollector:
-    """Collects trajectories for unforced-lag async GRPO.
-
-    Differences vs. `AsyncTrajectoryCollector` (forced lag):
-
-    - No per-batch ``target_weight_version`` reservation; each rollout is
-      stamped only with the generation ``weight_version`` snapshotted when its
-      worker thread starts.
-    - Conceptually there are no "batches" in unforced lag: the unit of work
-      is a single prompt-group. The collector iterates over upstream
-      dataloader batches transparently and dispatches one rollout per
-      prompt regardless of upstream batching (single dataloader,
-      multi-dataloader wrapper, any ``batch_size``).
-    - In-flight parallelism is capped purely by ``num_parallel_generations``
-      rollouts via ``_inflight_sema``. Dataloader prefetching (with
-      ``num_workers > 0``) overlaps fetch work with semaphore waits.
-    - Backpressure comes purely from the in-flight semaphore plus the replay
-      buffer's ``max_size`` (with exponential backoff on ``"full"`` adds);
-      there is no "all targets generated, pause" path.
-
-    This mirrors Megatron-LM's ``enforce_order=False`` /
-    ``--rl-num-parallel-generations`` mode in
-    ``Megatron-LM/megatron/rl/agent/api.py``.
-    """
-
-    def __init__(
-        self,
-        policy_generation: GenerationInterface,
-        tokenizer: TokenizerType,
-        task_to_env: dict[str, EnvironmentInterface],
-        master_config: MasterConfig,
-        replay_buffer: Any,
-        num_parallel_generations: int,
-        start_step: int = 0,
-    ):
-        if num_parallel_generations <= 0:
-            raise ValueError(
-                f"num_parallel_generations must be positive, got {num_parallel_generations}"
-            )
-
-        self.policy_generation = policy_generation
-        self.tokenizer = tokenizer
-        self.task_to_env = task_to_env
-        self.master_config = master_config
-        self.replay_buffer = replay_buffer
-        self.running = False
-
-        self._pg_lock: _threading.Lock = _threading.Lock()
-
-        self._manual_pause_cleared = _threading.Event()
-        self._manual_pause_cleared.set()
-
-        self._refit_pause_cleared = _threading.Event()
-        self._refit_pause_cleared.set()
-
-        self.current_weight_version: int = start_step
-        self.initial_weight_version: int = start_step
-
-        self._inflight_threads: set[_threading.Thread] = set()
-        self._threads_lock: _threading.Lock = _threading.Lock()
-
-        self.num_parallel_generations: int = num_parallel_generations
-        self._inflight_sema = _threading.Semaphore(num_parallel_generations)
-
-    def set_weight_version(self, version: int) -> None:
-        self.current_weight_version = version
-        print(f"🔄 [unforced] Updated weight version to {version}")
-
-    def get_weight_version(self) -> int:
-        return self.current_weight_version
-
-    def pause(self) -> int:
-        """Pause trajectory collection. Returns the number of in-flight threads at pause time."""
-        self._manual_pause_cleared.clear()
-        with self._threads_lock:
-            inflight = len(self._inflight_threads)
-        print(f"[unforced] Trajectory collection paused ({inflight} threads still in flight)")
-        return inflight
-
-    def get_inflight_count(self) -> int:
-        """Return the current number of in-flight generation threads."""
-        with self._threads_lock:
-            return len(self._inflight_threads)
-
-    def resume(self) -> None:
-        """Resume trajectory collection."""
-        self._manual_pause_cleared.set()
-        print("[unforced] Trajectory collection resumed")
-
-    def prepare_for_refit(self) -> None:
-        """Pause new generation starts and optionally wait for pending generations."""
-        start_time = time.time()
-        print("🔄 [unforced] Preparing for refit: pausing new generations...")
-
-        self._refit_pause_cleared.clear()
-        print("⏸️ New generation starts paused")
-
-        vllm_cfg = self.master_config.policy.get("generation", {}).get("vllm_cfg", {})
-        is_async_engine = vllm_cfg.get("async_engine", False)
-        in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(
-            "in_flight_weight_updates", False
-        )
-
-        if is_async_engine and in_flight_weight_updates:
-            print(
-                "🚀 Using vLLM V1 in-flight weight update - skipping wait for pending generations"
-            )
-            print(
-                f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
-            )
-        else:
-            print(
-                "⏸️ Non-async engine: waiting for all pending generations to complete..."
-            )
-            self.wait_for_pending_generations()
-
-        elapsed = time.time() - start_time
-        print(f"✅ Ready for refit (took {elapsed:.2f}s)")
-
-    def resume_after_refit(self) -> None:
-        """Resume new generation starts after refit is complete."""
-        print("🔄 [unforced] Resuming generation starts after refit")
-
-        async_cfg = self.master_config.grpo.get("async_grpo", {})
-        if async_cfg.get("in_flight_weight_updates", False) and async_cfg.get(
-            "recompute_kv_cache_after_weight_updates", False
-        ):
-            try:
-                print("🔄 Invalidating vLLM prefix/KV caches after weight update")
-                invalidated = self.policy_generation.invalidate_kv_cache()
-                if invalidated:
-                    print("✅ Invalidated vLLM prefix/KV caches after weight update")
-                else:
-                    print(
-                        "⚠️ vLLM cache invalidation reported partial/unsuccessful on some workers"
-                    )
-            except Exception as e:
-                print(f"⚠️ Failed to invalidate vLLM caches: {e}")
-
-        self._refit_pause_cleared.set()
-
-    def wait_for_pending_generations(self) -> None:
-        """Wait for all in-flight generation threads to complete."""
-        start_time = time.time()
-
-        while True:
-            with self._threads_lock:
-                finished = {t for t in self._inflight_threads if not t.is_alive()}
-                for t in finished:
-                    self._inflight_threads.remove(t)
-                pending_count = len(self._inflight_threads)
-
-            if pending_count == 0:
-                print("✅ All generation threads completed")
-                break
-
-            elapsed = time.time() - start_time
-            print(
-                f"⏳ Waiting for {pending_count} pending generation threads... ({elapsed:.1f}s elapsed)"
-            )
-            time.sleep(0.5)
-
-    def get_dataloader_state(self) -> dict:
-        """Get the current dataloader state for checkpointing."""
-        if hasattr(self, "dataloader") and hasattr(self.dataloader, "state_dict"):
-            return self.dataloader.state_dict()
-        return {}
-
-    def start_collection(self, dataloader: StatefulDataLoader) -> None:
-        """Start collecting trajectories from dataloader.
-
-        The dataloader can yield batches of any size; the collector walks
-        each batch one prompt at a time and dispatches each prompt as its
-        own rollout group.
-        """
-        self.running = True
-        self.dataloader = dataloader
-
-        print(
-            "[unforced] Started continuous trajectory collection "
-            f"(max in-flight rollouts={self.num_parallel_generations})"
-        )
-
-        self.collection_thread = _threading.Thread(target=self._collection_loop)
-        self.collection_thread.daemon = True
-        self.collection_thread.start()
-
-        print("[unforced] Collection thread started, start_collection returning")
-
-    def _collection_loop(self) -> None:
-        """Run the unforced-lag collection loop in background thread.
-
-        Walks the upstream dataloader batch-by-batch, but the collector has
-        no batch abstraction: each prompt is sliced out, repeat-interleaved
-        into a group, and dispatched as its own rollout worker. The
-        in-flight semaphore alone caps how many groups can run at once.
-        """
-        try:
-            num_generations = self.master_config.grpo["num_generations_per_prompt"]
-
-            for batch in self.dataloader:
-                if not self.running:
-                    break
-
-                if not self._manual_pause_cleared.is_set() and self.running:
-                    self._manual_pause_cleared.wait()
-
-                if not self._refit_pause_cleared.is_set() and self.running:
-                    print("⏸️ [unforced] Pausing collection for refit...")
-                    self._refit_pause_cleared.wait()
-                    print("▶️ [unforced] Refit completed, resuming collection")
-
-                if not self.running:
-                    break
-
-                for prompt_idx in range(batch.size):
-                    if not self.running:
-                        break
-
-                    if not self._manual_pause_cleared.is_set() and self.running:
-                        self._manual_pause_cleared.wait()
-
-                    if not self._refit_pause_cleared.is_set() and self.running:
-                        with self._threads_lock:
-                            active_threads = len(self._inflight_threads)
-                        print(
-                            f"⏸️ [unforced] Waiting for refit before starting new generation "
-                            f"({active_threads} threads still active)"
-                        )
-                        self._refit_pause_cleared.wait()
-
-                    if not self.running:
-                        break
-
-                    repeated_batch = batch.slice(
-                        prompt_idx, prompt_idx + 1
-                    ).repeat_interleave(num_generations)
-
-                    self._inflight_sema.acquire()
-
-                    if not self.running:
-                        self._inflight_sema.release()
-                        break
-
-                    generation_weight_version = self.current_weight_version
-
-                    worker = _threading.Thread(
-                        target=self._run_prompt_group_worker,
-                        args=(repeated_batch, generation_weight_version),
-                        daemon=True,
-                    )
-                    with self._threads_lock:
-                        self._inflight_threads.add(worker)
-                    worker.start()
-
-                self._cleanup_finished_threads()
-
-        except Exception as e:
-            print(f"❌ Error in unforced trajectory collection: {e}")
-            import traceback
-
-            traceback.print_exc()
-        finally:
-            self.running = False
-            print("🛑 [unforced] Trajectory collection stopped")
-
-    def _cleanup_finished_threads(self) -> None:
-        with self._threads_lock:
-            finished = {t for t in self._inflight_threads if not t.is_alive()}
-            for t in finished:
-                self._inflight_threads.remove(t)
-
-    def _run_prompt_group_worker(
-        self,
-        repeated_batch: BatchedDataDict[DatumSpec],
-        generation_weight_version: int,
-    ) -> None:
-        try:
-            from nemo_rl.algorithms.grpo import _should_use_nemo_gym
-            from nemo_rl.experience.rollouts import run_async_nemo_gym_rollout
-
-            if _should_use_nemo_gym(self.master_config):
-                generation_config = self.master_config.policy["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
-                    policy_generation=self.policy_generation,
-                    input_batch=repeated_batch,
-                    tokenizer=self.tokenizer,
-                    task_to_env=self.task_to_env,
-                    max_seq_len=self.master_config.policy["max_total_sequence_length"],
-                    generation_config=generation_config,
-                    max_rollout_turns=None,
-                    greedy=False,
-                )
-                final_batch = nemo_gym_rollout_result.final_batch
-                rollout_metrics = nemo_gym_rollout_result.rollout_metrics
-            else:
-                final_batch, rollout_metrics = run_async_multi_turn_rollout(
-                    policy_generation=self.policy_generation,
-                    input_batch=repeated_batch,
-                    tokenizer=self.tokenizer,
-                    task_to_env=self.task_to_env,
-                    max_seq_len=self.master_config.policy["max_total_sequence_length"],
-                    max_rollout_turns=self.master_config.grpo["max_rollout_turns"],
-                    greedy=False,
-                )
-
-            final_batch_cpu = final_batch.to("cpu")
-            del final_batch
-
-            trajectory_group = {
-                "batch": final_batch_cpu,
-                "rollout_metrics": rollout_metrics,
-                "timestamp": time.time(),
-            }
-
-            try:
-                backoff_delay = 0.01
-                while self.running:
-                    status = ray.get(
-                        self.replay_buffer.add.remote(
-                            trajectory_group,
-                            generation_weight_version,
-                        )
-                    )
-                    if status == "success":
-                        print(
-                            f"📦 [unforced] Buffered prompt group "
-                            f"(weight_version {generation_weight_version})"
-                        )
-                        break
-                    elif status == "full":
-                        time.sleep(min(backoff_delay, 0.5))
-                        backoff_delay *= 1.5
-                    else:
-                        time.sleep(0.01)
-            except Exception as e:
-                print(f"❌ [unforced] Failed to enqueue prompt group: {e}")
-                import traceback
-
-                traceback.print_exc()
-        except Exception as e:
-            print(f"❌ [unforced] Error in prompt group worker: {e}")
-            import traceback
-
-            traceback.print_exc()
-        finally:
             with self._threads_lock:
                 current = _threading.current_thread()
                 if current in self._inflight_threads:

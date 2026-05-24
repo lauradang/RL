@@ -14,11 +14,13 @@
 
 import threading as _threading
 from collections import Counter
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Literal, Optional
 
 import ray
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+
+LagMode = Literal["forced", "unforced"]
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -29,14 +31,23 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     grpo.num_generations_per_prompt (required to compute per-prompt advantages).
     """
 
-    def __init__(self, max_size: int):
+    def __init__(self, max_size: int, lag_mode: LagMode = "forced"):
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
+        if lag_mode not in ("forced", "unforced"):
+            raise ValueError(
+                f"lag_mode must be 'forced' or 'unforced', got {lag_mode!r}"
+            )
         self.max_size = max_size
-        self.trajectories = []  # List[dict[str, Any]]
+        self.lag_mode = lag_mode
+        self.trajectories: list[dict[str, Any]] = []
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
-        self.trajectory_versions = []  # it is the weight-version used for generation of a trajectory
-        self.target_weight_versions = []  # it is the weight-version of the trainer where this trajectory will be used.
+        self.trajectory_versions: list[
+            int
+        ] = []  # it is the weight-version used for generation of a trajectory
+        self.target_weight_versions: list[
+            int
+        ] = []  # it is the weight-version of the trainer where this trajectory will be used.
 
         self.last_target_weight_already_generated = -1
         self._lock = _threading.Lock()
@@ -53,12 +64,14 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             trajectory: data dict
             weight_version: version of the model weights used for generation
             target_weight_version: version of the model weights this trajectory is intended for training.
-                Required for the forced-lag buffer.
+                Required in forced-lag mode and ignored in unforced-lag mode.
         """
+        if self.lag_mode == "unforced":
+            return self._add_unforced(trajectory, weight_version)
+
         if target_weight_version is None:
             raise ValueError(
-                "ReplayBuffer (forced lag) requires `target_weight_version`. "
-                "Use `UnforcedReplayBuffer` for FIFO/unforced-lag mode."
+                "ReplayBuffer in forced-lag mode requires `target_weight_version`."
             )
         with self._lock:
             if len(self.trajectories) >= self.max_size:
@@ -76,8 +89,35 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             )
             return "success"
 
+    def _add_unforced(
+        self,
+        trajectory: dict[str, Any],
+        weight_version: int,
+    ) -> str:
+        """Append a trajectory in FIFO order for unforced-lag mode."""
+        with self._lock:
+            if len(self.trajectories) >= self.max_size:
+                return "full"
+
+            self.trajectories.append(trajectory)
+            self.trajectory_versions.append(weight_version)
+            print(
+                f"🔍 ReplayBuffer(unforced).add: size={len(self.trajectories)}, "
+                f"weight_version={weight_version}, "
+                f"versions_in_buffer={self.trajectory_versions}"
+            )
+            return "success"
+
     def get_debug_info(self) -> dict:
         """Get debug information about buffer state."""
+        if self.lag_mode == "unforced":
+            return {
+                "total_trajectories": len(self.trajectories),
+                "trajectory_versions": list(self.trajectory_versions),
+                "target_weight_versions": [],
+                "max_size": self.max_size,
+            }
+
         return {
             "total_trajectories": len(self.trajectories),
             "trajectory_versions": self.trajectory_versions,
@@ -86,11 +126,15 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         }
 
     def get_last_target_weight_already_generated(self) -> int:
+        if self.lag_mode == "unforced":
+            return -1
         with self._lock:
             return self.last_target_weight_already_generated
 
     def get_existing_target_weights(self) -> set[int]:
         """Get set of target weight versions that already have trajectories."""
+        if self.lag_mode == "unforced":
+            return set()
         with self._lock:
             return set(self.target_weight_versions)
 
@@ -117,6 +161,13 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         Returns:
             Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
         """
+        if self.lag_mode == "unforced":
+            return self._sample_unforced(
+                num_prompt_groups=num_prompt_groups,
+                current_weight_version=current_weight_version,
+                max_age_steps=max_age_steps,
+            )
+
         with self._lock:
             if not self.trajectories:
                 return None
@@ -126,7 +177,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             print(f"   {current_weight_version=}, {max_age_steps=}")
             print(f"   {self.trajectory_versions=}")
 
-            # For debugging: check for unexpected old trajectories
             version_counts = Counter(self.trajectory_versions)
             print(f"   {version_counts=}")
 
@@ -216,91 +266,13 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 "avg_trajectory_age": avg_trajectory_age,
             }
 
-    def size(self) -> int:
-        """Return current buffer size."""
-        with self._lock:
-            return len(self.trajectories)
-
-    def clear(self) -> None:
-        """Clear the buffer."""
-        with self._lock:
-            self.trajectories.clear()
-            self.trajectory_versions.clear()
-            self.target_weight_versions.clear()
-
-
-@ray.remote  # pragma: no cover
-class ReplayBuffer(ReplayBufferImpl):
-    pass
-
-
-class UnforcedReplayBufferImpl(ReplayBufferProtocol):
-    """FIFO replay buffer for unforced-lag async GRPO.
-
-    Stores per-prompt trajectory groups stamped only with the generation
-    `weight_version`. Trajectories are not pre-assigned to a particular
-    training step; the trainer consumes them FIFO. Trajectories older than
-    `current_weight_version - max_age_steps` are evicted at sample time.
-
-    This mirrors Megatron-LM's `enforce_order=False` / unforced-lag path in
-    `megatron/rl/agent/api.py`.
-    """
-
-    def __init__(self, max_size: int):
-        if max_size <= 0:
-            raise ValueError(f"max_size must be positive, got {max_size}")
-        self.max_size = max_size
-        self.trajectories: list[dict[str, Any]] = []
-        self.trajectory_versions: list[int] = []
-        self._lock = _threading.Lock()
-
-    def add(
-        self,
-        trajectory: dict[str, Any],
-        weight_version: int,
-        target_weight_version: Optional[int] = None,
-    ) -> str:
-        """Append a trajectory in FIFO order. `target_weight_version` is ignored."""
-        with self._lock:
-            if len(self.trajectories) >= self.max_size:
-                return "full"
-
-            self.trajectories.append(trajectory)
-            self.trajectory_versions.append(weight_version)
-            print(
-                f"🔍 UnforcedReplayBuffer.add: size={len(self.trajectories)}, "
-                f"weight_version={weight_version}, "
-                f"versions_in_buffer={self.trajectory_versions}"
-            )
-            return "success"
-
-    def get_debug_info(self) -> dict:
-        """Get debug information about buffer state."""
-        return {
-            "total_trajectories": len(self.trajectories),
-            "trajectory_versions": list(self.trajectory_versions),
-            "target_weight_versions": [],
-            "max_size": self.max_size,
-        }
-
-    def get_last_target_weight_already_generated(self) -> int:
-        return -1
-
-    def get_existing_target_weights(self) -> set[int]:
-        return set()
-
-    def sample(
+    def _sample_unforced(
         self,
         num_prompt_groups: int,
         current_weight_version: int,
         max_age_steps: int,
     ) -> Optional[dict[str, Any]]:
-        """Pop the oldest `num_prompt_groups` valid trajectories in FIFO order.
-
-        Trajectories with `weight_version < current_weight_version - max_age_steps`
-        are evicted before sampling. Returns `None` (stall) if fewer than
-        `num_prompt_groups` valid trajectories remain.
-        """
+        """Pop the oldest valid trajectories in FIFO order for unforced-lag mode."""
         with self._lock:
             min_valid_version = max(0, current_weight_version - max_age_steps)
 
@@ -318,13 +290,13 @@ class UnforcedReplayBufferImpl(ReplayBufferProtocol):
                 self.trajectories = [p[0] for p in valid_pairs]
                 self.trajectory_versions = [p[1] for p in valid_pairs]
                 print(
-                    f"🗑️ UnforcedReplayBuffer evicted {evicted} stale trajectories "
+                    f"🗑️ ReplayBuffer(unforced) evicted {evicted} stale trajectories "
                     f"(older than weight_version {min_valid_version})"
                 )
 
             available = len(self.trajectories)
             print(
-                f"🔍 UnforcedReplayBuffer.sample: requested={num_prompt_groups}, "
+                f"🔍 ReplayBuffer(unforced).sample: requested={num_prompt_groups}, "
                 f"available={available}, current_weight_version={current_weight_version}, "
                 f"max_age_steps={max_age_steps}, min_valid_version={min_valid_version}"
             )
@@ -357,21 +329,25 @@ class UnforcedReplayBufferImpl(ReplayBufferProtocol):
             }
 
     def evict(self) -> None:
-        """No-op: eviction happens lazily at sample time."""
+        """Evict old trajectories."""
+        # Adding for backward compatibility.
         pass
 
     def size(self) -> int:
+        """Return current buffer size."""
         with self._lock:
             return len(self.trajectories)
 
     def clear(self) -> None:
+        """Clear the buffer."""
         with self._lock:
             self.trajectories.clear()
             self.trajectory_versions.clear()
+            self.target_weight_versions.clear()
 
 
 @ray.remote  # pragma: no cover
-class UnforcedReplayBuffer(UnforcedReplayBufferImpl):
+class ReplayBuffer(ReplayBufferImpl):
     pass
 
 
