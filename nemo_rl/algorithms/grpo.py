@@ -189,6 +189,9 @@ class GRPOSaveState(TypedDict):
     current_epoch: int
     total_steps: int
     total_valid_tokens: int  # Track total number of non-padding tokens during training
+    cumulative_train_time: NotRequired[
+        float
+    ]  # Cumulative wall-clock time in seconds spent inside total_step_time
     val_reward: NotRequired[
         float
     ]  # Optional field - may not be present during training
@@ -201,6 +204,7 @@ def _default_grpo_save_state() -> GRPOSaveState:
         "current_epoch": 0,
         "total_steps": 0,
         "total_valid_tokens": 0,
+        "cumulative_train_time": 0.0,
         "val_reward": -99999999.0,
     }
 
@@ -1396,6 +1400,9 @@ def grpo_train(
     total_valid_tokens = grpo_save_state.get(
         "total_valid_tokens", 0
     )  # total valid tokens processed across all epochs; default to 0 for backward compatibility with older checkpoints
+    cumulative_train_time = grpo_save_state.get(
+        "cumulative_train_time", 0.0
+    )  # cumulative wall-clock seconds spent in total_step_time; default to 0 for backward compatibility
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
     val_period = master_config.grpo["val_period"]
@@ -2028,6 +2035,7 @@ def grpo_train(
                     grpo_save_state["total_steps"] = total_steps + 1
                     grpo_save_state["current_epoch"] = current_epoch
                     grpo_save_state["total_valid_tokens"] = total_valid_tokens
+                    grpo_save_state["cumulative_train_time"] = cumulative_train_time
                     if val_metrics is not None:
                         grpo_save_state["val_reward"] = val_metrics["accuracy"]
                     elif "val_reward" in grpo_save_state:
@@ -2223,6 +2231,8 @@ def grpo_train(
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
+            cumulative_train_time += total_time
+            timing_metrics["cumulative_train_time"] = cumulative_train_time
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
             )
@@ -2510,6 +2520,9 @@ def async_grpo_train(
     total_valid_tokens = grpo_save_state.get(
         "total_valid_tokens", 0
     )  # Default to 0 for backward compatibility with older checkpoints
+    cumulative_train_time = grpo_save_state.get(
+        "cumulative_train_time", 0.0
+    )  # cumulative wall-clock seconds spent in total_step_time; default to 0 for backward compatibility
     val_period = master_config.grpo["val_period"]
     val_at_start = master_config.grpo["val_at_start"]
     val_at_end = master_config.grpo["val_at_end"]
@@ -3163,6 +3176,7 @@ def async_grpo_train(
                 ):
                     grpo_save_state["current_step"] = step + 1
                     grpo_save_state["total_valid_tokens"] = total_valid_tokens
+                    grpo_save_state["cumulative_train_time"] = cumulative_train_time
                     if val_metrics is not None:
                         grpo_save_state["val_reward"] = val_metrics["accuracy"]
                     elif "val_reward" in grpo_save_state:
@@ -3315,6 +3329,8 @@ def async_grpo_train(
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
+            cumulative_train_time += total_time
+            timing_metrics["cumulative_train_time"] = cumulative_train_time
             performance_metrics = print_performance_metrics(
                 train_results, metrics, timing_metrics, master_config
             )
