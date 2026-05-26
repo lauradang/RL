@@ -138,6 +138,13 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         with self._lock:
             return set(self.target_weight_versions)
 
+    def get_target_weight_counts(self) -> dict[int, int]:
+        """Get buffered trajectory counts by target weight version."""
+        if self.lag_mode == "unforced":
+            return {}
+        with self._lock:
+            return dict(Counter(self.target_weight_versions))
+
     def sample(
         self,
         num_prompt_groups: int,
@@ -341,6 +348,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.trajectories.clear()
             self.trajectory_versions.clear()
             self.target_weight_versions.clear()
+            self.last_target_weight_already_generated = -1
 
 
 @ray.remote  # pragma: no cover

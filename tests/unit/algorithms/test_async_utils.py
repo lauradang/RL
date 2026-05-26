@@ -322,6 +322,22 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
+    def test_replay_buffer_get_target_weight_counts(self):
+        """Test counting buffered trajectories per forced-lag target weight."""
+        buffer = ReplayBufferImpl(max_size=10)
+
+        trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
+        assert buffer.get_target_weight_counts() == {}
+
+        buffer.add(trajectory, weight_version=0, target_weight_version=1)
+        buffer.add(trajectory, weight_version=0, target_weight_version=1)
+        buffer.add(trajectory, weight_version=0, target_weight_version=2)
+
+        assert buffer.get_target_weight_counts() == {1: 2, 2: 1}
+
+        buffer.clear()
+        assert buffer.get_target_weight_counts() == {}
+
     def test_replay_buffer_clear(self):
         """Test clearing the buffer."""
         buffer = ReplayBuffer.remote(max_size=10)
@@ -651,6 +667,42 @@ class TestAsyncTrajectoryCollector:
         # Test target weight calculation with different scenarios
         # Note: We can't directly test the private method, but we can test its effects
         # through the public interface behavior
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_forced_target_reservations_fill_target_before_advancing(self):
+        """Test forced mode reserves a full training step before next target."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        first_target, first_count = ray.get(
+            collector._get_next_target_for_generation.remote(0, 1)
+        )
+        second_target, second_count = ray.get(
+            collector._get_next_target_for_generation.remote(0, 1)
+        )
+        third_target, third_count = ray.get(
+            collector._get_next_target_for_generation.remote(0, 1)
+        )
+
+        assert (first_target, first_count) == (0, 1)
+        assert (second_target, second_count) == (0, 1)
+        assert (third_target, third_count) == (1, 1)
 
         ray.kill(collector)
         ray.kill(buffer)
