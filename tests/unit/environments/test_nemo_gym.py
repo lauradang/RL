@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import json
 import time
 from copy import deepcopy
@@ -25,7 +26,12 @@ from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
-from nemo_rl.environments.nemo_gym import NemoGym, NemoGymConfig, setup_nemo_gym_config
+from nemo_rl.environments.nemo_gym import (
+    NemoGym,
+    NemoGymConfig,
+    _PriorityRolloutLimiter,
+    setup_nemo_gym_config,
+)
 from nemo_rl.models.generation.vllm import VllmGeneration
 
 # cluster and tokenizer are fixture imports
@@ -36,6 +42,199 @@ from tests.unit.models.generation.test_vllm_generation import (
 from tests.unit.models.generation.test_vllm_generation import (
     tokenizer as nemo_gym_tokenizer,  # noqa: F401
 )
+
+
+async def _wait_until(predicate, timeout: float = 1.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.01)
+    assert predicate()
+
+
+def test_priority_rollout_limiter_enforces_max_concurrency():
+    async def scenario():
+        limiter = _PriorityRolloutLimiter(max_concurrent=1)
+        second_acquired = asyncio.Event()
+
+        async def acquire_second():
+            async with limiter.context("train"):
+                second_acquired.set()
+
+        async with limiter.context("train"):
+            second_task = asyncio.create_task(acquire_second())
+            await _wait_until(
+                lambda: limiter.waiting_by_kind["train"] == 1
+                and limiter.active_by_kind["train"] == 1
+            )
+            assert not second_acquired.is_set()
+
+        await asyncio.wait_for(second_task, timeout=1)
+        assert second_acquired.is_set()
+        stats = await limiter.stats()
+        assert stats["active_total_requests"] == 0
+        assert stats["max_concurrent_requests"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_priority_rollout_limiter_prioritizes_validation_waiters():
+    async def scenario():
+        limiter = _PriorityRolloutLimiter(max_concurrent=1)
+        release_validation = asyncio.Event()
+        release_train = asyncio.Event()
+        train_acquired = asyncio.Event()
+        validation_acquired = asyncio.Event()
+
+        async def acquire_training():
+            async with limiter.context("train"):
+                train_acquired.set()
+                await release_train.wait()
+
+        async def acquire_validation():
+            async with limiter.context("validation"):
+                validation_acquired.set()
+                await release_validation.wait()
+
+        async with limiter.context("train"):
+            train_task = asyncio.create_task(acquire_training())
+            await _wait_until(lambda: limiter.waiting_by_kind["train"] == 1)
+            validation_task = asyncio.create_task(acquire_validation())
+            await _wait_until(lambda: limiter.waiting_by_kind["validation"] == 1)
+
+        await asyncio.wait_for(validation_acquired.wait(), timeout=1)
+        assert not train_acquired.is_set()
+        stats = await limiter.stats()
+        assert stats["active_validation_requests"] == 1
+        assert stats["waiting_train_requests"] == 1
+
+        release_validation.set()
+        await asyncio.wait_for(train_acquired.wait(), timeout=1)
+        release_train.set()
+        await asyncio.wait_for(validation_task, timeout=1)
+        await asyncio.wait_for(train_task, timeout=1)
+
+    asyncio.run(scenario())
+
+
+def test_priority_rollout_limiter_training_resumes_after_validation_mode():
+    async def scenario():
+        limiter = _PriorityRolloutLimiter(max_concurrent=1)
+        train_acquired = asyncio.Event()
+
+        async def acquire_training():
+            async with limiter.context("train"):
+                train_acquired.set()
+
+        await limiter.enter_validation_mode()
+        train_task = asyncio.create_task(acquire_training())
+        await _wait_until(lambda: limiter.waiting_by_kind["train"] == 1)
+        assert not train_acquired.is_set()
+
+        await limiter.exit_validation_mode()
+        await asyncio.wait_for(train_task, timeout=1)
+        assert train_acquired.is_set()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("invalid_cap", [0, -1, True, 1.5, "8"])
+def test_priority_rollout_limiter_rejects_invalid_cap(invalid_cap):
+    with pytest.raises(ValueError, match="positive int"):
+        _PriorityRolloutLimiter(invalid_cap)
+
+
+def test_nemo_gym_run_rollouts_omits_semaphore_without_limiter():
+    async def scenario():
+        class FakeRunCollectionHelper:
+            def __init__(self):
+                self.kwargs = None
+
+            def run_examples(self, **kwargs):
+                self.kwargs = kwargs
+
+                async def done():
+                    return {"_rowidx": 0}, {"message_log": []}
+
+                return [done()]
+
+        env = NemoGym.__new__(NemoGym)
+        env._rollout_limiter = None
+        env.rollout_max_attempts_to_avoid_lp_nan = 1
+        env.head_server_config = object()
+        env.rch = FakeRunCollectionHelper()
+        env._postprocess_nemo_gym_to_nemo_rl_result = lambda result, tokenizer: result
+
+        results, _ = await NemoGym.run_rollouts(env, [{}], None, "timing/test")
+
+        assert results == [{"message_log": []}]
+        assert "semaphore" not in env.rch.kwargs
+
+    asyncio.run(scenario())
+
+
+def test_nemo_gym_run_rollouts_passes_semaphore_with_limiter():
+    async def scenario():
+        class FakeRunCollectionHelper:
+            def __init__(self):
+                self.kwargs = None
+
+            def run_examples(self, **kwargs):
+                self.kwargs = kwargs
+
+                async def done():
+                    return {"_rowidx": 0}, {"message_log": []}
+
+                return [done()]
+
+        env = NemoGym.__new__(NemoGym)
+        env._rollout_limiter = _PriorityRolloutLimiter(max_concurrent=1)
+        env.rollout_max_attempts_to_avoid_lp_nan = 1
+        env.head_server_config = object()
+        env.rch = FakeRunCollectionHelper()
+        env._postprocess_nemo_gym_to_nemo_rl_result = lambda result, tokenizer: result
+
+        await NemoGym.run_rollouts(
+            env, [{}], None, "timing/test", rollout_kind="validation"
+        )
+
+        assert "semaphore" in env.rch.kwargs
+
+    asyncio.run(scenario())
+
+
+def test_nemo_gym_limiter_actor_methods_report_stats():
+    async def scenario():
+        env = NemoGym.__new__(NemoGym)
+        env._rollout_limiter = None
+
+        assert await NemoGym.has_rollout_limiter(env) is False
+        stats = await NemoGym.get_rollout_limiter_stats(env)
+        assert stats["max_concurrent_requests"] == 0
+
+        env._rollout_limiter = _PriorityRolloutLimiter(max_concurrent=1)
+        assert await NemoGym.has_rollout_limiter(env) is True
+        release_validation = asyncio.Event()
+
+        async def acquire_validation():
+            async with env._rollout_limiter.context("validation"):
+                await release_validation.wait()
+
+        async with env._rollout_limiter.context("train"):
+            validation_task = asyncio.create_task(acquire_validation())
+            await _wait_until(
+                lambda: env._rollout_limiter.waiting_by_kind["validation"] == 1
+            )
+            stats = await NemoGym.get_rollout_limiter_stats(env)
+            assert stats["active_train_requests"] == 1
+            assert stats["waiting_validation_requests"] == 1
+            assert stats["active_total_requests"] == 1
+
+        release_validation.set()
+        await asyncio.wait_for(validation_task, timeout=1)
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.nemo_gym

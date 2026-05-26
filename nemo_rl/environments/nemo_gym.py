@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 from pathlib import Path
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, Literal, Optional, TypedDict
 
 import ray
 import torch
@@ -27,6 +28,152 @@ class NemoGymConfig(TypedDict):
     model_name: str
     base_urls: List[str]
     initial_global_config_dict: Dict[str, Any]
+
+
+RolloutKind = Literal["train", "validation"]
+G_ROLLOUT_KINDS: tuple[RolloutKind, RolloutKind] = ("train", "validation")
+
+
+class _RolloutLimiterContext:
+    def __init__(self, limiter: "_PriorityRolloutLimiter", rollout_kind: RolloutKind):
+        self._limiter = limiter
+        self._rollout_kind = rollout_kind
+
+    async def __aenter__(self) -> "_RolloutLimiterContext":
+        await self._limiter.acquire(self._rollout_kind)
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback) -> None:
+        await self._limiter.release(self._rollout_kind)
+
+
+class _PriorityRolloutLimiter:
+    """Priority-aware async limiter shared by training and validation rollouts."""
+
+    def __init__(self, max_concurrent: int):
+        if (
+            isinstance(max_concurrent, bool)
+            or not isinstance(max_concurrent, int)
+            or max_concurrent <= 0
+        ):
+            raise ValueError(
+                f"max_concurrent_rollout_requests must be a positive int, got {max_concurrent!r}"
+            )
+
+        self.max_concurrent = max_concurrent
+        self.active_by_kind: dict[RolloutKind, int] = {
+            "train": 0,
+            "validation": 0,
+        }
+        self.waiting_by_kind: dict[RolloutKind, int] = {
+            "train": 0,
+            "validation": 0,
+        }
+        self.peak_active_by_kind: dict[RolloutKind, int] = {
+            "train": 0,
+            "validation": 0,
+        }
+        self.peak_active_total = 0
+        self.validation_mode_depth = 0
+        self._condition = asyncio.Condition()
+
+    def context(self, rollout_kind: RolloutKind) -> _RolloutLimiterContext:
+        self._validate_rollout_kind(rollout_kind)
+        return _RolloutLimiterContext(self, rollout_kind)
+
+    async def acquire(self, rollout_kind: RolloutKind) -> None:
+        self._validate_rollout_kind(rollout_kind)
+        async with self._condition:
+            self.waiting_by_kind[rollout_kind] += 1
+            try:
+                await self._condition.wait_for(
+                    lambda: self._can_acquire(rollout_kind)
+                )
+                self.active_by_kind[rollout_kind] += 1
+                self._update_peaks()
+            finally:
+                self.waiting_by_kind[rollout_kind] -= 1
+
+    async def release(self, rollout_kind: RolloutKind) -> None:
+        self._validate_rollout_kind(rollout_kind)
+        async with self._condition:
+            if self.active_by_kind[rollout_kind] <= 0:
+                raise RuntimeError(
+                    f"Cannot release {rollout_kind!r} rollout permit; none are active."
+                )
+            self.active_by_kind[rollout_kind] -= 1
+            self._condition.notify_all()
+
+    async def enter_validation_mode(self) -> None:
+        async with self._condition:
+            self.validation_mode_depth += 1
+            if self.validation_mode_depth == 1:
+                self._reset_peaks()
+            self._condition.notify_all()
+
+    async def exit_validation_mode(self) -> None:
+        async with self._condition:
+            if self.validation_mode_depth <= 0:
+                raise RuntimeError("Cannot exit validation mode; it is not active.")
+            self.validation_mode_depth -= 1
+            self._condition.notify_all()
+
+    async def stats(self) -> dict[str, int]:
+        async with self._condition:
+            active_train = self.active_by_kind["train"]
+            active_validation = self.active_by_kind["validation"]
+            waiting_train = self.waiting_by_kind["train"]
+            waiting_validation = self.waiting_by_kind["validation"]
+            return {
+                "active_train_requests": active_train,
+                "active_validation_requests": active_validation,
+                "active_total_requests": active_train + active_validation,
+                "waiting_train_requests": waiting_train,
+                "waiting_validation_requests": waiting_validation,
+                "waiting_total_requests": waiting_train + waiting_validation,
+                "max_concurrent_requests": self.max_concurrent,
+                "validation_mode_depth": self.validation_mode_depth,
+                "peak_active_train_requests": self.peak_active_by_kind["train"],
+                "peak_active_validation_requests": self.peak_active_by_kind[
+                    "validation"
+                ],
+                "peak_active_total_requests": self.peak_active_total,
+            }
+
+    def _can_acquire(self, rollout_kind: RolloutKind) -> bool:
+        active_total = sum(self.active_by_kind.values())
+        if active_total >= self.max_concurrent:
+            return False
+        if rollout_kind == "validation":
+            return True
+        return (
+            self.validation_mode_depth == 0
+            and self.waiting_by_kind["validation"] == 0
+        )
+
+    def _validate_rollout_kind(self, rollout_kind: RolloutKind) -> None:
+        if rollout_kind not in G_ROLLOUT_KINDS:
+            raise ValueError(
+                f"rollout_kind must be one of {G_ROLLOUT_KINDS}, got {rollout_kind!r}"
+            )
+
+    def _reset_peaks(self) -> None:
+        self.peak_active_by_kind = {
+            "train": self.active_by_kind["train"],
+            "validation": self.active_by_kind["validation"],
+        }
+        self.peak_active_total = sum(self.active_by_kind.values())
+
+    def _update_peaks(self) -> None:
+        for rollout_kind in G_ROLLOUT_KINDS:
+            self.peak_active_by_kind[rollout_kind] = max(
+                self.peak_active_by_kind[rollout_kind],
+                self.active_by_kind[rollout_kind],
+            )
+        self.peak_active_total = max(
+            self.peak_active_total,
+            sum(self.active_by_kind.values()),
+        )
 
 
 @ray.remote(max_restarts=-1, max_task_retries=-1)  # pragma: no cover
@@ -47,9 +194,22 @@ class NemoGym(EnvironmentInterface):
         RELATIVE_PATH = "nemo_rl/environments/nemo_gym.py"
         assert __file__.endswith(RELATIVE_PATH)
 
-        initial_global_config_dict = (
+        initial_global_config_dict = dict(
             self.cfg.get("initial_global_config_dict") or dict()
         )
+        max_concurrent_rollout_requests = initial_global_config_dict.pop(
+            "max_concurrent_rollout_requests", None
+        )
+        self._rollout_limiter: Optional[_PriorityRolloutLimiter] = None
+        if max_concurrent_rollout_requests is not None:
+            self._rollout_limiter = _PriorityRolloutLimiter(
+                max_concurrent_rollout_requests
+            )
+            print(
+                "Configured NeMo-Gym rollout limiter with "
+                f"max_concurrent_rollout_requests={max_concurrent_rollout_requests}."
+            )
+
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -119,16 +279,27 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
-    ) -> list[dict]:
+        rollout_kind: RolloutKind = "train",
+    ) -> tuple[list[dict], dict[str, Any]]:
         timer = Timer()
+        if rollout_kind not in G_ROLLOUT_KINDS:
+            raise ValueError(
+                f"rollout_kind must be one of {G_ROLLOUT_KINDS}, got {rollout_kind!r}"
+            )
 
         timer.start("_run_rollouts_total")
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
         while trial < max_attempts:
             nemo_gym_num_rows = len(nemo_gym_examples)
-            nemo_gym_result_iterator = self.rch.run_examples(
-                examples=nemo_gym_examples, head_server_config=self.head_server_config
-            )
+            run_examples_kwargs = {
+                "examples": nemo_gym_examples,
+                "head_server_config": self.head_server_config,
+            }
+            if self._rollout_limiter is not None:
+                run_examples_kwargs["semaphore"] = self._rollout_limiter.context(
+                    rollout_kind
+                )
+            nemo_gym_result_iterator = self.rch.run_examples(**run_examples_kwargs)
 
             nemo_rl_rowidxs = []
             nemo_rl_results = []
@@ -177,6 +348,34 @@ Depending on your data shape, you may want to change these values."""
         )
 
         return nemo_rl_results, timing_metrics
+
+    async def enter_validation_mode(self) -> None:
+        if self._rollout_limiter is not None:
+            await self._rollout_limiter.enter_validation_mode()
+
+    async def exit_validation_mode(self) -> None:
+        if self._rollout_limiter is not None:
+            await self._rollout_limiter.exit_validation_mode()
+
+    async def has_rollout_limiter(self) -> bool:
+        return self._rollout_limiter is not None
+
+    async def get_rollout_limiter_stats(self) -> dict[str, int]:
+        if self._rollout_limiter is None:
+            return {
+                "active_train_requests": 0,
+                "active_validation_requests": 0,
+                "active_total_requests": 0,
+                "waiting_train_requests": 0,
+                "waiting_validation_requests": 0,
+                "waiting_total_requests": 0,
+                "max_concurrent_requests": 0,
+                "validation_mode_depth": 0,
+                "peak_active_train_requests": 0,
+                "peak_active_validation_requests": 0,
+                "peak_active_total_requests": 0,
+            }
+        return await self._rollout_limiter.stats()
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self, nemo_gym_result: dict, tokenizer: PreTrainedTokenizerBase

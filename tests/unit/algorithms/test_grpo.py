@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 import ray
@@ -116,46 +116,92 @@ class StubAsyncTrajectoryCollector:
     Each method is a property that returns a MagicMock with a 'remote' attribute.
     """
 
+    def __init__(self):
+        self.inflight_count = 0
+        self.start_collection_remote = MagicMock(return_value=MagicMock())
+        self.set_weight_version_remote = MagicMock(return_value=None)
+        self.pause_remote = MagicMock(side_effect=lambda: self.inflight_count)
+        self.resume_remote = MagicMock(return_value=None)
+        self.stop_remote = MagicMock(return_value=None)
+        self.wait_for_stop_remote = MagicMock(return_value=None)
+        self.prepare_for_refit_remote = MagicMock(return_value=None)
+        self.resume_after_refit_remote = MagicMock(return_value=None)
+        self.wait_for_pending_generations_remote = MagicMock(return_value=None)
+        self.get_inflight_count_remote = MagicMock(
+            side_effect=lambda: self.inflight_count
+        )
+        self.get_dataloader_state_remote = MagicMock(return_value={})
+
     @property
     def start_collection(self):
         """Start collection - returns a remote-callable mock"""
         mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())  # Returns a fake ObjectRef
+        mock.remote = self.start_collection_remote
         return mock
 
     @property
     def set_weight_version(self):
         """Set weight version - returns a remote-callable mock"""
         mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())
+        mock.remote = self.set_weight_version_remote
         return mock
 
     @property
     def pause(self):
         """Pause collection - returns a remote-callable mock"""
         mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())
+        mock.remote = self.pause_remote
         return mock
 
     @property
     def resume(self):
         """Resume collection - returns a remote-callable mock"""
         mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())
+        mock.remote = self.resume_remote
         return mock
 
     @property
     def stop(self):
         """Stop collection - returns a remote-callable mock"""
         mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())
+        mock.remote = self.stop_remote
         return mock
 
     @property
     def wait_for_stop(self):
         """Wait for stop - returns a remote-callable mock"""
         mock = MagicMock()
-        mock.remote = MagicMock(return_value=MagicMock())
+        mock.remote = self.wait_for_stop_remote
+        return mock
+
+    @property
+    def prepare_for_refit(self):
+        mock = MagicMock()
+        mock.remote = self.prepare_for_refit_remote
+        return mock
+
+    @property
+    def resume_after_refit(self):
+        mock = MagicMock()
+        mock.remote = self.resume_after_refit_remote
+        return mock
+
+    @property
+    def wait_for_pending_generations(self):
+        mock = MagicMock()
+        mock.remote = self.wait_for_pending_generations_remote
+        return mock
+
+    @property
+    def get_inflight_count(self):
+        mock = MagicMock()
+        mock.remote = self.get_inflight_count_remote
+        return mock
+
+    @property
+    def get_dataloader_state(self):
+        mock = MagicMock()
+        mock.remote = self.get_dataloader_state_remote
         return mock
 
 
@@ -353,6 +399,8 @@ def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
         mock_rollout_metrics=mock_rollout_metrics,
     )
     stub_collector = StubAsyncTrajectoryCollector()
+    stack.stub_buffer = stub_buffer
+    stack.stub_collector = stub_collector
 
     # Patch venv creation
     stack.enter_context(
@@ -435,6 +483,57 @@ def mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics):
     )
 
     return stack
+
+
+class _RemoteMethod:
+    def __init__(self, fn):
+        self._fn = fn
+
+    def remote(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+class _FakeNemoGymActor:
+    def __init__(self, has_limiter: bool):
+        self.events = []
+        self.has_rollout_limiter = _RemoteMethod(lambda: has_limiter)
+        self.get_rollout_limiter_stats = _RemoteMethod(self._get_stats)
+        self.enter_validation_mode = _RemoteMethod(self._enter_validation_mode)
+        self.exit_validation_mode = _RemoteMethod(self._exit_validation_mode)
+
+    def _enter_validation_mode(self):
+        self.events.append("enter")
+
+    def _exit_validation_mode(self):
+        self.events.append("exit")
+
+    def _get_stats(self):
+        return {
+            "active_train_requests": 3,
+            "active_validation_requests": 1,
+            "active_total_requests": 4,
+            "waiting_train_requests": 2,
+            "waiting_validation_requests": 1,
+            "waiting_total_requests": 3,
+            "max_concurrent_requests": 8,
+            "validation_mode_depth": 1,
+            "peak_active_train_requests": 3,
+            "peak_active_validation_requests": 2,
+            "peak_active_total_requests": 5,
+        }
+
+
+def _enable_async_nemo_gym_validation(master_config: MasterConfig) -> None:
+    master_config.grpo["max_num_steps"] = 1
+    master_config.grpo["max_num_epochs"] = 1
+    master_config.grpo["val_period"] = 1
+    master_config.grpo["val_at_start"] = False
+    master_config.grpo["val_at_end"] = False
+    master_config.grpo["use_dynamic_sampling"] = False
+    master_config.grpo["async_grpo"]["enabled"] = True
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+    master_config.env = {"should_use_nemo_gym": True}
 
 
 @contextmanager
@@ -1403,6 +1502,138 @@ def test_grpo_train_collects_generation_logger_metrics(
         "generation_logger_metrics" in call.args[0]
         for call in mock_grpo_components["logger"].log_metrics.call_args_list
     )
+
+
+def test_validate_enters_exits_nemo_gym_validation_mode(mock_grpo_components):
+    mock_batch = next(iter(mock_grpo_components["val_dataloader"]))
+    nemo_gym = _FakeNemoGymActor(has_limiter=True)
+    master_config = mock_grpo_components["master_config"]
+    master_config.env = {"should_use_nemo_gym": True}
+    master_config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+    captured_kwargs = {}
+
+    def fake_nemo_gym_rollout(**kwargs):
+        captured_kwargs.update(kwargs)
+        result = MagicMock()
+        result.final_batch = mock_batch
+        result.rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
+        return result
+
+    with (
+        patch("nemo_rl.algorithms.grpo.ray.get", side_effect=lambda ref: ref),
+        patch(
+            "nemo_rl.algorithms.grpo.run_async_nemo_gym_rollout",
+            side_effect=fake_nemo_gym_rollout,
+        ),
+        patch("nemo_rl.algorithms.grpo.print_message_log_samples"),
+    ):
+        validate(
+            mock_grpo_components["policy"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            {"nemo_gym": nemo_gym},
+            step=1,
+            master_config=master_config,
+            logger=mock_grpo_components["logger"],
+        )
+
+    assert nemo_gym.events == ["enter", "exit"]
+    assert captured_kwargs["rollout_kind"] == "validation"
+
+
+def test_async_grpo_nemo_gym_limiter_skips_validation_drain(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_async_nemo_gym_validation(master_config)
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
+    nemo_gym = _FakeNemoGymActor(has_limiter=True)
+    policy = mock_grpo_components["policy"]
+    policy_generation = MagicMock()
+
+    infra = mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+    validation_events = []
+
+    def fake_validate(*_args, **_kwargs):
+        validation_events.append("validate")
+        return {}, {}
+
+    infra.stub_collector.resume_remote.side_effect = lambda: validation_events.append(
+        "resume"
+    )
+
+    with (
+        infra,
+        patch("nemo_rl.algorithms.grpo.validate", side_effect=fake_validate),
+        _patched_logprob_phase(policy),
+    ):
+        async_grpo_train(
+            policy,
+            policy_generation,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            {"nemo_gym": nemo_gym},
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    assert infra.stub_collector.wait_for_pending_generations_remote.call_count == 0
+    policy_generation.finish_generation.assert_not_called()
+    assert infra.stub_collector.resume_after_refit_remote.call_args_list == [
+        call(resume_collection=False),
+        call(),
+    ]
+    assert validation_events == ["validate", "resume"]
+
+    logged_metric_keys = set()
+    for log_call in mock_grpo_components["logger"].log_metrics.call_args_list:
+        logged_metric_keys.update(log_call.args[0].keys())
+
+    assert "collector_train_threads_before_pause" in logged_metric_keys
+    assert "collector_train_threads_after_resume" in logged_metric_keys
+    assert "nemo_gym_before_validation_active_train_requests" in logged_metric_keys
+    assert "nemo_gym_during_validation_active_validation_requests" in logged_metric_keys
+
+
+def test_async_grpo_nemo_gym_without_limiter_drains_validation(
+    mock_grpo_components,
+):
+    master_config = mock_grpo_components["master_config"]
+    _enable_async_nemo_gym_validation(master_config)
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 10.0}
+    nemo_gym = _FakeNemoGymActor(has_limiter=False)
+    policy = mock_grpo_components["policy"]
+
+    infra = mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics)
+
+    with (
+        infra,
+        _patched_logprob_phase(policy),
+    ):
+        async_grpo_train(
+            policy,
+            None,
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            {"nemo_gym": nemo_gym},
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _default_grpo_save_state(),
+            master_config,
+        )
+
+    assert infra.stub_collector.wait_for_pending_generations_remote.call_count == 1
+    policy.finish_generation.assert_called_once()
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])

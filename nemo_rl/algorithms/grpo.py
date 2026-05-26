@@ -16,7 +16,7 @@ import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Literal, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
@@ -1066,6 +1066,75 @@ def _should_log_nemo_gym_responses(master_config: MasterConfig) -> bool:
     )
 
     return should_log_nemo_gym_responses
+
+
+def _get_nemo_gym_env(
+    task_to_env: Optional[dict[str, EnvironmentInterface]],
+) -> Optional[EnvironmentInterface]:
+    if task_to_env is None:
+        return None
+    return task_to_env.get("nemo_gym")
+
+
+def _nemo_gym_has_rollout_limiter(
+    master_config: MasterConfig,
+    task_to_env: Optional[dict[str, EnvironmentInterface]],
+) -> bool:
+    if not _should_use_nemo_gym(master_config):
+        return False
+
+    nemo_gym_environment = _get_nemo_gym_env(task_to_env)
+    if nemo_gym_environment is None:
+        return False
+
+    return bool(ray.get(nemo_gym_environment.has_rollout_limiter.remote()))
+
+
+@contextmanager
+def _maybe_nemo_gym_validation_mode(
+    master_config: MasterConfig,
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+):
+    if not _should_use_nemo_gym(master_config):
+        yield
+        return
+
+    nemo_gym_environment = _get_nemo_gym_env(val_task_to_env)
+    if nemo_gym_environment is None:
+        raise ValueError("NeMo-Gym validation requires val_task_to_env['nemo_gym']")
+
+    ray.get(nemo_gym_environment.enter_validation_mode.remote())
+    try:
+        yield
+    finally:
+        ray.get(nemo_gym_environment.exit_validation_mode.remote())
+
+
+def _log_async_validation_snapshot(
+    logger: Logger,
+    step: int,
+    snapshot_name: str,
+    trajectory_collector: Optional[Any] = None,
+    nemo_gym_environment: Optional[EnvironmentInterface] = None,
+) -> None:
+    metrics: dict[str, Any] = {}
+
+    if trajectory_collector is not None:
+        metrics[f"collector_train_threads_{snapshot_name}"] = ray.get(
+            trajectory_collector.get_inflight_count.remote()
+        )
+
+    if nemo_gym_environment is not None:
+        limiter_stats = ray.get(nemo_gym_environment.get_rollout_limiter_stats.remote())
+        for key, value in limiter_stats.items():
+            metrics[f"nemo_gym_{snapshot_name}_{key}"] = value
+            if snapshot_name == "after_validation" and key.startswith("peak_active_"):
+                metrics[f"nemo_gym_during_validation_{key.removeprefix('peak_')}"] = (
+                    value
+                )
+
+    if metrics:
+        logger.log_metrics(metrics, step, prefix="timing/validation")
 
 
 def _create_advantage_estimator(master_config: MasterConfig):
@@ -2308,67 +2377,70 @@ def validate(
         total_rewards = []
         total_lengths = []
         all_message_logs = []  # Collect all message logs
+        additional_metrics_to_report = dict()
 
         max_batches = (
             master_config.grpo["max_val_samples"]
             // master_config.grpo["val_batch_size"]
         )
-        for batch_idx, val_batch in enumerate(val_dataloader):
-            if batch_idx >= max_batches:
-                break
+        with _maybe_nemo_gym_validation_mode(master_config, val_task_to_env):
+            for batch_idx, val_batch in enumerate(val_dataloader):
+                if batch_idx >= max_batches:
+                    break
 
-            additional_metrics_to_report = dict()
-            # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
-            # Use async rollouts if vLLM async engine is enabled
-            # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
-            if _should_use_nemo_gym(master_config):
-                generation_config = master_config.policy["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
-                    policy_generation=policy_generation,
-                    input_batch=val_batch,
-                    tokenizer=tokenizer,
-                    task_to_env=val_task_to_env,
-                    max_seq_len=master_config.policy["max_total_sequence_length"],
-                    generation_config=generation_config,
-                    max_rollout_turns=None,
-                    greedy=False,
-                )
-                val_batch = nemo_gym_rollout_result.final_batch
-                gen_metrics = nemo_gym_rollout_result.rollout_metrics
-                additional_metrics_to_report = gen_metrics
-            elif _should_use_async_rollouts(master_config):
-                val_batch, gen_metrics = run_async_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config.policy["max_total_sequence_length"],
-                    max_rollout_turns=master_config.grpo["max_rollout_turns"],
-                    greedy=False,
-                )
-            else:
-                val_batch, gen_metrics = run_multi_turn_rollout(
-                    policy_generation,
-                    val_batch,
-                    tokenizer,
-                    val_task_to_env,
-                    max_seq_len=master_config.policy["max_total_sequence_length"],
-                    max_rollout_turns=master_config.grpo["max_rollout_turns"],
-                    greedy=False,
-                )
+                additional_metrics_to_report = dict()
+                # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+                # Use async rollouts if vLLM async engine is enabled
+                # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
+                if _should_use_nemo_gym(master_config):
+                    generation_config = master_config.policy["generation"]
+                    nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=val_batch,
+                        tokenizer=tokenizer,
+                        task_to_env=val_task_to_env,
+                        max_seq_len=master_config.policy["max_total_sequence_length"],
+                        generation_config=generation_config,
+                        max_rollout_turns=None,
+                        greedy=False,
+                        rollout_kind="validation",
+                    )
+                    val_batch = nemo_gym_rollout_result.final_batch
+                    gen_metrics = nemo_gym_rollout_result.rollout_metrics
+                    additional_metrics_to_report = gen_metrics
+                elif _should_use_async_rollouts(master_config):
+                    val_batch, gen_metrics = run_async_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=master_config.policy["max_total_sequence_length"],
+                        max_rollout_turns=master_config.grpo["max_rollout_turns"],
+                        greedy=False,
+                    )
+                else:
+                    val_batch, gen_metrics = run_multi_turn_rollout(
+                        policy_generation,
+                        val_batch,
+                        tokenizer,
+                        val_task_to_env,
+                        max_seq_len=master_config.policy["max_total_sequence_length"],
+                        max_rollout_turns=master_config.grpo["max_rollout_turns"],
+                        greedy=False,
+                    )
 
-            total_rewards.extend(val_batch["total_reward"].tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+                total_rewards.extend(val_batch["total_reward"].tolist())
+                total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
-            # Collect message logs for later display
-            to_env = [
-                get_keys_from_message_log(
-                    val_batch["message_log"][i], ["role", "content"]
-                )
-                for i in range(len(val_batch["message_log"]))
-            ]
+                # Collect message logs for later display
+                to_env = [
+                    get_keys_from_message_log(
+                        val_batch["message_log"][i], ["role", "content"]
+                    )
+                    for i in range(len(val_batch["message_log"]))
+                ]
 
-            all_message_logs.extend(to_env)
+                all_message_logs.extend(to_env)
 
         # Calculate validation metrics
         num_samples = len(total_rewards)
@@ -2641,6 +2713,17 @@ def async_grpo_train(
     trajectory_collector = AsyncTrajectoryCollector.options(
         runtime_env=_tc_runtime_env
     ).remote(**collector_kwargs)
+    validation_task_to_env = (
+        val_task_to_env if val_task_to_env is not None else task_to_env
+    )
+    nemo_gym_validation_env = (
+        _get_nemo_gym_env(validation_task_to_env)
+        if _should_use_nemo_gym(master_config)
+        else None
+    )
+    nemo_gym_limiter_enabled = _nemo_gym_has_rollout_limiter(
+        master_config, validation_task_to_env
+    )
 
     # Start trajectory collection in background
     collection_task = trajectory_collector.start_collection.remote(dataloader)
@@ -2685,22 +2768,48 @@ def async_grpo_train(
     # Run validation at start if configured
     if val_at_start and step == 0:
         print("\n🔍 Running initial validation...")
-        # Pause trajectory collection during initial validation
-        inflight_at_pause = ray.get(trajectory_collector.pause.remote())
-        logger.log_metrics(
-            {"collector_inflight_at_pause": inflight_at_pause},
+        _log_async_validation_snapshot(
+            logger,
             step,
-            prefix="timing/validation",
+            "before_pause",
+            trajectory_collector=trajectory_collector,
+            nemo_gym_environment=nemo_gym_validation_env,
         )
-        _drain_start = time.time()
-        ray.get(trajectory_collector.wait_for_pending_generations.remote())
-        logger.log_metrics(
-            {"collector_drain_time": time.time() - _drain_start},
+        ray.get(trajectory_collector.pause.remote())
+        _log_async_validation_snapshot(
+            logger,
             step,
-            prefix="timing/validation",
+            "after_pause",
+            trajectory_collector=trajectory_collector,
+            nemo_gym_environment=nemo_gym_validation_env,
         )
 
         try:
+            _log_async_validation_snapshot(
+                logger,
+                step,
+                "before_validation",
+                trajectory_collector=trajectory_collector,
+                nemo_gym_environment=nemo_gym_validation_env,
+            )
+            if nemo_gym_limiter_enabled:
+                logger.log_metrics(
+                    {"collector_drain_skipped": 1, "collector_drain_time": 0.0},
+                    step,
+                    prefix="timing/validation",
+                )
+            else:
+                _drain_start = time.time()
+                ray.get(trajectory_collector.wait_for_pending_generations.remote())
+                logger.log_metrics(
+                    {
+                        "collector_drain_skipped": 0,
+                        "collector_drain_time": time.time() - _drain_start,
+                    },
+                    step,
+                    prefix="timing/validation",
+                )
+
             val_metrics, validation_timings = validate(
                 policy_generation,
                 val_dataloader,
@@ -2710,7 +2819,15 @@ def async_grpo_train(
                 master_config=master_config,
                 logger=logger,
             )
-            policy_generation.finish_generation()
+            if not nemo_gym_limiter_enabled:
+                policy_generation.finish_generation()
+            _log_async_validation_snapshot(
+                logger,
+                step,
+                "after_validation",
+                trajectory_collector=trajectory_collector,
+                nemo_gym_environment=nemo_gym_validation_env,
+            )
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
             print("✅ Initial validation completed successfully")
@@ -2722,7 +2839,14 @@ def async_grpo_train(
             # Continue anyway since validation is optional
         finally:
             # Resume trajectory collection after initial validation
-            trajectory_collector.resume.remote()
+            ray.get(trajectory_collector.resume.remote())
+            _log_async_validation_snapshot(
+                logger,
+                step,
+                "after_resume",
+                trajectory_collector=trajectory_collector,
+                nemo_gym_environment=nemo_gym_validation_env,
+            )
 
     print("✅ All setup complete, starting buffer wait...")
     # Clear logger metrics at start of training
@@ -3008,6 +3132,32 @@ def async_grpo_train(
                         timer=timer,
                     )
 
+                val_metrics, validation_timings = None, None
+                is_last_step = step + 1 == master_config.grpo["max_num_steps"]
+                should_run_validation = (
+                    val_period > 0 and (step + 1) % val_period == 0
+                ) or (val_at_end and is_last_step)
+                collector_paused_for_validation = False
+                refit_resume_deferred_for_validation = False
+
+                if should_run_validation:
+                    _log_async_validation_snapshot(
+                        logger,
+                        step + 1,
+                        "before_pause",
+                        trajectory_collector=trajectory_collector,
+                        nemo_gym_environment=nemo_gym_validation_env,
+                    )
+                    ray.get(trajectory_collector.pause.remote())
+                    collector_paused_for_validation = True
+                    _log_async_validation_snapshot(
+                        logger,
+                        step + 1,
+                        "after_pause",
+                        trajectory_collector=trajectory_collector,
+                        nemo_gym_environment=nemo_gym_validation_env,
+                    )
+
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
                 if NEED_REFIT:
@@ -3034,65 +3184,103 @@ def async_grpo_train(
                         # Update weight version before resuming trajectory collection so that all trajectories are updated with the new correct weight version
                         weight_version += 1
                         trajectory_collector.set_weight_version.remote(weight_version)
-                        trajectory_collector.resume_after_refit.remote()
+                        resume_after_refit_ref = (
+                            trajectory_collector.resume_after_refit.remote(
+                                resume_collection=not should_run_validation
+                            )
+                        )
+                        if should_run_validation:
+                            ray.get(resume_after_refit_ref)
+                        refit_resume_deferred_for_validation = should_run_validation
 
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:
                     policy_generation.clear_logger_metrics()
 
                 # Validation
-                val_metrics, validation_timings = None, None
-                is_last_step = step + 1 == master_config.grpo["max_num_steps"]
-
-                # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (step + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
-                    # Pause trajectory collection during validation to reduce memory pressure
-                    inflight_at_pause = ray.get(trajectory_collector.pause.remote())
-                    logger.log_metrics(
-                        {"collector_inflight_at_pause": inflight_at_pause},
-                        step + 1,
-                        prefix="timing/validation",
-                    )
-                    _drain_start = time.time()
-                    ray.get(trajectory_collector.wait_for_pending_generations.remote())
-                    logger.log_metrics(
-                        {"collector_drain_time": time.time() - _drain_start},
-                        step + 1,
-                        prefix="timing/validation",
-                    )
-
-                    if NEED_REFIT and POLICY_GENERATION_STALE:
-                        refit_policy_generation(
-                            policy, policy_generation, colocated_inference
+                if should_run_validation:
+                    try:
+                        _log_async_validation_snapshot(
+                            logger,
+                            step + 1,
+                            "before_validation",
+                            trajectory_collector=trajectory_collector,
+                            nemo_gym_environment=nemo_gym_validation_env,
                         )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        policy_generation.prepare_for_generation()
-                    val_metrics, validation_timings = validate(
-                        policy_generation,
-                        val_dataloader,
-                        tokenizer,
-                        val_task_to_env,
-                        step=step + 1,
-                        master_config=master_config,
-                        logger=logger,
-                    )
-                    policy_generation.finish_generation()
-                    logger.log_metrics(
-                        validation_timings, step + 1, prefix="timing/validation"
-                    )
-                    logger.log_metrics(val_metrics, step + 1, prefix="validation")
+                        if nemo_gym_limiter_enabled:
+                            logger.log_metrics(
+                                {
+                                    "collector_drain_skipped": 1,
+                                    "collector_drain_time": 0.0,
+                                },
+                                step + 1,
+                                prefix="timing/validation",
+                            )
+                        else:
+                            _drain_start = time.time()
+                            ray.get(
+                                trajectory_collector.wait_for_pending_generations.remote()
+                            )
+                            logger.log_metrics(
+                                {
+                                    "collector_drain_skipped": 0,
+                                    "collector_drain_time": time.time() - _drain_start,
+                                },
+                                step + 1,
+                                prefix="timing/validation",
+                            )
 
-                    # Explicit GPU memory cleanup after validation in async mode
-                    import gc
+                        if NEED_REFIT and POLICY_GENERATION_STALE:
+                            refit_policy_generation(
+                                policy, policy_generation, colocated_inference
+                            )
+                            POLICY_GENERATION_STALE = False
+                        else:
+                            policy_generation.prepare_for_generation()
+                        val_metrics, validation_timings = validate(
+                            policy_generation,
+                            val_dataloader,
+                            tokenizer,
+                            val_task_to_env,
+                            step=step + 1,
+                            master_config=master_config,
+                            logger=logger,
+                        )
+                        if not nemo_gym_limiter_enabled:
+                            policy_generation.finish_generation()
+                        _log_async_validation_snapshot(
+                            logger,
+                            step + 1,
+                            "after_validation",
+                            trajectory_collector=trajectory_collector,
+                            nemo_gym_environment=nemo_gym_validation_env,
+                        )
+                        logger.log_metrics(
+                            validation_timings, step + 1, prefix="timing/validation"
+                        )
+                        logger.log_metrics(
+                            val_metrics, step + 1, prefix="validation"
+                        )
 
-                    gc.collect()
-                    torch.cuda.empty_cache()
+                        # Explicit GPU memory cleanup after validation in async mode
+                        import gc
 
-                    # Resume trajectory collection after validation
-                    trajectory_collector.resume.remote()
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                    finally:
+                        if refit_resume_deferred_for_validation:
+                            ray.get(trajectory_collector.resume_after_refit.remote())
+                            refit_resume_deferred_for_validation = False
+                        if collector_paused_for_validation:
+                            ray.get(trajectory_collector.resume.remote())
+                            collector_paused_for_validation = False
+                            _log_async_validation_snapshot(
+                                logger,
+                                step + 1,
+                                "after_resume",
+                                trajectory_collector=trajectory_collector,
+                                nemo_gym_environment=nemo_gym_validation_env,
+                            )
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
                 flat_token_mask = flat_messages["token_loss_mask"]

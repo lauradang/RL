@@ -68,6 +68,7 @@ class AsyncTrajectoryCollector:
 
         self._refit_pause_cleared = _threading.Event()
         self._refit_pause_cleared.set()  # Start in cleared state
+        self._post_refit_cleanup_pending = False
 
         self.current_weight_version: int = start_step
         self.initial_weight_version: int = start_step
@@ -451,6 +452,7 @@ class AsyncTrajectoryCollector:
 
         # Pause new generation starts
         self._refit_pause_cleared.clear()
+        self._post_refit_cleanup_pending = True
         print("⏸️ New generation starts paused")
 
         # Check if we're using vLLM async engine
@@ -480,7 +482,7 @@ class AsyncTrajectoryCollector:
         elapsed = time.time() - start_time
         print(f"✅ Ready for refit (took {elapsed:.2f}s)")
 
-    def resume_after_refit(self) -> None:
+    def resume_after_refit(self, resume_collection: bool = True) -> None:
         """Resume new generation starts after refit is complete."""
         print("🔄 Resuming generation starts after refit")
 
@@ -488,22 +490,29 @@ class AsyncTrajectoryCollector:
         # recompute_kv_cache_after_weight_updates is True (AREAL-style implementation).
         # Otherwise, keep using the stale KV caches (Magistral-style implementation).
         async_cfg = self.master_config.grpo.get("async_grpo", {})
-        if async_cfg.get("in_flight_weight_updates", False) and async_cfg.get(
-            "recompute_kv_cache_after_weight_updates", False
-        ):
-            try:
-                print("🔄 Invalidating vLLM prefix/KV caches after weight update")
-                invalidated = self.policy_generation.invalidate_kv_cache()
-                if invalidated:
-                    print("✅ Invalidated vLLM prefix/KV caches after weight update")
-                else:
-                    print(
-                        "⚠️ vLLM cache invalidation reported partial/unsuccessful on some workers"
-                    )
-            except Exception as e:
-                print(f"⚠️ Failed to invalidate vLLM caches: {e}")
+        # This cleanup is separate from unblocking collection so validation can keep
+        # new training starts paused without rerunning post-refit work later.
+        if self._post_refit_cleanup_pending:
+            if async_cfg.get("in_flight_weight_updates", False) and async_cfg.get(
+                "recompute_kv_cache_after_weight_updates", False
+            ):
+                try:
+                    print("🔄 Invalidating vLLM prefix/KV caches after weight update")
+                    invalidated = self.policy_generation.invalidate_kv_cache()
+                    if invalidated:
+                        print("✅ Invalidated vLLM prefix/KV caches after weight update")
+                    else:
+                        print(
+                            "⚠️ vLLM cache invalidation reported partial/unsuccessful on some workers"
+                        )
+                except Exception as e:
+                    print(f"⚠️ Failed to invalidate vLLM caches: {e}")
+            self._post_refit_cleanup_pending = False
 
-        self._refit_pause_cleared.set()
+        if resume_collection:
+            self._refit_pause_cleared.set()
+        else:
+            print("⏸️ Keeping new generation starts paused after refit")
 
     def wait_for_pending_generations(self) -> None:
         """Wait for all in-flight generation threads to complete."""

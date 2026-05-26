@@ -805,6 +805,75 @@ def test_run_async_nemo_gym_rollout_warns_when_max_seq_len_exceeds_engine():
             )
 
 
+def test_run_async_nemo_gym_rollout_passes_rollout_kind(monkeypatch):
+    class _FakePolicyGeneration:
+        cfg = {"vllm_cfg": {"max_model_len": 16}}
+
+    class _FakeTokenizer:
+        pad_token_id = 0
+
+    class _RemoteMethod:
+        def __init__(self, fn):
+            self._fn = fn
+
+        def remote(self, *args, **kwargs):
+            return self._fn(*args, **kwargs)
+
+    class _FakeNemoGym:
+        def __init__(self):
+            self.calls = []
+            self.run_rollouts = _RemoteMethod(self._run_rollouts)
+
+        def _run_rollouts(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            result = {
+                "input_message_log": [{"role": "user", "token_ids": [1]}],
+                "message_log": [
+                    {"role": "user", "token_ids": [1]},
+                    {
+                        "role": "assistant",
+                        "token_ids": [2],
+                        "generation_logprobs": [0.0],
+                    },
+                ],
+                "full_result": {"reward": 1.0},
+            }
+            return [result], {}
+
+    monkeypatch.setattr(ray, "get", lambda ref: ref)
+    nemo_gym = _FakeNemoGym()
+    row = {
+        "agent_ref": {"name": "agent", "type": "responses_api_agents"},
+        "responses_create_params": {},
+    }
+    input_batch = BatchedDataDict[DatumSpec](
+        {
+            "extra_env_info": [row],
+            "loss_multiplier": torch.tensor([1.0]),
+        }
+    )
+
+    run_async_nemo_gym_rollout(
+        policy_generation=_FakePolicyGeneration(),
+        input_batch=input_batch,
+        tokenizer=_FakeTokenizer(),
+        task_to_env={"nemo_gym": nemo_gym},
+        generation_config={
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": None,
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "max_new_tokens": 4,
+        },
+        max_seq_len=16,
+        max_rollout_turns=None,
+        rollout_kind="validation",
+    )
+
+    assert nemo_gym.calls[0][1]["rollout_kind"] == "validation"
+
+
 @pytest.mark.nemo_gym
 def test_run_async_nemo_gym_rollout(
     nemo_gym,  # noqa: F811

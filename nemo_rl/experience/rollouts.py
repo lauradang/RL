@@ -23,7 +23,7 @@ import statistics
 import warnings
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import ray
 import torch
@@ -1101,6 +1101,7 @@ def run_async_nemo_gym_rollout(
     max_seq_len: Optional[int] = None,
     max_rollout_turns: Optional[int] = None,
     greedy: bool = False,
+    rollout_kind: Literal["train", "validation"] = "train",
 ) -> AsyncNemoGymRolloutResult:
     """Run multi-turn rollouts with NeMo-Gym. Please refer to the `run_async_multi_turn_rollout` docs for more information on the parameters."""
     # We accept max_seq_len for API parity with the other rollout paths, but NeMo-Gym
@@ -1160,7 +1161,7 @@ def run_async_nemo_gym_rollout(
         nemo_gym_environment = task_to_env["nemo_gym"]
         results, rollout_loop_timing_metrics = ray.get(
             nemo_gym_environment.run_rollouts.remote(
-                nemo_gym_rows, tokenizer, timer_prefix
+                nemo_gym_rows, tokenizer, timer_prefix, rollout_kind=rollout_kind
             )
         )
 
