@@ -726,6 +726,20 @@ class TestAsyncTrajectoryCollector:
         )
         assert (next_target, next_count) == (1, 1)
 
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=2,
+                current_weight_version=0,
+                max_age_steps=2,
+            )
+        )
+        assert sample_result is not None
+
+        after_consume_target, after_consume_count = ray.get(
+            collector._get_next_target_for_generation.remote(0, 1)
+        )
+        assert (after_consume_target, after_consume_count) == (1, 1)
+
         ray.kill(collector)
         ray.kill(buffer)
         ray.kill(mock_env)

@@ -99,6 +99,7 @@ class AsyncTrajectoryCollector:
         # only when buffered groups plus in-flight reservations reaches a full
         # training step.
         self._target_reservations: dict[int, int] = {}
+        self._completed_target_weights: set[int] = set()
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.
@@ -141,8 +142,12 @@ class AsyncTrajectoryCollector:
 
         with self._generation_check_lock:
             for target_weight in target_weights:
+                if target_weight in self._completed_target_weights:
+                    continue
+
                 buffered_count = buffered_counts.get(target_weight, 0)
                 if buffered_count >= target_group_goal:
+                    self._mark_target_complete_locked(target_weight)
                     continue
 
                 reserved_count = self._target_reservations.get(target_weight, 0)
@@ -171,6 +176,31 @@ class AsyncTrajectoryCollector:
 
         return None, 0
 
+    def _mark_target_complete_locked(self, target_weight_version: int) -> None:
+        if target_weight_version not in self._completed_target_weights:
+            print(
+                f"✅ Target weight {target_weight_version} has a full training step buffered; "
+                "skipping future reservations for it"
+            )
+        self._completed_target_weights.add(target_weight_version)
+        self._target_reservations.pop(target_weight_version, None)
+
+    def _mark_target_complete_if_buffered(self, target_weight_version: int) -> None:
+        target_group_goal = int(self.master_config.grpo["num_prompts_per_step"])
+        try:
+            buffered_counts = ray.get(
+                self.replay_buffer.get_target_weight_counts.remote()
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to check completed target weight {target_weight_version}: {e}")
+            return
+
+        if buffered_counts.get(target_weight_version, 0) < target_group_goal:
+            return
+
+        with self._generation_check_lock:
+            self._mark_target_complete_locked(target_weight_version)
+
     def _release_target_reservation(self, target_weight_version: int) -> None:
         with self._generation_check_lock:
             reserved_count = self._target_reservations.get(target_weight_version, 0)
@@ -179,6 +209,7 @@ class AsyncTrajectoryCollector:
             else:
                 self._target_reservations[target_weight_version] = reserved_count - 1
         self._generation_limit_cleared.set()
+        self._mark_target_complete_if_buffered(target_weight_version)
 
     def set_weight_version(self, version: int) -> None:
         self.current_weight_version = version
@@ -210,8 +241,12 @@ class AsyncTrajectoryCollector:
             # Check if any target weight in our range needs generation
             with self._generation_check_lock:
                 for target_weight in target_weights:
+                    if target_weight in self._completed_target_weights:
+                        continue
+
                     buffered_count = buffered_counts.get(target_weight, 0)
                     if buffered_count >= target_group_goal:
+                        self._mark_target_complete_locked(target_weight)
                         continue
 
                     reserved_count = self._target_reservations.get(target_weight, 0)
