@@ -91,6 +91,7 @@ class TestSetupDistributed:
 
     @patch("nemo_rl.models.megatron.setup.destroy_parallel_state")
     @patch("nemo_rl.models.megatron.setup.configure_dynamo_cache")
+    @patch("nemo_rl.models.megatron.setup.torch.distributed.new_group")
     @patch("nemo_rl.models.megatron.setup.torch.distributed.init_process_group")
     @patch("nemo_rl.models.megatron.setup.torch.cuda.set_device")
     @patch("nemo_rl.models.megatron.setup.torch.cuda.device_count", return_value=1)
@@ -101,23 +102,37 @@ class TestSetupDistributed:
         _mock_device_count,
         _mock_set_device,
         mock_init_process_group,
+        mock_new_group,
         _mock_configure_dynamo_cache,
         _mock_destroy_parallel_state,
         monkeypatch,
     ):
         from datetime import timedelta
 
-        from nemo_rl.models.megatron.setup import setup_distributed
+        from nemo_rl.models.megatron import setup as megatron_setup
 
         monkeypatch.setenv("LOCAL_RANK", "0")
         monkeypatch.setenv("NEMO_RL_DISTRIBUTED_TIMEOUT_SECONDS", "3600")
 
-        setup_distributed()
+        megatron_setup.setup_distributed()
 
         mock_init_process_group.assert_called_once_with(
             backend="nccl",
             device_id=torch.device("cuda", 0),
             timeout=timedelta(seconds=3600),
+        )
+        megatron_setup.torch.distributed.new_group(ranks=[0, 1])
+        mock_new_group.assert_called_once_with(
+            ranks=[0, 1], timeout=timedelta(seconds=3600)
+        )
+
+        mock_new_group.reset_mock()
+        explicit_timeout = timedelta(seconds=5)
+        megatron_setup.torch.distributed.new_group(
+            ranks=[0, 1], timeout=explicit_timeout
+        )
+        mock_new_group.assert_called_once_with(
+            ranks=[0, 1], timeout=explicit_timeout
         )
 
     @patch("nemo_rl.models.megatron.setup.destroy_parallel_state")

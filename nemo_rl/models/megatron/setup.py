@@ -151,6 +151,8 @@ def setup_distributed() -> None:
     configure_dynamo_cache()
     # Ensure clean slate before import
     destroy_parallel_state()
+    timeout = _get_distributed_timeout_from_env()
+    _install_new_group_timeout_patch(timeout)
     # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
     torch.distributed.init_process_group(**_get_nccl_init_process_group_kwargs())
 
@@ -167,6 +169,26 @@ def _get_nccl_init_process_group_kwargs() -> dict[str, Any]:
         init_kwargs["timeout"] = timeout
 
     return init_kwargs
+
+
+def _install_new_group_timeout_patch(timeout: Optional[timedelta]) -> None:
+    if timeout is None:
+        return
+
+    current_new_group = torch.distributed.new_group
+    original_new_group = getattr(
+        current_new_group, "_nemo_rl_original_new_group", current_new_group
+    )
+
+    def new_group_with_timeout(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("timeout") is None:
+            kwargs["timeout"] = timeout
+        return original_new_group(*args, **kwargs)
+
+    new_group_with_timeout._nemo_rl_original_new_group = (  # type: ignore[attr-defined]
+        original_new_group
+    )
+    torch.distributed.new_group = new_group_with_timeout
 
 
 def _get_local_cuda_device() -> Optional[torch.device]:
