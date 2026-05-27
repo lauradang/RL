@@ -673,7 +673,7 @@ class TestAsyncTrajectoryCollector:
         ray.kill(mock_env)
 
     def test_forced_target_reservations_fill_target_before_advancing(self):
-        """Test forced mode reserves a full training step before next target."""
+        """Test forced mode waits for a target to buffer before advancing."""
         buffer = ReplayBuffer.remote(max_size=10)
         mock_generation = MockGenerationInterface()
         mock_tokenizer = mock.MagicMock()
@@ -702,7 +702,29 @@ class TestAsyncTrajectoryCollector:
 
         assert (first_target, first_count) == (0, 1)
         assert (second_target, second_count) == (0, 1)
-        assert (third_target, third_count) == (1, 1)
+        assert (third_target, third_count) == (None, 0)
+        assert ray.get(collector._should_pause_for_generation_limits.remote())
+
+        ray.get(collector._release_target_reservation.remote(0))
+        refilled_target, refilled_count = ray.get(
+            collector._get_next_target_for_generation.remote(0, 1)
+        )
+        assert (refilled_target, refilled_count) == (0, 1)
+
+        trajectory = {
+            "batch": self.create_mock_batch(size=1),
+            "rollout_metrics": {},
+            "timestamp": 0.0,
+        }
+        ray.get(buffer.add.remote(trajectory, weight_version=0, target_weight_version=0))
+        ray.get(buffer.add.remote(trajectory, weight_version=0, target_weight_version=0))
+        ray.get(collector._release_target_reservation.remote(0))
+        ray.get(collector._release_target_reservation.remote(0))
+
+        next_target, next_count = ray.get(
+            collector._get_next_target_for_generation.remote(0, 1)
+        )
+        assert (next_target, next_count) == (1, 1)
 
         ray.kill(collector)
         ray.kill(buffer)

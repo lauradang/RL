@@ -142,8 +142,19 @@ class AsyncTrajectoryCollector:
         with self._generation_check_lock:
             for target_weight in target_weights:
                 buffered_count = buffered_counts.get(target_weight, 0)
+                if buffered_count >= target_group_goal:
+                    continue
+
                 reserved_count = self._target_reservations.get(target_weight, 0)
                 missing_count = target_group_goal - buffered_count - reserved_count
+
+                if missing_count <= 0:
+                    print(
+                        f"🎯 Target weight {target_weight} is fully reserved "
+                        f"({buffered_count} buffered, {reserved_count} reserved, goal {target_group_goal}); "
+                        "waiting before advancing to later targets"
+                    )
+                    return None, 0
 
                 if missing_count > 0:
                     reservation_count = min(
@@ -167,6 +178,7 @@ class AsyncTrajectoryCollector:
                 self._target_reservations.pop(target_weight_version, None)
             else:
                 self._target_reservations[target_weight_version] = reserved_count - 1
+        self._generation_limit_cleared.set()
 
     def set_weight_version(self, version: int) -> None:
         self.current_weight_version = version
@@ -199,9 +211,19 @@ class AsyncTrajectoryCollector:
             with self._generation_check_lock:
                 for target_weight in target_weights:
                     buffered_count = buffered_counts.get(target_weight, 0)
+                    if buffered_count >= target_group_goal:
+                        continue
+
                     reserved_count = self._target_reservations.get(target_weight, 0)
-                    if buffered_count + reserved_count < target_group_goal:
-                        return False  # Found a target that needs generation
+                    if buffered_count + reserved_count >= target_group_goal:
+                        print(
+                            f"⏸️ Target weight {target_weight} has {buffered_count} buffered "
+                            f"and {reserved_count} in-flight reservations; waiting before "
+                            "starting later targets"
+                        )
+                        return True
+
+                    return False
 
             print(
                 f"⏸️ All target weights {target_weights} already generated or in progress, pausing"
@@ -257,20 +279,17 @@ class AsyncTrajectoryCollector:
                 if self._should_pause_for_generation_limits() and self.running:
                     # Only log warning once per weight version
                     if self._last_limit_warning_version != self.current_weight_version:
-                        async_cfg = self.master_config.grpo.get("async_grpo", {})
-                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-                        target_weights = [
-                            self.current_weight_version + i
-                            for i in range(max_trajectory_age)
-                        ]
+                        target_weights = self._calculate_target_weights(
+                            self.current_weight_version
+                        )
 
                         print(
                             f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
-                            f"already exist in buffer. Waiting for weight update..."
+                            "are already buffered or reserved. Waiting before starting more generation..."
                         )
                         self._last_limit_warning_version = self.current_weight_version
 
-                        self._generation_limit_cleared.clear()  # Clear the event to pause
+                    self._generation_limit_cleared.clear()
 
                     # Efficiently wait for generation limits to be cleared (no polling!)
                     self._generation_limit_cleared.wait()
