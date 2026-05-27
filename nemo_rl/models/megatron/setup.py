@@ -14,6 +14,7 @@
 
 import hashlib
 import json
+import math
 import os
 import time
 import warnings
@@ -149,46 +150,113 @@ def setup_distributed() -> None:
     # Disable dynamo autotune_local_cache to avoid crash when there's already a cache
     # with different order of node_bundles
     configure_dynamo_cache()
+    timeout = _get_distributed_timeout_from_env()
+    _install_distributed_timeout_patch(timeout)
     # Ensure clean slate before import
     destroy_parallel_state()
-    timeout = _get_distributed_timeout_from_env()
-    _install_new_group_timeout_patch(timeout)
     # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-    torch.distributed.init_process_group(**_get_nccl_init_process_group_kwargs())
+    torch.distributed.init_process_group(
+        **_get_nccl_init_process_group_kwargs(timeout)
+    )
 
 
-def _get_nccl_init_process_group_kwargs() -> dict[str, Any]:
+def _get_nccl_init_process_group_kwargs(
+    timeout: Optional[timedelta] = None,
+) -> dict[str, Any]:
     init_kwargs: dict[str, Any] = {"backend": "nccl"}
 
     device = _get_local_cuda_device()
     if device is not None:
         init_kwargs["device_id"] = device
 
-    timeout = _get_distributed_timeout_from_env()
     if timeout is not None:
         init_kwargs["timeout"] = timeout
 
     return init_kwargs
 
 
-def _install_new_group_timeout_patch(timeout: Optional[timedelta]) -> None:
+def _install_distributed_timeout_patch(timeout: Optional[timedelta]) -> None:
     if timeout is None:
         return
 
-    current_new_group = torch.distributed.new_group
-    original_new_group = getattr(
-        current_new_group, "_nemo_rl_original_new_group", current_new_group
+    _set_default_pg_timeout(timeout)
+    _patch_distributed_timeout_function(
+        torch.distributed, "init_process_group", timeout
+    )
+    _patch_distributed_timeout_function(torch.distributed, "new_group", timeout)
+
+    distributed_c10d = getattr(torch.distributed, "distributed_c10d", None)
+    if distributed_c10d is not None:
+        _patch_distributed_timeout_function(
+            distributed_c10d, "init_process_group", timeout
+        )
+        _patch_distributed_timeout_function(distributed_c10d, "new_group", timeout)
+
+    print(
+        "[NeMo-RL] Distributed process group timeout minimum set to "
+        f"{int(timeout.total_seconds())} seconds",
+        flush=True,
     )
 
-    def new_group_with_timeout(*args: Any, **kwargs: Any) -> Any:
-        if kwargs.get("timeout") is None:
+
+def _set_default_pg_timeout(timeout: timedelta) -> None:
+    if hasattr(torch.distributed, "constants"):
+        torch.distributed.constants.default_pg_timeout = timeout
+
+    distributed_c10d = getattr(torch.distributed, "distributed_c10d", None)
+    if distributed_c10d is not None and hasattr(
+        distributed_c10d, "default_pg_timeout"
+    ):
+        distributed_c10d.default_pg_timeout = timeout
+
+
+def _patch_distributed_timeout_function(
+    module: Any, function_name: str, timeout: timedelta
+) -> None:
+    current_function = getattr(module, function_name, None)
+    if current_function is None:
+        return
+
+    original_function = getattr(
+        current_function,
+        "_nemo_rl_original_distributed_timeout_function",
+        current_function,
+    )
+
+    def function_with_timeout(*args: Any, **kwargs: Any) -> Any:
+        if _should_replace_distributed_timeout(kwargs.get("timeout"), timeout):
             kwargs["timeout"] = timeout
-        return original_new_group(*args, **kwargs)
+        return original_function(*args, **kwargs)
 
-    new_group_with_timeout._nemo_rl_original_new_group = (  # type: ignore[attr-defined]
-        original_new_group
+    function_with_timeout._nemo_rl_original_distributed_timeout_function = (  # type: ignore[attr-defined]
+        original_function
     )
-    torch.distributed.new_group = new_group_with_timeout
+    setattr(module, function_name, function_with_timeout)
+
+
+def _should_replace_distributed_timeout(
+    existing_timeout: Any, minimum_timeout: timedelta
+) -> bool:
+    if existing_timeout is None:
+        return True
+
+    try:
+        return existing_timeout < minimum_timeout
+    except TypeError:
+        return False
+
+
+def _apply_megatron_distributed_timeout(
+    megatron_cfg: ConfigContainer, timeout: Optional[timedelta]
+) -> None:
+    if timeout is None:
+        return
+
+    timeout_minutes = max(1, math.ceil(timeout.total_seconds() / 60))
+    if hasattr(megatron_cfg, "dist") and hasattr(
+        megatron_cfg.dist, "distributed_timeout_minutes"
+    ):
+        megatron_cfg.dist.distributed_timeout_minutes = timeout_minutes
 
 
 def _get_local_cuda_device() -> Optional[torch.device]:
@@ -976,6 +1044,9 @@ def setup_model_and_optimizer(
     state.cfg = megatron_cfg
     # TODO: Freeze state.cfg
 
+    _apply_megatron_distributed_timeout(
+        megatron_cfg, _get_distributed_timeout_from_env()
+    )
     megatron_cfg.dist.external_gpu_device_mapping = True
     initialize_megatron(
         cfg=megatron_cfg,

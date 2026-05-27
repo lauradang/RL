@@ -121,6 +121,14 @@ class TestSetupDistributed:
             device_id=torch.device("cuda", 0),
             timeout=timedelta(seconds=3600),
         )
+        mock_init_process_group.reset_mock()
+        megatron_setup.torch.distributed.init_process_group(
+            backend="nccl", timeout=timedelta(seconds=600)
+        )
+        mock_init_process_group.assert_called_once_with(
+            backend="nccl", timeout=timedelta(seconds=3600)
+        )
+
         megatron_setup.torch.distributed.new_group(ranks=[0, 1])
         mock_new_group.assert_called_once_with(
             ranks=[0, 1], timeout=timedelta(seconds=3600)
@@ -132,7 +140,16 @@ class TestSetupDistributed:
             ranks=[0, 1], timeout=explicit_timeout
         )
         mock_new_group.assert_called_once_with(
-            ranks=[0, 1], timeout=explicit_timeout
+            ranks=[0, 1], timeout=timedelta(seconds=3600)
+        )
+
+        mock_new_group.reset_mock()
+        longer_timeout = timedelta(seconds=7200)
+        megatron_setup.torch.distributed.new_group(
+            ranks=[0, 1], timeout=longer_timeout
+        )
+        mock_new_group.assert_called_once_with(
+            ranks=[0, 1], timeout=longer_timeout
         )
 
     @patch("nemo_rl.models.megatron.setup.destroy_parallel_state")
@@ -158,6 +175,19 @@ class TestSetupDistributed:
             setup_distributed()
 
         mock_init_process_group.assert_not_called()
+
+    def test_apply_megatron_distributed_timeout_sets_minutes(self):
+        from datetime import timedelta
+
+        from nemo_rl.models.megatron.setup import _apply_megatron_distributed_timeout
+
+        config = SimpleNamespace(
+            dist=SimpleNamespace(distributed_timeout_minutes=10)
+        )
+
+        _apply_megatron_distributed_timeout(config, timedelta(seconds=3600))
+
+        assert config.dist.distributed_timeout_minutes == 60
 
 
 @pytest.mark.mcore
