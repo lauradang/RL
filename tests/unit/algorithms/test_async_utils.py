@@ -15,6 +15,7 @@
 import os
 import tempfile
 import threading
+import time
 import unittest.mock as mock
 
 import pytest
@@ -748,6 +749,75 @@ class TestAsyncTrajectoryCollector:
         assert (refill_current_target, refill_current_count) == (1, 1)
 
         ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_forced_target_reservation_timeout_allows_replacement(self):
+        """Test forced mode can replace a stale in-flight reservation."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+        master_config.grpo["async_grpo"]["forced_reservation_timeout_seconds"] = 0.01
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        target, count = ray.get(collector._get_next_target_for_generation.remote(0, 2))
+        assert (target, count) == (0, 2)
+
+        trajectory = {
+            "batch": self.create_mock_batch(size=1),
+            "rollout_metrics": {},
+            "timestamp": 0.0,
+        }
+        ray.get(buffer.add.remote(trajectory, weight_version=0, target_weight_version=0))
+        ray.get(collector._release_target_reservation.remote(0))
+
+        blocked_target, blocked_count = ray.get(
+            collector._get_next_target_for_generation.remote(0, 1)
+        )
+        assert (blocked_target, blocked_count) == (None, 0)
+
+        time.sleep(0.02)
+        replacement_target, replacement_count = ray.get(
+            collector._get_next_target_for_generation.remote(0, 1)
+        )
+        assert (replacement_target, replacement_count) == (0, 1)
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_forced_target_reservation_timeout_must_be_positive(self):
+        """Test invalid forced reservation timeout values fail fast."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+        master_config.grpo["async_grpo"]["forced_reservation_timeout_seconds"] = 0
+
+        with pytest.raises(ray.exceptions.RayActorError):
+            collector = AsyncTrajectoryCollector.remote(
+                policy_generation=mock_generation,
+                tokenizer=mock_tokenizer,
+                task_to_env=task_to_env,
+                master_config=master_config,
+                replay_buffer=buffer,
+                start_step=0,
+            )
+            ray.get(collector.get_weight_version.remote())
+
         ray.kill(buffer)
         ray.kill(mock_env)
 

@@ -93,12 +93,25 @@ class AsyncTrajectoryCollector:
         self.max_inflight_generations = max_inflight
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
+        forced_reservation_timeout = self.master_config.grpo.get(
+            "async_grpo", {}
+        ).get("forced_reservation_timeout_seconds", None)
+        if forced_reservation_timeout is not None:
+            forced_reservation_timeout = float(forced_reservation_timeout)
+            if forced_reservation_timeout <= 0:
+                raise ValueError(
+                    "grpo.async_grpo.forced_reservation_timeout_seconds must be "
+                    f"positive when set, got {forced_reservation_timeout}"
+                )
+        self._forced_reservation_timeout_seconds = forced_reservation_timeout
+
         # Simple lock to prevent race conditions when checking/spawning workers
         self._generation_check_lock: _threading.Lock = _threading.Lock()
         # Track prompt-group reservations by target weight. A target is complete
         # only when buffered groups plus in-flight reservations reaches a full
         # training step.
-        self._target_reservations: dict[int, int] = {}
+        self._target_reservations: dict[int, dict[int, float]] = {}
+        self._next_reservation_id = 0
         self._completed_target_weights: set[int] = set()
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
@@ -123,9 +136,58 @@ class AsyncTrajectoryCollector:
             generation_weight_version + i for i in range(max_trajectory_age + 1)
         ]
 
-    def _get_next_target_for_generation(
+    def _get_reservation_count_locked(self, target_weight: int) -> int:
+        return len(self._target_reservations.get(target_weight, {}))
+
+    def _reserve_target_locked(
+        self, target_weight: int, reservation_count: int
+    ) -> list[int]:
+        now = time.monotonic()
+        reservations = self._target_reservations.setdefault(target_weight, {})
+        reservation_ids: list[int] = []
+        for _ in range(reservation_count):
+            reservation_id = self._next_reservation_id
+            self._next_reservation_id += 1
+            reservations[reservation_id] = now
+            reservation_ids.append(reservation_id)
+        return reservation_ids
+
+    def _expire_stale_reservations_locked(self, target_weight: int) -> int:
+        if self._forced_reservation_timeout_seconds is None:
+            return 0
+
+        reservations = self._target_reservations.get(target_weight)
+        if not reservations:
+            return 0
+
+        now = time.monotonic()
+        stale_reservation_ids = [
+            reservation_id
+            for reservation_id, started_at in reservations.items()
+            if now - started_at >= self._forced_reservation_timeout_seconds
+        ]
+        if not stale_reservation_ids:
+            return 0
+
+        oldest_age = max(
+            now - reservations[reservation_id]
+            for reservation_id in stale_reservation_ids
+        )
+        for reservation_id in stale_reservation_ids:
+            reservations.pop(reservation_id, None)
+        if not reservations:
+            self._target_reservations.pop(target_weight, None)
+
+        print(
+            f"⚠️ Expired {len(stale_reservation_ids)} stale reservations for "
+            f"target weight {target_weight} after {oldest_age:.1f}s; "
+            "allowing replacement generation"
+        )
+        return len(stale_reservation_ids)
+
+    def _reserve_next_target_for_generation(
         self, generation_weight_version: int, num_prompt_groups_to_reserve: int
-    ) -> tuple[Optional[int], int]:
+    ) -> tuple[Optional[int], list[int]]:
         """Get the next target weight that needs generation (if any)."""
         target_weights = self._calculate_target_weights(generation_weight_version)
         buffered_counts = ray.get(
@@ -143,7 +205,8 @@ class AsyncTrajectoryCollector:
                     self._mark_target_complete_locked(target_weight)
                     continue
 
-                reserved_count = self._target_reservations.get(target_weight, 0)
+                self._expire_stale_reservations_locked(target_weight)
+                reserved_count = self._get_reservation_count_locked(target_weight)
                 missing_count = target_group_goal - buffered_count - reserved_count
 
                 if missing_count <= 0:
@@ -152,22 +215,31 @@ class AsyncTrajectoryCollector:
                         f"({buffered_count} buffered, {reserved_count} reserved, goal {target_group_goal}); "
                         "waiting before advancing to later targets"
                     )
-                    return None, 0
+                    return None, []
 
                 if missing_count > 0:
                     reservation_count = min(
                         num_prompt_groups_to_reserve, missing_count
                     )
-                    self._target_reservations[target_weight] = (
-                        reserved_count + reservation_count
+                    reservation_ids = self._reserve_target_locked(
+                        target_weight, reservation_count
                     )
                     print(
                         f"🎯 Reserved {reservation_count} prompt groups for target weight {target_weight} "
                         f"({buffered_count} buffered, {reserved_count} already reserved, goal {target_group_goal})"
                     )
-                    return target_weight, reservation_count
+                    return target_weight, reservation_ids
 
-        return None, 0
+        return None, []
+
+    def _get_next_target_for_generation(
+        self, generation_weight_version: int, num_prompt_groups_to_reserve: int
+    ) -> tuple[Optional[int], int]:
+        """Get and reserve the next target weight that needs generation."""
+        target_weight, reservation_ids = self._reserve_next_target_for_generation(
+            generation_weight_version, num_prompt_groups_to_reserve
+        )
+        return target_weight, len(reservation_ids)
 
     def _mark_target_complete_locked(self, target_weight_version: int) -> None:
         if target_weight_version not in self._completed_target_weights:
@@ -194,13 +266,23 @@ class AsyncTrajectoryCollector:
         with self._generation_check_lock:
             self._mark_target_complete_locked(target_weight_version)
 
-    def _release_target_reservation(self, target_weight_version: int) -> None:
+    def _release_target_reservation(
+        self,
+        target_weight_version: int,
+        reservation_id: Optional[int] = None,
+    ) -> None:
         with self._generation_check_lock:
-            reserved_count = self._target_reservations.get(target_weight_version, 0)
-            if reserved_count <= 1:
+            reservations = self._target_reservations.get(target_weight_version)
+            if reservations is None:
+                pass
+            elif reservation_id is not None:
+                reservations.pop(reservation_id, None)
+            elif reservations:
+                reservations.pop(next(iter(reservations)))
+
+            if not reservations:
                 self._target_reservations.pop(target_weight_version, None)
-            else:
-                self._target_reservations[target_weight_version] = reserved_count - 1
+
         self._generation_limit_cleared.set()
         self._mark_target_complete_if_buffered(target_weight_version)
 
@@ -242,7 +324,8 @@ class AsyncTrajectoryCollector:
                         self._mark_target_complete_locked(target_weight)
                         continue
 
-                    reserved_count = self._target_reservations.get(target_weight, 0)
+                    self._expire_stale_reservations_locked(target_weight)
+                    reserved_count = self._get_reservation_count_locked(target_weight)
                     if buffered_count + reserved_count >= target_group_goal:
                         print(
                             f"⏸️ Target weight {target_weight} has {buffered_count} buffered "
@@ -319,8 +402,9 @@ class AsyncTrajectoryCollector:
 
                     self._generation_limit_cleared.clear()
 
-                    # Efficiently wait for generation limits to be cleared (no polling!)
-                    self._generation_limit_cleared.wait()
+                    # Wake periodically as well as on completions so stale forced
+                    # reservations can expire even if a worker thread is hung.
+                    self._generation_limit_cleared.wait(timeout=5.0)
 
                     # Double-check we're still running after being woken up
                     if not self.running:
@@ -419,7 +503,7 @@ class AsyncTrajectoryCollector:
             num_prompts = batch.size
 
             # Get the next target weight that needs generation
-            target_weight, reserved_prompt_groups = self._get_next_target_for_generation(
+            target_weight, reservation_ids = self._reserve_next_target_for_generation(
                 generation_weight_version, num_prompts
             )
 
@@ -434,7 +518,7 @@ class AsyncTrajectoryCollector:
             )
 
             # Generate for all prompts in this batch for the target weight
-            for prompt_idx in range(reserved_prompt_groups):
+            for prompt_idx, reservation_id in enumerate(reservation_ids):
                 # Wait for refit to complete if in progress
                 if not self._refit_pause_cleared.is_set() and self.running:
                     with self._threads_lock:
@@ -461,6 +545,7 @@ class AsyncTrajectoryCollector:
                         generation_weight_version,
                         target_weight,
                         prompt_idx,
+                        reservation_id,
                     ),
                     daemon=True,
                 )
@@ -621,6 +706,7 @@ class AsyncTrajectoryCollector:
         generation_weight_version: int,
         target_weight_version: Optional[int] = None,
         prompt_idx: Optional[int] = None,
+        reservation_id: Optional[int] = None,
     ) -> None:
         try:
             # Import here to avoid circular dependency
@@ -720,7 +806,7 @@ class AsyncTrajectoryCollector:
         finally:
             # Clean up the per-prompt reservation after success or failure.
             if self.lag_mode == "forced" and target_weight_version is not None:
-                self._release_target_reservation(target_weight_version)
+                self._release_target_reservation(target_weight_version, reservation_id)
 
             # Detach thread record when finished
             with self._threads_lock:

@@ -131,6 +131,11 @@ class AsyncGRPOConfig(TypedDict):
     #   (in rollout units, i.e. prompt-groups), and the trainer consumes them
     #   FIFO subject to `max_trajectory_age_steps`.
     lag_mode: NotRequired[Literal["forced", "unforced"]]
+    # Optional forced-lag reservation lease timeout in seconds. When set to a
+    # positive value, stale forced-lag reservations are released so another
+    # prompt group can refill a target step if an in-flight rollout hangs.
+    # Set to null/omit to disable lease expiry.
+    forced_reservation_timeout_seconds: NotRequired[Optional[float]]
 
 
 class AdvEstimatorConfig(TypedDict):
