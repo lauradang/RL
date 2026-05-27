@@ -740,6 +740,13 @@ class TestAsyncTrajectoryCollector:
         )
         assert (after_consume_target, after_consume_count) == (1, 1)
 
+        ray.get(collector.set_weight_version.remote(1))
+        ray.get(collector._release_target_reservation.remote(1))
+        refill_current_target, refill_current_count = ray.get(
+            collector._get_next_target_for_generation.remote(1, 1)
+        )
+        assert (refill_current_target, refill_current_count) == (1, 1)
+
         ray.kill(collector)
         ray.kill(buffer)
         ray.kill(mock_env)

@@ -114,21 +114,14 @@ class AsyncTrajectoryCollector:
         max_trajectory_age_steps = 4
 
         Returns:
-            [11, 12, 13, 14]  # Meaning this generation server can create trajectories for training step 11, 12, 13, 14
+            [10, 11, 12, 13, 14]  # Meaning this generation server can refill the current training target or create trajectories for future steps.
         """
         # Read async config strictly from grpo.async_grpo
         async_cfg = self.master_config.grpo.get("async_grpo", {})
         max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-        if generation_weight_version == self.initial_weight_version:
-            return [
-                i
-                for i in range(
-                    self.initial_weight_version,
-                    self.initial_weight_version + max_trajectory_age + 1,
-                )
-            ]
-
-        return [generation_weight_version + i for i in range(1, max_trajectory_age + 1)]
+        return [
+            generation_weight_version + i for i in range(max_trajectory_age + 1)
+        ]
 
     def _get_next_target_for_generation(
         self, generation_weight_version: int, num_prompt_groups_to_reserve: int
