@@ -61,6 +61,10 @@ class ReplayBufferProtocol(Protocol):
         """Return current buffer size."""
         ...
 
+    def get_target_weight_counts(self) -> dict[int, int]:
+        """Return buffered trajectory counts by forced-lag target weight."""
+        ...
+
     def clear(self) -> None:
         """Clear the buffer."""
         ...
