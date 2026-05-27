@@ -23,8 +23,9 @@ VLLM_EXECUTABLE = (
 SGLANG_EXECUTABLE = (
     PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.SGLANG
 )
-MCORE_EXECUTABLE = (
-    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.MCORE
+MCORE_EXECUTABLE = PY_EXECUTABLES.MCORE
+NEMO_GYM_EXECUTABLE = (
+    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.NEMO_GYM
 )
 
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
@@ -42,11 +43,11 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.games.sliding_puzzle.SlidingPuzzleEnv": PY_EXECUTABLES.SYSTEM,
     # AsyncTrajectoryCollector needs vLLM environment to handle exceptions from VllmGenerationWorker
-    "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector": PY_EXECUTABLES.VLLM,
+    "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector": VLLM_EXECUTABLE,
     # ReplayBuffer needs vLLM environment to handle trajectory data from VllmGenerationWorker
-    "nemo_rl.algorithms.async_utils.ReplayBuffer": PY_EXECUTABLES.VLLM,
+    "nemo_rl.algorithms.async_utils.ReplayBuffer": VLLM_EXECUTABLE,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
+    "nemo_rl.environments.nemo_gym.NemoGym": NEMO_GYM_EXECUTABLE,
 }
 
 from nemo_rl.modelopt.registry import MODELOPT_ACTOR_REGISTRY
