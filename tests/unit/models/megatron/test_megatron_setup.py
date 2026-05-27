@@ -32,6 +32,120 @@ import torch
 
 
 @pytest.mark.mcore
+class TestSetupDistributed:
+    """Tests for Megatron distributed initialization."""
+
+    @patch("nemo_rl.models.megatron.setup.destroy_parallel_state")
+    @patch("nemo_rl.models.megatron.setup.configure_dynamo_cache")
+    @patch("nemo_rl.models.megatron.setup.torch.distributed.init_process_group")
+    @patch("nemo_rl.models.megatron.setup.torch.cuda.set_device")
+    @patch("nemo_rl.models.megatron.setup.torch.cuda.device_count", return_value=1)
+    @patch("nemo_rl.models.megatron.setup.torch.cuda.is_available", return_value=True)
+    def test_setup_distributed_uses_visible_device_zero(
+        self,
+        _mock_cuda_available,
+        _mock_device_count,
+        mock_set_device,
+        mock_init_process_group,
+        _mock_configure_dynamo_cache,
+        _mock_destroy_parallel_state,
+        monkeypatch,
+    ):
+        from nemo_rl.models.megatron.setup import setup_distributed
+
+        monkeypatch.setenv("LOCAL_RANK", "3")
+
+        setup_distributed()
+
+        mock_set_device.assert_called_once_with(0)
+        mock_init_process_group.assert_called_once_with(
+            backend="nccl", device_id=torch.device("cuda", 0)
+        )
+
+    @patch("nemo_rl.models.megatron.setup.destroy_parallel_state")
+    @patch("nemo_rl.models.megatron.setup.configure_dynamo_cache")
+    @patch("nemo_rl.models.megatron.setup.torch.distributed.init_process_group")
+    @patch("nemo_rl.models.megatron.setup.torch.cuda.set_device")
+    @patch("nemo_rl.models.megatron.setup.torch.cuda.device_count", return_value=4)
+    @patch("nemo_rl.models.megatron.setup.torch.cuda.is_available", return_value=True)
+    def test_setup_distributed_uses_local_rank_when_all_devices_visible(
+        self,
+        _mock_cuda_available,
+        _mock_device_count,
+        mock_set_device,
+        mock_init_process_group,
+        _mock_configure_dynamo_cache,
+        _mock_destroy_parallel_state,
+        monkeypatch,
+    ):
+        from nemo_rl.models.megatron.setup import setup_distributed
+
+        monkeypatch.setenv("LOCAL_RANK", "2")
+
+        setup_distributed()
+
+        mock_set_device.assert_called_once_with(2)
+        mock_init_process_group.assert_called_once_with(
+            backend="nccl", device_id=torch.device("cuda", 2)
+        )
+
+    @patch("nemo_rl.models.megatron.setup.destroy_parallel_state")
+    @patch("nemo_rl.models.megatron.setup.configure_dynamo_cache")
+    @patch("nemo_rl.models.megatron.setup.torch.distributed.init_process_group")
+    @patch("nemo_rl.models.megatron.setup.torch.cuda.set_device")
+    @patch("nemo_rl.models.megatron.setup.torch.cuda.device_count", return_value=1)
+    @patch("nemo_rl.models.megatron.setup.torch.cuda.is_available", return_value=True)
+    def test_setup_distributed_passes_timeout_override(
+        self,
+        _mock_cuda_available,
+        _mock_device_count,
+        _mock_set_device,
+        mock_init_process_group,
+        _mock_configure_dynamo_cache,
+        _mock_destroy_parallel_state,
+        monkeypatch,
+    ):
+        from datetime import timedelta
+
+        from nemo_rl.models.megatron.setup import setup_distributed
+
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        monkeypatch.setenv("NEMO_RL_DISTRIBUTED_TIMEOUT_SECONDS", "3600")
+
+        setup_distributed()
+
+        mock_init_process_group.assert_called_once_with(
+            backend="nccl",
+            device_id=torch.device("cuda", 0),
+            timeout=timedelta(seconds=3600),
+        )
+
+    @patch("nemo_rl.models.megatron.setup.destroy_parallel_state")
+    @patch("nemo_rl.models.megatron.setup.configure_dynamo_cache")
+    @patch("nemo_rl.models.megatron.setup.torch.distributed.init_process_group")
+    @patch("nemo_rl.models.megatron.setup.torch.cuda.device_count", return_value=1)
+    @patch("nemo_rl.models.megatron.setup.torch.cuda.is_available", return_value=True)
+    def test_setup_distributed_rejects_invalid_timeout_override(
+        self,
+        _mock_cuda_available,
+        _mock_device_count,
+        mock_init_process_group,
+        _mock_configure_dynamo_cache,
+        _mock_destroy_parallel_state,
+        monkeypatch,
+    ):
+        from nemo_rl.models.megatron.setup import setup_distributed
+
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        monkeypatch.setenv("NEMO_RL_DISTRIBUTED_TIMEOUT_SECONDS", "0")
+
+        with pytest.raises(ValueError, match="positive integer"):
+            setup_distributed()
+
+        mock_init_process_group.assert_not_called()
+
+
+@pytest.mark.mcore
 class TestValidateModelPaths:
     """Tests for validate_model_paths function."""
 

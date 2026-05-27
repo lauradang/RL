@@ -17,6 +17,7 @@ import json
 import os
 import time
 import warnings
+from datetime import timedelta
 from typing import Any, Callable, Optional, TypeVar
 
 import torch
@@ -151,7 +152,64 @@ def setup_distributed() -> None:
     # Ensure clean slate before import
     destroy_parallel_state()
     # Need to initialize the process group before calling into Megatron-Bridge, otherwise Megatron-Bridge will try to set an incorrect device
-    torch.distributed.init_process_group("nccl")
+    torch.distributed.init_process_group(**_get_nccl_init_process_group_kwargs())
+
+
+def _get_nccl_init_process_group_kwargs() -> dict[str, Any]:
+    init_kwargs: dict[str, Any] = {"backend": "nccl"}
+
+    device = _get_local_cuda_device()
+    if device is not None:
+        init_kwargs["device_id"] = device
+
+    timeout = _get_distributed_timeout_from_env()
+    if timeout is not None:
+        init_kwargs["timeout"] = timeout
+
+    return init_kwargs
+
+
+def _get_local_cuda_device() -> Optional[torch.device]:
+    if not torch.cuda.is_available():
+        return None
+
+    device_count = torch.cuda.device_count()
+    if device_count <= 0:
+        return None
+
+    local_rank_env = os.environ.get("LOCAL_RANK", "0")
+    try:
+        local_rank = int(local_rank_env)
+    except ValueError as exc:
+        raise ValueError(
+            f"LOCAL_RANK must be an integer, got {local_rank_env!r}"
+        ) from exc
+
+    device_index = local_rank if 0 <= local_rank < device_count else 0
+    torch.cuda.set_device(device_index)
+    return torch.device("cuda", device_index)
+
+
+def _get_distributed_timeout_from_env() -> Optional[timedelta]:
+    timeout_seconds_env = os.environ.get("NEMO_RL_DISTRIBUTED_TIMEOUT_SECONDS")
+    if timeout_seconds_env is None:
+        return None
+
+    try:
+        timeout_seconds = int(timeout_seconds_env)
+    except ValueError as exc:
+        raise ValueError(
+            "NEMO_RL_DISTRIBUTED_TIMEOUT_SECONDS must be a positive integer, "
+            f"got {timeout_seconds_env!r}"
+        ) from exc
+
+    if timeout_seconds <= 0:
+        raise ValueError(
+            "NEMO_RL_DISTRIBUTED_TIMEOUT_SECONDS must be a positive integer, "
+            f"got {timeout_seconds}"
+        )
+
+    return timedelta(seconds=timeout_seconds)
 
 
 def validate_and_set_config(
