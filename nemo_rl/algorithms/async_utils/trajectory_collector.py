@@ -14,6 +14,7 @@
 
 import threading as _threading
 import time
+from math import ceil
 from typing import Any, Literal, Optional
 
 import ray
@@ -84,12 +85,9 @@ class AsyncTrajectoryCollector:
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
-        # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
-        # This value limits the parallelism of the generation requests.
-        max_inflight = (
-            int(self.master_config.grpo["num_prompts_per_step"])
-            * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
-        ) or 1
+        # Limit in-flight prompt groups to num_prompts_per_step * max_trajectory_age_steps.
+        # Each prompt group can fan out to num_generations_per_prompt rollout requests.
+        max_inflight = self._get_max_inflight_prompt_groups()
         self.max_inflight_generations = max_inflight
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
@@ -113,6 +111,58 @@ class AsyncTrajectoryCollector:
         self._target_reservations: dict[int, dict[int, float]] = {}
         self._next_reservation_id = 0
         self._completed_target_weights: set[int] = set()
+
+    def get_max_inflight_generations(self) -> int:
+        """Return the configured in-flight prompt-group cap."""
+        return self.max_inflight_generations
+
+    def _get_max_inflight_prompt_groups(self) -> int:
+        num_prompts_per_step = int(self.master_config.grpo["num_prompts_per_step"])
+        num_generations_per_prompt = int(
+            self.master_config.grpo["num_generations_per_prompt"]
+        )
+        max_trajectory_age_steps = int(
+            self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
+        )
+        base_max_inflight = max(1, num_prompts_per_step * max_trajectory_age_steps)
+
+        env_config = getattr(self.master_config, "env", {})
+        nemo_gym_config = env_config.get("nemo_gym", {}) if env_config else {}
+        max_concurrent_rollout_requests = nemo_gym_config.get(
+            "max_concurrent_rollout_requests", None
+        )
+        if max_concurrent_rollout_requests is None:
+            return base_max_inflight
+        if (
+            isinstance(max_concurrent_rollout_requests, bool)
+            or not isinstance(max_concurrent_rollout_requests, int)
+            or max_concurrent_rollout_requests <= 0
+        ):
+            raise ValueError(
+                "env.nemo_gym.max_concurrent_rollout_requests must be a positive "
+                f"int when set, got {max_concurrent_rollout_requests!r}"
+            )
+
+        request_limited_prompt_groups = max(
+            num_prompts_per_step,
+            2
+            * ceil(
+                max_concurrent_rollout_requests
+                / max(1, num_generations_per_prompt)
+            ),
+        )
+        max_inflight = max(
+            1, min(base_max_inflight, request_limited_prompt_groups)
+        )
+        if max_inflight < base_max_inflight:
+            print(
+                "📐 NeMo-Gym limiter capped collector in-flight prompt groups "
+                f"from {base_max_inflight} to {max_inflight} "
+                f"(max_concurrent_rollout_requests="
+                f"{max_concurrent_rollout_requests}, "
+                f"num_generations_per_prompt={num_generations_per_prompt})"
+            )
+        return max_inflight
 
     def _calculate_target_weights(self, generation_weight_version: int) -> list[int]:
         """Calculate target weight versions for given generation weight version.

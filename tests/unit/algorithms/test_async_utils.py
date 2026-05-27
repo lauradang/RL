@@ -537,6 +537,38 @@ class TestAsyncTrajectoryCollector:
         # Test basic functionality
         weight_version = ray.get(collector.get_weight_version.remote())
         assert weight_version == 0
+        max_inflight = ray.get(collector.get_max_inflight_generations.remote())
+        assert max_inflight == 4
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_async_trajectory_collector_nemo_gym_limiter_caps_inflight(self):
+        """Test NeMo-Gym limiter config caps collector prompt-group concurrency."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+        master_config.env = {
+            "nemo_gym": {
+                "max_concurrent_rollout_requests": 3,
+            },
+        }
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        max_inflight = ray.get(collector.get_max_inflight_generations.remote())
+        assert max_inflight == 2
 
         ray.kill(collector)
         ray.kill(buffer)
