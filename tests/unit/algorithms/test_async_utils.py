@@ -30,6 +30,10 @@ os.environ["RAY_TMPDIR"] = _temp_dir  # Alternative env var
 os.environ["TMPDIR"] = _temp_dir  # System temp dir
 
 from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+from nemo_rl.algorithms.async_utils.trajectory_collector import (
+    _should_wait_for_pending_generations_before_refit,
+    _uses_nemo_gym_rollouts,
+)
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType
@@ -725,6 +729,43 @@ class TestAsyncTrajectoryCollector:
         ray.kill(collector)
         ray.kill(buffer)
         ray.kill(mock_env)
+
+    def test_refit_wait_decision_keeps_direct_async_fast_path(self):
+        """Direct async generation can still use in-flight weight updates."""
+        master_config = self.create_mock_config()
+        master_config.policy = {
+            "generation": {"vllm_cfg": {"async_engine": True}},
+            "max_total_sequence_length": 512,
+        }
+        master_config.grpo["async_grpo"]["in_flight_weight_updates"] = True
+
+        assert not _should_wait_for_pending_generations_before_refit(
+            master_config,
+            uses_nemo_gym_rollouts=False,
+        )
+
+    def test_refit_wait_decision_waits_for_nemo_gym_async_rollouts(self):
+        """NeMo-Gym rollouts must quiesce before collective refit."""
+        master_config = self.create_mock_config()
+        master_config.policy = {
+            "generation": {"vllm_cfg": {"async_engine": True}},
+            "max_total_sequence_length": 512,
+        }
+        master_config.grpo["async_grpo"]["in_flight_weight_updates"] = True
+
+        assert _should_wait_for_pending_generations_before_refit(
+            master_config,
+            uses_nemo_gym_rollouts=True,
+        )
+
+    def test_uses_nemo_gym_rollouts_from_config_or_task_map(self):
+        master_config = self.create_mock_config()
+        mock_env = mock.MagicMock()
+
+        assert _uses_nemo_gym_rollouts(master_config, {"nemo_gym": mock_env})
+
+        master_config.env = {"should_use_nemo_gym": True}
+        assert _uses_nemo_gym_rollouts(master_config, {"test": mock_env})
 
     def test_calculate_target_weights(self):
         """Test target weight calculation logic."""

@@ -34,6 +34,35 @@ TokenizerType = PreTrainedTokenizerBase
 LagMode = Literal["forced", "unforced"]
 
 
+def _uses_nemo_gym_rollouts(
+    master_config: MasterConfig,
+    task_to_env: dict[str, EnvironmentInterface],
+) -> bool:
+    env_config = getattr(master_config, "env", {}) or {}
+    return bool(env_config.get("should_use_nemo_gym") or "nemo_gym" in task_to_env)
+
+
+def _should_wait_for_pending_generations_before_refit(
+    master_config: MasterConfig,
+    uses_nemo_gym_rollouts: bool,
+) -> bool:
+    vllm_cfg = master_config.policy.get("generation", {}).get("vllm_cfg", {})
+    is_async_engine = vllm_cfg.get("async_engine", False)
+    in_flight_weight_updates = master_config.grpo.get("async_grpo", {}).get(
+        "in_flight_weight_updates", False
+    )
+
+    if not (is_async_engine and in_flight_weight_updates):
+        return True
+
+    # NeMo-Gym drives generation through HTTP /run requests. In practice those
+    # active requests can overlap with vLLM collective weight updates and leave
+    # the trainer-side broadcast producers and vLLM consumers waiting on each
+    # other. Keep the in-flight refit fast path for direct generation, but force
+    # NeMo-Gym to quiesce before collective refit.
+    return uses_nemo_gym_rollouts
+
+
 @ray.remote  # pragma: no cover
 class AsyncTrajectoryCollector:
     """Collects trajectories asynchronously and adds them to replay buffer."""
@@ -60,6 +89,9 @@ class AsyncTrajectoryCollector:
         self.replay_buffer = replay_buffer
         self.running = False
         self.lag_mode = lag_mode
+        self._uses_nemo_gym_rollouts = _uses_nemo_gym_rollouts(
+            master_config, task_to_env
+        )
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -699,14 +731,23 @@ class AsyncTrajectoryCollector:
         self._post_refit_cleanup_pending = True
         print("⏸️ New generation starts paused")
 
-        # Check if we're using vLLM async engine
-        vllm_cfg = self.master_config.policy.get("generation", {}).get("vllm_cfg", {})
-        is_async_engine = vllm_cfg.get("async_engine", False)
-        in_flight_weight_updates = self.master_config.grpo.get("async_grpo", {}).get(
-            "in_flight_weight_updates", False
+        should_wait_for_pending = _should_wait_for_pending_generations_before_refit(
+            self.master_config,
+            self._uses_nemo_gym_rollouts,
         )
 
-        if is_async_engine and in_flight_weight_updates:
+        if should_wait_for_pending:
+            if self._uses_nemo_gym_rollouts:
+                print(
+                    "⏸️ NeMo-Gym generation: waiting for active rollout requests "
+                    "before collective refit..."
+                )
+            else:
+                print(
+                    "⏸️ Non-async engine: waiting for all pending generations to complete..."
+                )
+            self.wait_for_pending_generations()
+        else:
             # vLLM V1 async engine supports in-flight weight updates
             # Ongoing generations will continue with their current KV caches
             # New generations (after weight update) will use the updated weights
@@ -716,12 +757,6 @@ class AsyncTrajectoryCollector:
             print(
                 f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
             )
-        else:
-            # For non-async engines, wait for all pending generations to complete
-            print(
-                "⏸️ Non-async engine: waiting for all pending generations to complete..."
-            )
-            self.wait_for_pending_generations()
 
         elapsed = time.time() - start_time
         print(f"✅ Ready for refit (took {elapsed:.2f}s)")
