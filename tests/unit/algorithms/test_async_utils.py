@@ -248,18 +248,65 @@ class TestReplayBuffer:
             )
         )
 
-        # Sample with current_weight_version=3 and max_age_steps=1
-        # This should filter out the trajectory with weight_version=0 (too old)
-        with pytest.raises(
-            ValueError, match="Found .* trajectories older than min_valid_version"
-        ):
-            ray.get(
-                buffer.sample.remote(
-                    num_prompt_groups=1,
-                    current_weight_version=3,
-                    max_age_steps=1,
-                )
+        # Sample with current_weight_version=3 and max_age_steps=1.
+        # The trajectory with weight_version=0 is too old and should be evicted.
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=3,
+                max_age_steps=1,
             )
+        )
+
+        assert sample_result is not None
+        assert sample_result["trajectories"][0]["batch"]["data"] == "recent"
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["total_trajectories"] == 0
+
+        ray.kill(buffer)
+
+    def test_replay_buffer_evicts_missed_forced_targets(self):
+        """Test forced-lag sampling evicts targets that missed their step."""
+        buffer = ReplayBuffer.remote(max_size=10)
+
+        missed_trajectory = {
+            "batch": {"data": "missed"},
+            "rollout_metrics": {"reward": 1.0},
+        }
+        current_trajectory = {
+            "batch": {"data": "current"},
+            "rollout_metrics": {"reward": 2.0},
+        }
+
+        ray.get(
+            buffer.add.remote(
+                missed_trajectory,
+                weight_version=3,
+                target_weight_version=2,
+            )
+        )
+        ray.get(
+            buffer.add.remote(
+                current_trajectory,
+                weight_version=3,
+                target_weight_version=4,
+            )
+        )
+
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=1,
+                current_weight_version=4,
+                max_age_steps=4,
+            )
+        )
+
+        assert sample_result is not None
+        assert sample_result["trajectories"][0]["batch"]["data"] == "current"
+
+        debug_info = ray.get(buffer.get_debug_info.remote())
+        assert debug_info["total_trajectories"] == 0
 
         ray.kill(buffer)
 
@@ -779,6 +826,66 @@ class TestAsyncTrajectoryCollector:
             collector._get_next_target_for_generation.remote(1, 1)
         )
         assert (refill_current_target, refill_current_count) == (1, 1)
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
+    def test_forced_completed_target_refills_after_stale_eviction(self):
+        """Test forced mode refills a completed target if stale eviction drops it."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        trajectory = {
+            "batch": self.create_mock_batch(size=1),
+            "rollout_metrics": {},
+            "timestamp": 0.0,
+        }
+        for target_weight_version in (0, 1, 2):
+            ray.get(
+                buffer.add.remote(
+                    trajectory,
+                    weight_version=0,
+                    target_weight_version=target_weight_version,
+                )
+            )
+            ray.get(
+                buffer.add.remote(
+                    trajectory,
+                    weight_version=0,
+                    target_weight_version=target_weight_version,
+                )
+            )
+
+        target, count = ray.get(collector._get_next_target_for_generation.remote(0, 1))
+        assert (target, count) == (None, 0)
+
+        sample_result = ray.get(
+            buffer.sample.remote(
+                num_prompt_groups=2,
+                current_weight_version=2,
+                max_age_steps=1,
+            )
+        )
+        assert sample_result is None
+
+        refilled_target, refilled_count = ray.get(
+            collector._get_next_target_for_generation.remote(2, 1)
+        )
+        assert (refilled_target, refilled_count) == (2, 1)
 
         ray.kill(collector)
         ray.kill(buffer)

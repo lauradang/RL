@@ -65,6 +65,10 @@ class ReplayBufferProtocol(Protocol):
         """Return buffered trajectory counts by forced-lag target weight."""
         ...
 
+    def get_last_consumed_target_weight_version(self) -> int:
+        """Return the latest forced-lag target weight consumed by training."""
+        ...
+
     def clear(self) -> None:
         """Clear the buffer."""
         ...

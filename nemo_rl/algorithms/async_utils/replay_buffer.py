@@ -50,6 +50,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         ] = []  # it is the weight-version of the trainer where this trajectory will be used.
 
         self.last_target_weight_already_generated = -1
+        self.last_consumed_target_weight_version = -1
         self._lock = _threading.Lock()
 
     def add(
@@ -145,6 +146,13 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         with self._lock:
             return dict(Counter(self.target_weight_versions))
 
+    def get_last_consumed_target_weight_version(self) -> int:
+        """Get the latest forced-lag target weight consumed by training."""
+        if self.lag_mode == "unforced":
+            return -1
+        with self._lock:
+            return self.last_consumed_target_weight_version
+
     def sample(
         self,
         num_prompt_groups: int,
@@ -185,14 +193,37 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             min_valid_version = max(0, current_weight_version - max_age_steps)
             print(f"   {min_valid_version=}")
 
-            # Check for unexpected old trajectories
-            old_trajectories = [
-                v for v in self.trajectory_versions if v < min_valid_version
-            ]
-            if old_trajectories:
-                raise ValueError(
-                    f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}"
+            retained: list[tuple[dict[str, Any], int, int]] = []
+            stale_age_count = 0
+            missed_target_count = 0
+            for trajectory, version, target_version in zip(
+                self.trajectories,
+                self.trajectory_versions,
+                self.target_weight_versions,
+            ):
+                if version < min_valid_version:
+                    stale_age_count += 1
+                    continue
+                if target_version < current_weight_version:
+                    missed_target_count += 1
+                    continue
+                retained.append((trajectory, version, target_version))
+
+            if stale_age_count or missed_target_count:
+                self.trajectories = [item[0] for item in retained]
+                self.trajectory_versions = [item[1] for item in retained]
+                self.target_weight_versions = [item[2] for item in retained]
+                print(
+                    f"🗑️ ReplayBuffer(forced) evicted {stale_age_count} stale "
+                    f"and {missed_target_count} missed-target trajectories "
+                    f"(min_valid_version={min_valid_version}, "
+                    f"current_weight_version={current_weight_version})"
                 )
+                total_trajectories = len(self.trajectories)
+
+            if not self.trajectories:
+                print("No trajectories available for sampling after stale eviction.")
+                return None
 
             # Filter for valid trajectories without modifying the buffer
             valid_indices = [
@@ -261,6 +292,10 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 self.trajectory_versions.pop(idx)
                 self.target_weight_versions.pop(idx)
                 self.trajectories.pop(idx)
+            self.last_consumed_target_weight_version = max(
+                self.last_consumed_target_weight_version,
+                current_weight_version,
+            )
             print(
                 f"🗑️ Consumed and removed {len(selected)} groups from buffer, old buffer size: {total_trajectories}, new buffer size: {len(self.trajectories)}, new target weight versions {self.target_weight_versions}"
             )
@@ -349,6 +384,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.trajectory_versions.clear()
             self.target_weight_versions.clear()
             self.last_target_weight_already_generated = -1
+            self.last_consumed_target_weight_version = -1
 
 
 @ray.remote  # pragma: no cover

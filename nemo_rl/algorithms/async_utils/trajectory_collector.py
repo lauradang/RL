@@ -244,13 +244,19 @@ class AsyncTrajectoryCollector:
             self.replay_buffer.get_target_weight_counts.remote()
         )
         target_group_goal = int(self.master_config.grpo["num_prompts_per_step"])
+        last_consumed_target_weight = self._get_last_consumed_target_weight_version()
 
         with self._generation_check_lock:
             for target_weight in target_weights:
-                if target_weight in self._completed_target_weights:
+                if target_weight <= last_consumed_target_weight:
                     continue
 
                 buffered_count = buffered_counts.get(target_weight, 0)
+                if self._target_is_complete_locked(
+                    target_weight, buffered_count, target_group_goal
+                ):
+                    continue
+
                 if buffered_count >= target_group_goal:
                     self._mark_target_complete_locked(target_weight)
                     continue
@@ -299,6 +305,34 @@ class AsyncTrajectoryCollector:
             )
         self._completed_target_weights.add(target_weight_version)
         self._target_reservations.pop(target_weight_version, None)
+
+    def _get_last_consumed_target_weight_version(self) -> int:
+        try:
+            return ray.get(
+                self.replay_buffer.get_last_consumed_target_weight_version.remote()
+            )
+        except Exception as e:
+            print(f"⚠️ Failed to get last consumed target weight: {e}")
+            return -1
+
+    def _target_is_complete_locked(
+        self,
+        target_weight: int,
+        buffered_count: int,
+        target_group_goal: int,
+    ) -> bool:
+        if target_weight not in self._completed_target_weights:
+            return False
+
+        if buffered_count >= target_group_goal:
+            return True
+
+        print(
+            f"↩️ Target weight {target_weight} was marked complete but now has "
+            f"{buffered_count}/{target_group_goal} buffered groups; allowing refill"
+        )
+        self._completed_target_weights.discard(target_weight)
+        return False
 
     def _mark_target_complete_if_buffered(self, target_weight_version: int) -> None:
         target_group_goal = int(self.master_config.grpo["num_prompts_per_step"])
@@ -362,14 +396,22 @@ class AsyncTrajectoryCollector:
                 self.replay_buffer.get_target_weight_counts.remote()
             )
             target_group_goal = int(self.master_config.grpo["num_prompts_per_step"])
+            last_consumed_target_weight = (
+                self._get_last_consumed_target_weight_version()
+            )
 
             # Check if any target weight in our range needs generation
             with self._generation_check_lock:
                 for target_weight in target_weights:
-                    if target_weight in self._completed_target_weights:
+                    if target_weight <= last_consumed_target_weight:
                         continue
 
                     buffered_count = buffered_counts.get(target_weight, 0)
+                    if self._target_is_complete_locked(
+                        target_weight, buffered_count, target_group_goal
+                    ):
+                        continue
+
                     if buffered_count >= target_group_goal:
                         self._mark_target_complete_locked(target_weight)
                         continue
