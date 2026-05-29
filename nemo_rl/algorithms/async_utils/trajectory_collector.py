@@ -117,6 +117,12 @@ class AsyncTrajectoryCollector:
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
+        # Track the part of a rollout thread that can still touch the generation
+        # backend separately from post-rollout replay-buffer enqueue work.
+        self._backend_lock = _threading.Condition()
+        self._backend_active_threads = 0
+        self._backend_enqueue_wait_threads = 0
+
         # Limit in-flight prompt groups to num_prompts_per_step * max_trajectory_age_steps.
         # Each prompt group can fan out to num_generations_per_prompt rollout requests.
         max_inflight = self._get_max_inflight_prompt_groups()
@@ -706,6 +712,21 @@ class AsyncTrajectoryCollector:
         with self._threads_lock:
             return len(self._inflight_threads)
 
+    def get_backend_request_stats(self) -> dict[str, int]:
+        """Return collector-side backend/enqueue phase counts."""
+        with self._backend_lock:
+            backend_active_threads = self._backend_active_threads
+            backend_enqueue_wait_threads = self._backend_enqueue_wait_threads
+
+        with self._threads_lock:
+            inflight_threads = len(self._inflight_threads)
+
+        return {
+            "backend_active_threads": backend_active_threads,
+            "backend_enqueue_wait_threads": backend_enqueue_wait_threads,
+            "inflight_threads": inflight_threads,
+        }
+
     def resume(self) -> None:
         """Resume trajectory collection."""
         self._manual_pause_cleared.set()  # Signal collection to resume
@@ -714,7 +735,7 @@ class AsyncTrajectoryCollector:
         else:
             print("Trajectory collection resumed")
 
-    def prepare_for_refit(self) -> None:
+    def prepare_for_refit(self) -> dict[str, float | int]:
         """Pause new generation starts and optionally wait for pending generations.
 
         For vLLM V1 async engine, leverages in-flight weight updates via collective_rpc,
@@ -746,7 +767,10 @@ class AsyncTrajectoryCollector:
                 print(
                     "⏸️ Non-async engine: waiting for all pending generations to complete..."
                 )
-            self.wait_for_pending_generations()
+            if self._uses_nemo_gym_rollouts:
+                wait_metrics = self.wait_for_backend_requests()
+            else:
+                wait_metrics = self.wait_for_pending_generations()
         else:
             # vLLM V1 async engine supports in-flight weight updates
             # Ongoing generations will continue with their current KV caches
@@ -757,9 +781,31 @@ class AsyncTrajectoryCollector:
             print(
                 f"   {len(self._inflight_threads)} ongoing generations will complete with current weights"
             )
+            stats = self.get_backend_request_stats()
+            wait_metrics = {
+                "pre_refit_backend_wait_time": 0.0,
+                "pre_refit_waited_for_backend_threads": 0,
+                "pre_refit_waited_for_inflight_threads": 0,
+                "pre_refit_backend_active_threads_before_wait": stats[
+                    "backend_active_threads"
+                ],
+                "pre_refit_backend_active_threads_after_wait": stats[
+                    "backend_active_threads"
+                ],
+                "pre_refit_backend_enqueue_wait_threads_before_wait": stats[
+                    "backend_enqueue_wait_threads"
+                ],
+                "pre_refit_backend_enqueue_wait_threads_after_wait": stats[
+                    "backend_enqueue_wait_threads"
+                ],
+                "pre_refit_inflight_threads_before_wait": stats["inflight_threads"],
+                "pre_refit_inflight_threads_after_wait": stats["inflight_threads"],
+            }
 
         elapsed = time.time() - start_time
         print(f"✅ Ready for refit (took {elapsed:.2f}s)")
+        wait_metrics["pre_refit_prepare_for_refit_time"] = elapsed
+        return wait_metrics
 
     def resume_after_refit(self, resume_collection: bool = True) -> None:
         """Resume new generation starts after refit is complete."""
@@ -793,9 +839,56 @@ class AsyncTrajectoryCollector:
         else:
             print("⏸️ Keeping new generation starts paused after refit")
 
-    def wait_for_pending_generations(self) -> None:
+    def wait_for_backend_requests(self) -> dict[str, float | int]:
+        """Wait until no rollout thread is still using the generation backend."""
+        start_time = time.time()
+        initial_stats = self.get_backend_request_stats()
+
+        with self._backend_lock:
+            while self._backend_active_threads > 0:
+                elapsed = time.time() - start_time
+                print(
+                    "⏳ Waiting for "
+                    f"{self._backend_active_threads} backend-active rollout "
+                    "threads before refit "
+                    f"({self._backend_enqueue_wait_threads} enqueue-pending, "
+                    f"{elapsed:.1f}s elapsed)"
+                )
+                self._backend_lock.wait(timeout=0.5)
+
+        elapsed = time.time() - start_time
+        final_stats = self.get_backend_request_stats()
+        print(
+            "✅ All backend-active rollout threads completed "
+            f"({final_stats['backend_enqueue_wait_threads']} enqueue-pending)"
+        )
+        return {
+            "pre_refit_backend_wait_time": elapsed,
+            "pre_refit_waited_for_backend_threads": 1,
+            "pre_refit_waited_for_inflight_threads": 0,
+            "pre_refit_backend_active_threads_before_wait": initial_stats[
+                "backend_active_threads"
+            ],
+            "pre_refit_backend_active_threads_after_wait": final_stats[
+                "backend_active_threads"
+            ],
+            "pre_refit_backend_enqueue_wait_threads_before_wait": initial_stats[
+                "backend_enqueue_wait_threads"
+            ],
+            "pre_refit_backend_enqueue_wait_threads_after_wait": final_stats[
+                "backend_enqueue_wait_threads"
+            ],
+            "pre_refit_inflight_threads_before_wait": initial_stats[
+                "inflight_threads"
+            ],
+            "pre_refit_inflight_threads_after_wait": final_stats["inflight_threads"],
+        }
+
+    def wait_for_pending_generations(self) -> dict[str, float | int]:
         """Wait for all in-flight generation threads to complete."""
         start_time = time.time()
+        with self._threads_lock:
+            initial_pending_count = len(self._inflight_threads)
 
         while True:
             with self._threads_lock:
@@ -814,6 +907,48 @@ class AsyncTrajectoryCollector:
                 f"⏳ Waiting for {pending_count} pending generation threads... ({elapsed:.1f}s elapsed)"
             )
             time.sleep(0.5)
+        elapsed = time.time() - start_time
+        backend_stats = self.get_backend_request_stats()
+        return {
+            "pre_refit_backend_wait_time": elapsed,
+            "pre_refit_waited_for_backend_threads": 0,
+            "pre_refit_waited_for_inflight_threads": 1,
+            "pre_refit_inflight_threads_before_wait": initial_pending_count,
+            "pre_refit_inflight_threads_after_wait": 0,
+            "pre_refit_backend_active_threads_before_wait": backend_stats[
+                "backend_active_threads"
+            ],
+            "pre_refit_backend_active_threads_after_wait": backend_stats[
+                "backend_active_threads"
+            ],
+            "pre_refit_backend_enqueue_wait_threads_before_wait": backend_stats[
+                "backend_enqueue_wait_threads"
+            ],
+            "pre_refit_backend_enqueue_wait_threads_after_wait": backend_stats[
+                "backend_enqueue_wait_threads"
+            ],
+        }
+
+    def _begin_backend_request(self) -> None:
+        with self._backend_lock:
+            self._backend_active_threads += 1
+
+    def _finish_backend_request(self, pending_enqueue: bool) -> None:
+        with self._backend_lock:
+            if self._backend_active_threads <= 0:
+                raise RuntimeError("Cannot finish backend request; none are active.")
+            self._backend_active_threads -= 1
+            if pending_enqueue:
+                self._backend_enqueue_wait_threads += 1
+            if self._backend_active_threads == 0:
+                self._backend_lock.notify_all()
+
+    def _finish_backend_enqueue(self) -> None:
+        with self._backend_lock:
+            if self._backend_enqueue_wait_threads <= 0:
+                raise RuntimeError("Cannot finish backend enqueue; none are pending.")
+            self._backend_enqueue_wait_threads -= 1
+            self._backend_lock.notify_all()
 
     def get_dataloader_state(self) -> dict:
         """Get the current dataloader state for checkpointing."""
@@ -835,6 +970,7 @@ class AsyncTrajectoryCollector:
         prompt_idx: Optional[int] = None,
         reservation_id: Optional[int] = None,
     ) -> None:
+        backend_enqueue_pending = False
         try:
             # Import here to avoid circular dependency
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
@@ -845,16 +981,25 @@ class AsyncTrajectoryCollector:
             # Check if we should use nemo_gym (similar to synchronous GRPO)
             if _should_use_nemo_gym(self.master_config):
                 generation_config = self.master_config.policy["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
-                    policy_generation=self.policy_generation,
-                    input_batch=repeated_batch,
-                    tokenizer=self.tokenizer,
-                    task_to_env=self.task_to_env,
-                    max_seq_len=self.master_config.policy["max_total_sequence_length"],
-                    generation_config=generation_config,
-                    max_rollout_turns=None,
-                    greedy=False,
-                )
+                self._begin_backend_request()
+                backend_succeeded = False
+                try:
+                    nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        policy_generation=self.policy_generation,
+                        input_batch=repeated_batch,
+                        tokenizer=self.tokenizer,
+                        task_to_env=self.task_to_env,
+                        max_seq_len=self.master_config.policy[
+                            "max_total_sequence_length"
+                        ],
+                        generation_config=generation_config,
+                        max_rollout_turns=None,
+                        greedy=False,
+                    )
+                    backend_succeeded = True
+                finally:
+                    self._finish_backend_request(pending_enqueue=backend_succeeded)
+                    backend_enqueue_pending = backend_succeeded
                 final_batch = nemo_gym_rollout_result.final_batch
                 rollout_metrics = nemo_gym_rollout_result.rollout_metrics
             else:
@@ -931,6 +1076,9 @@ class AsyncTrajectoryCollector:
 
             traceback.print_exc()
         finally:
+            if backend_enqueue_pending:
+                self._finish_backend_enqueue()
+
             # Clean up the per-prompt reservation after success or failure.
             if self.lag_mode == "forced" and target_weight_version is not None:
                 self._release_target_reservation(target_weight_version, reservation_id)

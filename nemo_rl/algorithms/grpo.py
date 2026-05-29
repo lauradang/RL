@@ -1128,6 +1128,11 @@ def _log_async_validation_snapshot(
         metrics[f"collector_train_threads_{snapshot_name}"] = ray.get(
             trajectory_collector.get_inflight_count.remote()
         )
+        collector_backend_stats = ray.get(
+            trajectory_collector.get_backend_request_stats.remote()
+        )
+        for key, value in collector_backend_stats.items():
+            metrics[f"collector_{key}_{snapshot_name}"] = value
 
     if nemo_gym_environment is not None:
         limiter_stats = ray.get(nemo_gym_environment.get_rollout_limiter_stats.remote())
@@ -3165,11 +3170,16 @@ def async_grpo_train(
 
                 print("🔄 Synchronizing policy weights to trajectory collector…")
                 generation_logger_metrics = None
+                pre_refit_metrics = {}
                 if NEED_REFIT:
                     # Measure pending-generation wait as exposed_generation time
                     print("🔄 Coordinating with trajectory collector before refit...")
                     with timer.time("exposed_generation"):
-                        ray.get(trajectory_collector.prepare_for_refit.remote())
+                        maybe_pre_refit_metrics = ray.get(
+                            trajectory_collector.prepare_for_refit.remote()
+                        )
+                        if isinstance(maybe_pre_refit_metrics, dict):
+                            pre_refit_metrics = maybe_pre_refit_metrics
 
                     # Collect generation logger metrics for performance reporting
                     # inflight batch sizes and num pending samples are collected from each worker
@@ -3461,6 +3471,7 @@ def async_grpo_train(
             timing_metrics: dict[str, float] = timer.get_timing_metrics(
                 reduction_op="sum"
             )
+            timing_metrics.update(pre_refit_metrics)
 
             # Add buffer stats
             buffer_size_current = ray.get(replay_buffer.size.remote())
@@ -3529,6 +3540,15 @@ def async_grpo_train(
             )
             performance_metrics["generation_concurrent_workers"] = ray.get(
                 trajectory_collector.get_inflight_count.remote()
+            )
+            collector_backend_stats = ray.get(
+                trajectory_collector.get_backend_request_stats.remote()
+            )
+            performance_metrics["generation_backend_active_threads"] = (
+                collector_backend_stats["backend_active_threads"]
+            )
+            performance_metrics["generation_backend_enqueue_wait_threads"] = (
+                collector_backend_stats["backend_enqueue_wait_threads"]
             )
 
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
