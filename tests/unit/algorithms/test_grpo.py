@@ -124,31 +124,11 @@ class StubAsyncTrajectoryCollector:
         self.resume_remote = MagicMock(return_value=None)
         self.stop_remote = MagicMock(return_value=None)
         self.wait_for_stop_remote = MagicMock(return_value=None)
-        self.prepare_for_refit_remote = MagicMock(
-            return_value={
-                "pre_refit_backend_wait_time": 0.25,
-                "pre_refit_waited_for_backend_threads": 1,
-                "pre_refit_waited_for_inflight_threads": 0,
-                "pre_refit_backend_active_threads_before_wait": 3,
-                "pre_refit_backend_active_threads_after_wait": 0,
-                "pre_refit_backend_enqueue_wait_threads_before_wait": 2,
-                "pre_refit_backend_enqueue_wait_threads_after_wait": 2,
-                "pre_refit_inflight_threads_before_wait": 5,
-                "pre_refit_inflight_threads_after_wait": 2,
-                "pre_refit_prepare_for_refit_time": 0.3,
-            }
-        )
+        self.prepare_for_refit_remote = MagicMock(return_value=None)
         self.resume_after_refit_remote = MagicMock(return_value=None)
         self.wait_for_pending_generations_remote = MagicMock(return_value=None)
         self.get_inflight_count_remote = MagicMock(
             side_effect=lambda: self.inflight_count
-        )
-        self.get_backend_request_stats_remote = MagicMock(
-            return_value={
-                "backend_active_threads": 0,
-                "backend_enqueue_wait_threads": 0,
-                "inflight_threads": self.inflight_count,
-            }
         )
         self.get_dataloader_state_remote = MagicMock(return_value={})
 
@@ -216,12 +196,6 @@ class StubAsyncTrajectoryCollector:
     def get_inflight_count(self):
         mock = MagicMock()
         mock.remote = self.get_inflight_count_remote
-        return mock
-
-    @property
-    def get_backend_request_stats(self):
-        mock = MagicMock()
-        mock.remote = self.get_backend_request_stats_remote
         return mock
 
     @property
@@ -1623,9 +1597,6 @@ def test_async_grpo_nemo_gym_limiter_skips_validation_drain(
 
     assert "collector_train_threads_before_pause" in logged_metric_keys
     assert "collector_train_threads_after_resume" in logged_metric_keys
-    assert "collector_backend_active_threads_before_pause" in logged_metric_keys
-    assert "pre_refit_backend_wait_time" in logged_metric_keys
-    assert "pre_refit_backend_enqueue_wait_threads_after_wait" in logged_metric_keys
     assert "nemo_gym_before_validation_active_train_requests" in logged_metric_keys
     assert "nemo_gym_during_validation_active_validation_requests" in logged_metric_keys
 
