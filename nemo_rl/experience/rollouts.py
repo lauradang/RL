@@ -1312,3 +1312,148 @@ def run_async_nemo_gym_rollout(
         final_batch=final_batch,
         rollout_metrics=rollout_metrics,
     )
+
+
+_NEMO_GYM_AGGREGATE_STAT_SUFFIXES = (
+    "/mean",
+    "/max",
+    "/min",
+    "/median",
+    "/stddev",
+    "/histogram",
+)
+
+
+def _merge_nemo_gym_rollout_metrics(
+    per_prompt_metrics: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Merge per-prompt (batch_size=1) NeMo-Gym ``rollout_metrics`` dicts into one batched dict.
+
+    Merge strategy by key:
+
+    - ``X/{mean,max,min,median,stddev,histogram}`` groups: collect per-prompt ``X/mean`` scalars
+      (which equal each prompt's underlying value since each per-prompt result has batch_size=1)
+      and re-run :func:`_calculate_single_metric` to produce correct batch-level statistics.
+    - wandb ``Table`` metrics: concat data.
+    - ``timing/rollout/postprocess_results_pct``: recomputed from summed await + postprocess.
+    - Other ``timing/*`` keys (including ``timing/rollout/concurrent_requests``): summed.
+    - ``natural_termination_rate``, ``truncation_rate``, ``mean_gen_tokens_per_sample``: mean.
+    - Any other numeric key: mean. Non-numeric, non-Table fallthrough: first non-None value.
+    """
+    if not per_prompt_metrics:
+        return {}
+
+    merged: dict[str, Any] = {}
+    all_keys: set[str] = set()
+    for m in per_prompt_metrics:
+        all_keys.update(m.keys())
+
+    group_bases: set[str] = set()
+    for key in all_keys:
+        for suffix in _NEMO_GYM_AGGREGATE_STAT_SUFFIXES:
+            if key.endswith(suffix):
+                group_bases.add(key[: -len(suffix)])
+                break
+
+    handled_keys: set[str] = set()
+    for base in group_bases:
+        mean_key = f"{base}/mean"
+        per_prompt_values = [
+            m[mean_key] for m in per_prompt_metrics if mean_key in m
+        ]
+        if not per_prompt_values:
+            continue
+        aggregated = _calculate_single_metric(
+            per_prompt_values, len(per_prompt_values), base
+        )
+        for suffix in _NEMO_GYM_AGGREGATE_STAT_SUFFIXES:
+            full_key = f"{base}{suffix}"
+            if full_key in all_keys and full_key in aggregated:
+                merged[full_key] = aggregated[full_key]
+                handled_keys.add(full_key)
+
+    postprocess_pct_key = "timing/rollout/postprocess_results_pct"
+    for key in all_keys - handled_keys:
+        if key == postprocess_pct_key:
+            continue
+        values = [m[key] for m in per_prompt_metrics if key in m]
+        if not values:
+            continue
+        first = values[0]
+
+        if isinstance(first, Table):
+            combined_data: list = []
+            for t in values:
+                table_data = getattr(t, "data", None)
+                if table_data is not None:
+                    combined_data.extend(table_data)
+            merged[key] = Table(data=combined_data, columns=first.columns)
+        elif key.startswith("timing/"):
+            merged[key] = sum(values)
+        elif key in {
+            "natural_termination_rate",
+            "truncation_rate",
+            "mean_gen_tokens_per_sample",
+        }:
+            merged[key] = sum(values) / len(values)
+        elif isinstance(first, (int, float)) and not isinstance(first, bool):
+            merged[key] = sum(values) / len(values)
+        else:
+            merged[key] = next((v for v in values if v is not None), None)
+
+    if postprocess_pct_key in all_keys:
+        await_sum = merged.get("timing/rollout/await_results", 0.0)
+        postprocess_sum = merged.get("timing/rollout/postprocess_results", 0.0)
+        denom = await_sum + postprocess_sum
+        merged[postprocess_pct_key] = (
+            100 * postprocess_sum / denom if denom > 0 else 0.0
+        )
+
+    return merged
+
+
+def merge_async_nemo_gym_rollout_results(
+    per_prompt_results: list[AsyncNemoGymRolloutResult],
+    tokenizer: TokenizerType,
+) -> AsyncNemoGymRolloutResult:
+    """Merge per-prompt (batch_size=1) ``AsyncNemoGymRolloutResult`` objects into one batched result.
+
+    Used by :meth:`AsyncTrajectoryCollector.run_validation_rollouts` so each val prompt is
+    sent through :func:`run_async_nemo_gym_rollout` individually (acquiring one
+    ``_inflight_sema`` permit per prompt), and the per-prompt results are recombined into
+    the batched shape that :func:`validate` consumes.
+    """
+    if not per_prompt_results:
+        raise ValueError("Cannot merge an empty list of NeMo-Gym rollout results.")
+    if len(per_prompt_results) == 1:
+        return per_prompt_results[0]
+
+    final_batch = BatchedDataDict.from_batches(
+        [r.final_batch for r in per_prompt_results]
+    )
+
+    max_input_seq_len = max(r.input_ids.shape[1] for r in per_prompt_results)
+    padded_input_ids = []
+    for r in per_prompt_results:
+        pad_len = max_input_seq_len - r.input_ids.shape[1]
+        if pad_len > 0:
+            padding = torch.full(
+                (r.input_ids.shape[0], pad_len),
+                tokenizer.pad_token_id,
+                dtype=r.input_ids.dtype,
+                device=r.input_ids.device,
+            )
+            padded_input_ids.append(torch.cat([r.input_ids, padding], dim=1))
+        else:
+            padded_input_ids.append(r.input_ids)
+    input_ids = torch.cat(padded_input_ids, dim=0)
+
+    rollout_metrics = _merge_nemo_gym_rollout_metrics(
+        [r.rollout_metrics for r in per_prompt_results]
+    )
+
+    return AsyncNemoGymRolloutResult(
+        input_ids=input_ids,
+        final_batch=final_batch,
+        rollout_metrics=rollout_metrics,
+    )

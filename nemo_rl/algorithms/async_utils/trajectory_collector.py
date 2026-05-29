@@ -25,9 +25,15 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
+    AsyncNemoGymRolloutResult,
+    merge_async_nemo_gym_rollout_results,
     run_async_multi_turn_rollout,
+    run_async_nemo_gym_rollout,
 )
-from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    GenerationInterface,
+)
 
 TokenizerType = PreTrainedTokenizerBase
 LagMode = Literal["forced", "unforced"]
@@ -526,6 +532,78 @@ class AsyncTrajectoryCollector:
                 f"⏳ Waiting for {pending_count} pending generation threads... ({elapsed:.1f}s elapsed)"
             )
             time.sleep(0.5)
+
+    def run_validation_rollouts(
+        self,
+        val_batch: BatchedDataDict[DatumSpec],
+        generation_config: GenerationConfig,
+        max_seq_len: Optional[int] = None,
+    ) -> AsyncNemoGymRolloutResult:
+        """Run NeMo-Gym validation rollouts through the same ``_inflight_sema`` used by training.
+
+        Mirrors the training collection loop pattern: iterate over prompts in ``val_batch``,
+        slice one prompt at a time, acquire ``_inflight_sema``, spawn a daemon worker, then
+        join all workers and merge results. Each val prompt is intrinsically one ``/run``
+        (validation does not repeat by ``num_generations``), so the per-permit unit is
+        ``1 permit = 1 prompt = 1 /run``. System-wide concurrent ``/run`` cap during
+        validation is therefore ``max_inflight``, which is stricter than training's
+        ``max_inflight \u00d7 num_generations`` and ensures validation can never flood the
+        engine even when in-flight training rollouts have not all drained.
+
+        Val prompts queue on the semaphore alongside any remaining in-flight training
+        rollouts, so the semaphore itself acts as the queue and no separate queue data
+        structure is needed.
+
+        The collector's internal pause / refit gating is intentionally skipped here: the
+        caller is expected to have already paused the training collection loop, and
+        validation must run regardless of any concurrent refit signalling.
+        """
+        num_prompts = val_batch.size
+        if num_prompts == 0:
+            raise ValueError("Cannot run validation rollouts on an empty batch.")
+
+        per_prompt_results: list[Optional[AsyncNemoGymRolloutResult]] = [None] * num_prompts
+        worker_errors: list[Optional[BaseException]] = [None] * num_prompts
+
+        def _worker(prompt_idx: int) -> None:
+            self._inflight_sema.acquire()
+            try:
+                single_prompt_batch = val_batch.slice(prompt_idx, prompt_idx + 1)
+                per_prompt_results[prompt_idx] = run_async_nemo_gym_rollout(
+                    policy_generation=self.policy_generation,
+                    input_batch=single_prompt_batch,
+                    tokenizer=self.tokenizer,
+                    task_to_env=self.task_to_env,
+                    generation_config=generation_config,
+                    max_seq_len=max_seq_len,
+                    max_rollout_turns=None,
+                    greedy=False,
+                )
+            except BaseException as e:
+                worker_errors[prompt_idx] = e
+            finally:
+                self._inflight_sema.release()
+
+        workers = []
+        for prompt_idx in range(num_prompts):
+            worker = _threading.Thread(
+                target=_worker, args=(prompt_idx,), daemon=True
+            )
+            workers.append(worker)
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        for prompt_idx, err in enumerate(worker_errors):
+            if err is not None:
+                raise RuntimeError(
+                    f"Validation rollout for prompt {prompt_idx} failed"
+                ) from err
+
+        ordered_results = [r for r in per_prompt_results if r is not None]
+        return merge_async_nemo_gym_rollout_results(
+            ordered_results, tokenizer=self.tokenizer
+        )
 
     def get_dataloader_state(self) -> dict:
         """Get the current dataloader state for checkpointing."""
