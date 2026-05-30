@@ -1458,7 +1458,7 @@ def test_replace_prefix_tokens_empty_model_prefix_returns_template():
     assert result == template_token_ids
 
 
-def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
+def test_replace_prefix_tokens_missing_eos_in_template_prefix_returns_template():
     class _T:
         eos_token_id = 2
 
@@ -1469,13 +1469,30 @@ def test_replace_prefix_tokens_missing_eos_in_template_prefix_raises():
     model_prefix_token_ids = [7, 2]
     template_prefix_token_ids = [9, 9, 9]  # no EOS inside prefix
     template_token_ids = [9, 9, 9, 2, 10]
-    with pytest.raises(AssertionError):
-        _replace_prefix_tokens(
+    with pytest.warns(RuntimeWarning, match="no EOS token"):
+        result = _replace_prefix_tokens(
             tokenizer=tokenizer,
             model_prefix_token_ids=model_prefix_token_ids,
             template_prefix_token_ids=template_prefix_token_ids,
             template_token_ids=template_token_ids,
         )
+    assert result == template_token_ids
+
+
+def test_replace_prefix_tokens_shorter_template_returns_template():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    template_token_ids = [9, 2, 10]
+    with pytest.warns(RuntimeWarning, match="prefix is longer"):
+        result = _replace_prefix_tokens(
+            tokenizer=tokenizer,
+            model_prefix_token_ids=[7, 2],
+            template_prefix_token_ids=[9, 2, 10, 11],
+            template_token_ids=template_token_ids,
+        )
+    assert result == template_token_ids
 
 
 def test_replace_prefix_tokens_tokenizer_without_eos_raises():
@@ -1507,6 +1524,20 @@ def test_replace_prefix_tokens_uses_last_eos_in_template_prefix():
         template_token_ids=template_token_ids,
     )
     assert result == [100, 2, 77, 88]
+
+
+def test_replace_prefix_tokens_allows_equal_template_and_prefix_lengths():
+    class _T:
+        eos_token_id = 2
+
+    tokenizer = _T()
+    result = _replace_prefix_tokens(
+        tokenizer=tokenizer,
+        model_prefix_token_ids=[100, 2],
+        template_prefix_token_ids=[9, 2],
+        template_token_ids=[9, 2],
+    )
+    assert result == [100, 2]
 
 
 @pytest.mark.asyncio

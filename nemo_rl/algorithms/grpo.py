@@ -2292,8 +2292,15 @@ def validate(
     step: int,
     master_config: MasterConfig,
     logger: Optional[Logger] = None,
+    trajectory_collector: Optional[Any] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Run validation on the validation dataset."""
+    """Run validation on the validation dataset.
+
+    When ``trajectory_collector`` is provided and the NeMo-Gym path is active, validation
+    rollouts are routed through the collector so they share its ``_inflight_sema`` with
+    in-flight training rollouts. This applies natural backpressure: validation prompts only
+    start as training rollouts release semaphore slots.
+    """
     if val_dataloader is None:
         assert val_dataloader is not None or master_config.grpo["val_period"] == 0, (
             "val_dataloader is None, so grpo.val_period must be 0"
@@ -2323,16 +2330,25 @@ def validate(
             # We cascade NeMo-Gym first since NeMo-Gym also uses async rollouts.
             if _should_use_nemo_gym(master_config):
                 generation_config = master_config.policy["generation"]
-                nemo_gym_rollout_result = run_async_nemo_gym_rollout(
-                    policy_generation=policy_generation,
-                    input_batch=val_batch,
-                    tokenizer=tokenizer,
-                    task_to_env=val_task_to_env,
-                    max_seq_len=master_config.policy["max_total_sequence_length"],
-                    generation_config=generation_config,
-                    max_rollout_turns=None,
-                    greedy=False,
-                )
+                if trajectory_collector is not None:
+                    nemo_gym_rollout_result = ray.get(
+                        trajectory_collector.run_validation_rollouts.remote(
+                            val_batch,
+                            generation_config,
+                            master_config.policy["max_total_sequence_length"],
+                        )
+                    )
+                else:
+                    nemo_gym_rollout_result = run_async_nemo_gym_rollout(
+                        policy_generation=policy_generation,
+                        input_batch=val_batch,
+                        tokenizer=tokenizer,
+                        task_to_env=val_task_to_env,
+                        max_seq_len=master_config.policy["max_total_sequence_length"],
+                        generation_config=generation_config,
+                        max_rollout_turns=None,
+                        greedy=False,
+                    )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics
                 additional_metrics_to_report = gen_metrics
@@ -2685,20 +2701,17 @@ def async_grpo_train(
     # Run validation at start if configured
     if val_at_start and step == 0:
         print("\n🔍 Running initial validation...")
-        # Pause trajectory collection during initial validation
+        # Pause trajectory collection during initial validation so we don't launch new training
+        # rollouts. We do NOT drain in-flight training rollouts: they share `_inflight_sema` with
+        # validation rollouts, so val requests naturally queue behind them and pop into vacated
+        # slots as those finish.
         inflight_at_pause = ray.get(trajectory_collector.pause.remote())
         logger.log_metrics(
             {"collector_inflight_at_pause": inflight_at_pause},
             step,
             prefix="timing/validation",
         )
-        _drain_start = time.time()
-        ray.get(trajectory_collector.wait_for_pending_generations.remote())
-        logger.log_metrics(
-            {"collector_drain_time": time.time() - _drain_start},
-            step,
-            prefix="timing/validation",
-        )
+        ray.get(trajectory_collector.reset_peak_inflight.remote())
 
         try:
             val_metrics, validation_timings = validate(
@@ -2709,8 +2722,20 @@ def async_grpo_train(
                 step=0,
                 master_config=master_config,
                 logger=logger,
+                trajectory_collector=trajectory_collector,
             )
             policy_generation.finish_generation()
+            peak_split = ray.get(
+                trajectory_collector.get_peak_inflight_split.remote()
+            )
+            logger.log_metrics(
+                {
+                    "peak_concurrent_training_workers": peak_split["training"],
+                    "peak_concurrent_validation_workers": peak_split["validation"],
+                },
+                step,
+                prefix="timing/validation",
+            )
             logger.log_metrics(val_metrics, step, prefix="validation")
             logger.log_metrics(validation_timings, step, prefix="timing/validation")
             print("✅ Initial validation completed successfully")
@@ -3048,20 +3073,17 @@ def async_grpo_train(
                 if (val_period > 0 and (step + 1) % val_period == 0) or (
                     val_at_end and is_last_step
                 ):
-                    # Pause trajectory collection during validation to reduce memory pressure
+                    # Pause trajectory collection during validation so no new training rollouts
+                    # start. We do NOT drain in-flight training rollouts: validation rollouts
+                    # share `_inflight_sema` with them and naturally queue behind them, popping
+                    # in as training rollouts release semaphore slots.
                     inflight_at_pause = ray.get(trajectory_collector.pause.remote())
                     logger.log_metrics(
                         {"collector_inflight_at_pause": inflight_at_pause},
                         step + 1,
                         prefix="timing/validation",
                     )
-                    _drain_start = time.time()
-                    ray.get(trajectory_collector.wait_for_pending_generations.remote())
-                    logger.log_metrics(
-                        {"collector_drain_time": time.time() - _drain_start},
-                        step + 1,
-                        prefix="timing/validation",
-                    )
+                    ray.get(trajectory_collector.reset_peak_inflight.remote())
 
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
@@ -3078,8 +3100,22 @@ def async_grpo_train(
                         step=step + 1,
                         master_config=master_config,
                         logger=logger,
+                        trajectory_collector=trajectory_collector,
                     )
                     policy_generation.finish_generation()
+                    peak_split = ray.get(
+                        trajectory_collector.get_peak_inflight_split.remote()
+                    )
+                    logger.log_metrics(
+                        {
+                            "peak_concurrent_training_workers": peak_split["training"],
+                            "peak_concurrent_validation_workers": peak_split[
+                                "validation"
+                            ],
+                        },
+                        step + 1,
+                        prefix="timing/validation",
+                    )
                     logger.log_metrics(
                         validation_timings, step + 1, prefix="timing/validation"
                     )
@@ -3336,6 +3372,13 @@ def async_grpo_train(
             )
             performance_metrics["generation_concurrent_workers"] = ray.get(
                 trajectory_collector.get_inflight_count.remote()
+            )
+            inflight_split = ray.get(trajectory_collector.get_inflight_split.remote())
+            performance_metrics["generation_concurrent_training_workers"] = (
+                inflight_split["training"]
+            )
+            performance_metrics["generation_concurrent_validation_workers"] = (
+                inflight_split["validation"]
             )
 
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")

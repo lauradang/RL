@@ -158,6 +158,27 @@ class StubAsyncTrajectoryCollector:
         mock.remote = MagicMock(return_value=MagicMock())
         return mock
 
+    @property
+    def get_inflight_split(self):
+        """Get live inflight split - returns a dict via remote mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={"training": 0, "validation": 0})
+        return mock
+
+    @property
+    def reset_peak_inflight(self):
+        """Reset peak inflight counters - returns a remote-callable mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value=MagicMock())
+        return mock
+
+    @property
+    def get_peak_inflight_split(self):
+        """Get peak inflight split - returns a dict via remote mock"""
+        mock = MagicMock()
+        mock.remote = MagicMock(return_value={"training": 0, "validation": 0})
+        return mock
+
 
 @pytest.fixture
 def mock_grpo_components():

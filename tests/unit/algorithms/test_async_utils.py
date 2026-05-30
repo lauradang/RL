@@ -682,6 +682,86 @@ class TestAsyncTrajectoryCollector:
         ray.kill(buffer)
         ray.kill(mock_env)
 
+    def test_inflight_permit_split_tracking(self):
+        """Test that held semaphore permits are counted and peaked per rollout kind."""
+        buffer = ReplayBuffer.remote(max_size=10)
+        mock_generation = MockGenerationInterface()
+        mock_tokenizer = mock.MagicMock()
+        mock_env = MockEnvironment.remote(rewards=[1.0, 2.0])
+        task_to_env = {"test": mock_env}
+        master_config = self.create_mock_config()
+
+        collector = AsyncTrajectoryCollector.remote(
+            policy_generation=mock_generation,
+            tokenizer=mock_tokenizer,
+            task_to_env=task_to_env,
+            master_config=master_config,
+            replay_buffer=buffer,
+            start_step=0,
+        )
+
+        # Initially nothing is held and peaks are zero.
+        assert ray.get(collector.get_inflight_split.remote()) == {
+            "training": 0,
+            "validation": 0,
+        }
+        assert ray.get(collector.get_peak_inflight_split.remote()) == {
+            "training": 0,
+            "validation": 0,
+        }
+
+        # Acquire two training permits and one validation permit.
+        ray.get(collector._acquire_inflight_permit.remote("training"))
+        ray.get(collector._acquire_inflight_permit.remote("training"))
+        ray.get(collector._acquire_inflight_permit.remote("validation"))
+
+        assert ray.get(collector.get_inflight_split.remote()) == {
+            "training": 2,
+            "validation": 1,
+        }
+        assert ray.get(collector.get_peak_inflight_split.remote()) == {
+            "training": 2,
+            "validation": 1,
+        }
+
+        # Releasing keeps the peak but lowers the live count.
+        ray.get(collector._release_inflight_permit.remote("training"))
+        assert ray.get(collector.get_inflight_split.remote()) == {
+            "training": 1,
+            "validation": 1,
+        }
+        assert ray.get(collector.get_peak_inflight_split.remote()) == {
+            "training": 2,
+            "validation": 1,
+        }
+
+        # Resetting peaks snaps them to the current live counts.
+        ray.get(collector.reset_peak_inflight.remote())
+        assert ray.get(collector.get_peak_inflight_split.remote()) == {
+            "training": 1,
+            "validation": 1,
+        }
+
+        # A new validation acquire after reset raises only the validation peak.
+        ray.get(collector._acquire_inflight_permit.remote("validation"))
+        assert ray.get(collector.get_peak_inflight_split.remote()) == {
+            "training": 1,
+            "validation": 2,
+        }
+
+        # Release the rest and confirm counts return to zero (clamped at zero).
+        ray.get(collector._release_inflight_permit.remote("training"))
+        ray.get(collector._release_inflight_permit.remote("validation"))
+        ray.get(collector._release_inflight_permit.remote("validation"))
+        assert ray.get(collector.get_inflight_split.remote()) == {
+            "training": 0,
+            "validation": 0,
+        }
+
+        ray.kill(collector)
+        ray.kill(buffer)
+        ray.kill(mock_env)
+
 
 class TestAsyncUtilsIntegration:
     """Integration tests for async utilities working together."""

@@ -25,9 +25,15 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.experience.rollouts import (
+    AsyncNemoGymRolloutResult,
+    merge_async_nemo_gym_rollout_results,
     run_async_multi_turn_rollout,
+    run_async_nemo_gym_rollout,
 )
-from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    GenerationInterface,
+)
 
 TokenizerType = PreTrainedTokenizerBase
 LagMode = Literal["forced", "unforced"]
@@ -91,6 +97,15 @@ class AsyncTrajectoryCollector:
         ) or 1
         self.max_inflight_generations = max_inflight
         self._inflight_sema = _threading.Semaphore(max_inflight)
+
+        # Track how many held semaphore permits belong to training vs validation
+        # rollouts, plus the peak held during the current window (reset around
+        # validation). Used for wandb metrics on rollout-thread usage.
+        self._inflight_stats_lock: _threading.Lock = _threading.Lock()
+        self._training_inflight = 0
+        self._validation_inflight = 0
+        self._peak_training_inflight = 0
+        self._peak_validation_inflight = 0
 
         # Simple lock to prevent race conditions when checking/spawning workers
         self._generation_check_lock: _threading.Lock = _threading.Lock()
@@ -315,10 +330,10 @@ class AsyncTrajectoryCollector:
                         prompt_idx, prompt_idx + 1
                     ).repeat_interleave(num_generations)
 
-                    self._inflight_sema.acquire()
+                    self._acquire_inflight_permit("training")
 
                     if not self.running:
-                        self._inflight_sema.release()
+                        self._release_inflight_permit("training")
                         break
 
                     generation_weight_version = self.current_weight_version
@@ -385,7 +400,7 @@ class AsyncTrajectoryCollector:
                 single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
                 repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
 
-                self._inflight_sema.acquire()
+                self._acquire_inflight_permit("training")
                 worker = _threading.Thread(
                     target=self._run_prompt_group_worker,
                     args=(
@@ -428,6 +443,52 @@ class AsyncTrajectoryCollector:
         """Return the current number of in-flight generation threads."""
         with self._threads_lock:
             return len(self._inflight_threads)
+
+    def _acquire_inflight_permit(self, kind: Literal["training", "validation"]) -> None:
+        """Acquire a shared ``_inflight_sema`` permit and count it by rollout kind."""
+        self._inflight_sema.acquire()
+        with self._inflight_stats_lock:
+            if kind == "validation":
+                self._validation_inflight += 1
+                self._peak_validation_inflight = max(
+                    self._peak_validation_inflight, self._validation_inflight
+                )
+            else:
+                self._training_inflight += 1
+                self._peak_training_inflight = max(
+                    self._peak_training_inflight, self._training_inflight
+                )
+
+    def _release_inflight_permit(self, kind: Literal["training", "validation"]) -> None:
+        """Release a shared ``_inflight_sema`` permit and decrement its counter."""
+        with self._inflight_stats_lock:
+            if kind == "validation":
+                self._validation_inflight = max(0, self._validation_inflight - 1)
+            else:
+                self._training_inflight = max(0, self._training_inflight - 1)
+        self._inflight_sema.release()
+
+    def get_inflight_split(self) -> dict[str, int]:
+        """Return live held-permit counts split by training vs validation rollouts."""
+        with self._inflight_stats_lock:
+            return {
+                "training": self._training_inflight,
+                "validation": self._validation_inflight,
+            }
+
+    def reset_peak_inflight(self) -> None:
+        """Reset peak held-permit counters to the current live counts."""
+        with self._inflight_stats_lock:
+            self._peak_training_inflight = self._training_inflight
+            self._peak_validation_inflight = self._validation_inflight
+
+    def get_peak_inflight_split(self) -> dict[str, int]:
+        """Return peak held-permit counts split by training vs validation rollouts."""
+        with self._inflight_stats_lock:
+            return {
+                "training": self._peak_training_inflight,
+                "validation": self._peak_validation_inflight,
+            }
 
     def resume(self) -> None:
         """Resume trajectory collection."""
@@ -526,6 +587,78 @@ class AsyncTrajectoryCollector:
                 f"⏳ Waiting for {pending_count} pending generation threads... ({elapsed:.1f}s elapsed)"
             )
             time.sleep(0.5)
+
+    def run_validation_rollouts(
+        self,
+        val_batch: BatchedDataDict[DatumSpec],
+        generation_config: GenerationConfig,
+        max_seq_len: Optional[int] = None,
+    ) -> AsyncNemoGymRolloutResult:
+        """Run NeMo-Gym validation rollouts through the same ``_inflight_sema`` used by training.
+
+        Mirrors the training collection loop pattern: iterate over prompts in ``val_batch``,
+        slice one prompt at a time, acquire ``_inflight_sema``, spawn a daemon worker, then
+        join all workers and merge results. Each val prompt is intrinsically one ``/run``
+        (validation does not repeat by ``num_generations``), so the per-permit unit is
+        ``1 permit = 1 prompt = 1 /run``. System-wide concurrent ``/run`` cap during
+        validation is therefore ``max_inflight``, which is stricter than training's
+        ``max_inflight \u00d7 num_generations`` and ensures validation can never flood the
+        engine even when in-flight training rollouts have not all drained.
+
+        Val prompts queue on the semaphore alongside any remaining in-flight training
+        rollouts, so the semaphore itself acts as the queue and no separate queue data
+        structure is needed.
+
+        The collector's internal pause / refit gating is intentionally skipped here: the
+        caller is expected to have already paused the training collection loop, and
+        validation must run regardless of any concurrent refit signalling.
+        """
+        num_prompts = val_batch.size
+        if num_prompts == 0:
+            raise ValueError("Cannot run validation rollouts on an empty batch.")
+
+        per_prompt_results: list[Optional[AsyncNemoGymRolloutResult]] = [None] * num_prompts
+        worker_errors: list[Optional[BaseException]] = [None] * num_prompts
+
+        def _worker(prompt_idx: int) -> None:
+            self._acquire_inflight_permit("validation")
+            try:
+                single_prompt_batch = val_batch.slice(prompt_idx, prompt_idx + 1)
+                per_prompt_results[prompt_idx] = run_async_nemo_gym_rollout(
+                    policy_generation=self.policy_generation,
+                    input_batch=single_prompt_batch,
+                    tokenizer=self.tokenizer,
+                    task_to_env=self.task_to_env,
+                    generation_config=generation_config,
+                    max_seq_len=max_seq_len,
+                    max_rollout_turns=None,
+                    greedy=False,
+                )
+            except BaseException as e:
+                worker_errors[prompt_idx] = e
+            finally:
+                self._release_inflight_permit("validation")
+
+        workers = []
+        for prompt_idx in range(num_prompts):
+            worker = _threading.Thread(
+                target=_worker, args=(prompt_idx,), daemon=True
+            )
+            workers.append(worker)
+            worker.start()
+        for worker in workers:
+            worker.join()
+
+        for prompt_idx, err in enumerate(worker_errors):
+            if err is not None:
+                raise RuntimeError(
+                    f"Validation rollout for prompt {prompt_idx} failed"
+                ) from err
+
+        ordered_results = [r for r in per_prompt_results if r is not None]
+        return merge_async_nemo_gym_rollout_results(
+            ordered_results, tokenizer=self.tokenizer
+        )
 
     def get_dataloader_state(self) -> dict:
         """Get the current dataloader state for checkpointing."""
@@ -668,7 +801,7 @@ class AsyncTrajectoryCollector:
                 if current in self._inflight_threads:
                     self._inflight_threads.remove(current)
             try:
-                self._inflight_sema.release()
+                self._release_inflight_permit("training")
             except Exception:
                 import traceback
 
