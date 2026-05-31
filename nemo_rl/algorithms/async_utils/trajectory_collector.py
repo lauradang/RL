@@ -39,6 +39,52 @@ TokenizerType = PreTrainedTokenizerBase
 LagMode = Literal["forced", "unforced"]
 
 
+class _TwoLaneSemaphore:
+    """Counting semaphore with a high- and low-priority waiting lane.
+
+    A freed permit is handed to a waiting high-priority (validation, priority 0)
+    acquirer before any waiting low-priority (training) acquirer. Only reorders
+    waiting acquirers; it cannot reclaim permits already held by in-flight rollouts.
+
+    Invariant: ``_free > 0`` implies no parked waiters, so the fast path never lets a
+    new acquirer jump ahead of a parked validation acquirer.
+    """
+
+    def __init__(self, value: int):
+        self._lock = _threading.Lock()
+        self._free = max(1, value)
+        self._high_waiting = 0
+        self._low_waiting = 0
+        self._high_lane = _threading.Semaphore(0)
+        self._low_lane = _threading.Semaphore(0)
+
+    def acquire(self, priority: int = 1) -> None:
+        with self._lock:
+            if self._free > 0:
+                self._free -= 1
+                return
+            if priority <= 0:
+                self._high_waiting += 1
+                lane = self._high_lane
+            else:
+                self._low_waiting += 1
+                lane = self._low_lane
+        # Block until a releaser hands us a permit (already accounted for in _free).
+        lane.acquire()
+
+    def release(self) -> None:
+        with self._lock:
+            self._free += 1
+            if self._high_waiting > 0:
+                self._high_waiting -= 1
+                self._free -= 1
+                self._high_lane.release()
+            elif self._low_waiting > 0:
+                self._low_waiting -= 1
+                self._free -= 1
+                self._low_lane.release()
+
+
 @ray.remote  # pragma: no cover
 class AsyncTrajectoryCollector:
     """Collects trajectories asynchronously and adds them to replay buffer."""
@@ -91,12 +137,14 @@ class AsyncTrajectoryCollector:
 
         # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
         # This value limits the parallelism of the generation requests.
+        # Uses a two-lane gate so that when a permit frees up it is handed to a waiting
+        # validation rollout before any waiting training rollout.
         max_inflight = (
             int(self.master_config.grpo["num_prompts_per_step"])
             * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
         ) or 1
         self.max_inflight_generations = max_inflight
-        self._inflight_sema = _threading.Semaphore(max_inflight)
+        self._inflight_sema = _TwoLaneSemaphore(max_inflight)
 
         # Track how many held semaphore permits belong to training vs validation
         # rollouts, plus the peak held during the current window (reset around
@@ -446,7 +494,7 @@ class AsyncTrajectoryCollector:
 
     def _acquire_inflight_permit(self, kind: Literal["training", "validation"]) -> None:
         """Acquire a shared ``_inflight_sema`` permit and count it by rollout kind."""
-        self._inflight_sema.acquire()
+        self._inflight_sema.acquire(0 if kind == "validation" else 1)
         with self._inflight_stats_lock:
             if kind == "validation":
                 self._validation_inflight += 1
