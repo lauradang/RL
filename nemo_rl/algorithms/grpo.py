@@ -224,6 +224,18 @@ class MasterConfig(BaseModel, extra="allow"):
     checkpointing: CheckpointingConfig
 
 
+def _will_run_validation_after_step(
+    step_index: int,
+    max_num_steps: int,
+    val_period: int,
+    val_at_end: bool,
+) -> bool:
+    """Return whether the 1-indexed training step will be followed by validation."""
+    return (val_period > 0 and step_index % val_period == 0) or (
+        val_at_end and step_index == max_num_steps
+    )
+
+
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
@@ -2706,8 +2718,14 @@ def async_grpo_train(
         # validation rollouts, so val requests naturally queue behind them and pop into vacated
         # slots as those finish.
         inflight_at_pause = ray.get(trajectory_collector.pause.remote())
+        generation_concurrency_limits = ray.get(
+            trajectory_collector.get_generation_concurrency_limits.remote()
+        )
         logger.log_metrics(
-            {"collector_inflight_at_pause": inflight_at_pause},
+            {
+                "collector_inflight_at_pause": inflight_at_pause,
+                **generation_concurrency_limits,
+            },
             step,
             prefix="timing/validation",
         )
@@ -2776,6 +2794,19 @@ def async_grpo_train(
     # Main training loop
     try:
         while step < master_config.grpo["max_num_steps"]:
+            current_step_index = step + 1
+            is_last_step = current_step_index == master_config.grpo["max_num_steps"]
+            validation_after_this_step = _will_run_validation_after_step(
+                current_step_index,
+                master_config.grpo["max_num_steps"],
+                val_period,
+                val_at_end,
+            )
+            step_generation_concurrency_limits = ray.get(
+                trajectory_collector.set_validation_headroom_active.remote(
+                    validation_after_this_step
+                )
+            )
             print(
                 f"\n{'=' * 25} Step {step + 1}/{master_config.grpo['max_num_steps']} {'=' * 25}"
             )
@@ -3067,19 +3098,22 @@ def async_grpo_train(
 
                 # Validation
                 val_metrics, validation_timings = None, None
-                is_last_step = step + 1 == master_config.grpo["max_num_steps"]
 
                 # Run validation if it's a validation step or last step with val_at_end
-                if (val_period > 0 and (step + 1) % val_period == 0) or (
-                    val_at_end and is_last_step
-                ):
+                if validation_after_this_step:
                     # Pause trajectory collection during validation so no new training rollouts
                     # start. We do NOT drain in-flight training rollouts: validation rollouts
                     # share `_inflight_sema` with them and naturally queue behind them, popping
                     # in as training rollouts release semaphore slots.
                     inflight_at_pause = ray.get(trajectory_collector.pause.remote())
+                    validation_concurrency_limits = ray.get(
+                        trajectory_collector.get_generation_concurrency_limits.remote()
+                    )
                     logger.log_metrics(
-                        {"collector_inflight_at_pause": inflight_at_pause},
+                        {
+                            "collector_inflight_at_pause": inflight_at_pause,
+                            **validation_concurrency_limits,
+                        },
                         step + 1,
                         prefix="timing/validation",
                     )
@@ -3128,6 +3162,21 @@ def async_grpo_train(
                     torch.cuda.empty_cache()
 
                     # Resume trajectory collection after validation
+                    next_step_index = current_step_index + 1
+                    next_step_will_validate = (
+                        next_step_index <= master_config.grpo["max_num_steps"]
+                        and _will_run_validation_after_step(
+                            next_step_index,
+                            master_config.grpo["max_num_steps"],
+                            val_period,
+                            val_at_end,
+                        )
+                    )
+                    ray.get(
+                        trajectory_collector.set_validation_headroom_active.remote(
+                            next_step_will_validate
+                        )
+                    )
                     trajectory_collector.resume.remote()
                 # Get flat advantages and token mask for masked metrics computation
                 flat_advantages = train_data["advantages"]
@@ -3380,6 +3429,7 @@ def async_grpo_train(
             performance_metrics["generation_concurrent_validation_workers"] = (
                 inflight_split["validation"]
             )
+            performance_metrics.update(step_generation_concurrency_limits)
 
             logger.log_metrics(performance_metrics, step + 1, prefix="performance")
             logger.log_metrics(metrics, step + 1, prefix="train")

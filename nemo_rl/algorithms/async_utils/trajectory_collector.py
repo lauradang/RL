@@ -46,43 +46,82 @@ class _TwoLaneSemaphore:
     acquirer before any waiting low-priority (training) acquirer. Only reorders
     waiting acquirers; it cannot reclaim permits already held by in-flight rollouts.
 
-    Invariant: ``_free > 0`` implies no parked waiters, so the fast path never lets a
-    new acquirer jump ahead of a parked validation acquirer.
+    The low-priority limit can be lowered dynamically to reserve free permits for
+    validation. Lowering the limit blocks new training acquires but does not reclaim
+    permits already held by training rollouts.
     """
 
-    def __init__(self, value: int):
+    def __init__(self, value: int, low_priority_limit: Optional[int] = None):
         self._lock = _threading.Lock()
-        self._free = max(1, value)
+        self._limit = max(1, value)
+        self._free = self._limit
+        self._low_priority_limit = self._normalize_low_priority_limit(
+            self._limit if low_priority_limit is None else low_priority_limit
+        )
+        self._low_held = 0
         self._high_waiting = 0
         self._low_waiting = 0
         self._high_lane = _threading.Semaphore(0)
         self._low_lane = _threading.Semaphore(0)
 
+    def _normalize_low_priority_limit(self, value: int) -> int:
+        if value < 0:
+            raise ValueError("low_priority_limit must be non-negative")
+        return min(value, self._limit)
+
+    def _can_acquire_low_priority_locked(self) -> bool:
+        return (
+            self._free > 0
+            and self._low_held < self._low_priority_limit
+            and self._high_waiting == 0
+        )
+
+    def _wake_waiters_locked(self) -> None:
+        while self._free > 0:
+            if self._high_waiting > 0:
+                self._high_waiting -= 1
+                self._free -= 1
+                self._high_lane.release()
+            elif (
+                self._low_waiting > 0
+                and self._low_held < self._low_priority_limit
+            ):
+                self._low_waiting -= 1
+                self._low_held += 1
+                self._free -= 1
+                self._low_lane.release()
+            else:
+                break
+
     def acquire(self, priority: int = 1) -> None:
         with self._lock:
-            if self._free > 0:
-                self._free -= 1
-                return
             if priority <= 0:
+                if self._free > 0:
+                    self._free -= 1
+                    return
                 self._high_waiting += 1
                 lane = self._high_lane
             else:
+                if self._can_acquire_low_priority_locked():
+                    self._free -= 1
+                    self._low_held += 1
+                    return
                 self._low_waiting += 1
                 lane = self._low_lane
         # Block until a releaser hands us a permit (already accounted for in _free).
         lane.acquire()
 
-    def release(self) -> None:
+    def release(self, priority: int = 1) -> None:
         with self._lock:
+            if priority > 0 and self._low_held > 0:
+                self._low_held -= 1
             self._free += 1
-            if self._high_waiting > 0:
-                self._high_waiting -= 1
-                self._free -= 1
-                self._high_lane.release()
-            elif self._low_waiting > 0:
-                self._low_waiting -= 1
-                self._free -= 1
-                self._low_lane.release()
+            self._wake_waiters_locked()
+
+    def set_low_priority_limit(self, value: int) -> None:
+        with self._lock:
+            self._low_priority_limit = self._normalize_low_priority_limit(value)
+            self._wake_waiters_locked()
 
 
 @ray.remote  # pragma: no cover
@@ -135,16 +174,35 @@ class AsyncTrajectoryCollector:
         self._inflight_threads: set[_threading.Thread] = set()
         self._threads_lock: _threading.Lock = _threading.Lock()
 
-        # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps
-        # This value limits the parallelism of the generation requests.
-        # Uses a two-lane gate so that when a permit frees up it is handed to a waiting
-        # validation rollout before any waiting training rollout.
-        max_inflight = (
-            int(self.master_config.grpo["num_prompts_per_step"])
-            * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
-        ) or 1
+        # Limit in-flight generator requests to num_prompts_per_step * max_trajectory_age_steps.
+        # The shared gate keeps total generation pressure bounded. Training can be
+        # dynamically capped before validation so free permits accumulate for val rollouts.
+        num_prompts_per_step = int(self.master_config.grpo["num_prompts_per_step"])
+        max_trajectory_age_steps = int(
+            self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
+        )
+        max_inflight = max(num_prompts_per_step * max_trajectory_age_steps, 1)
+        if self.lag_mode == "unforced" and max_trajectory_age_steps > 1:
+            pre_validation_training_limit = max(
+                num_prompts_per_step * (max_trajectory_age_steps - 1),
+                1,
+            )
+        else:
+            pre_validation_training_limit = max_inflight
+        pre_validation_training_limit = min(
+            pre_validation_training_limit,
+            max_inflight,
+        )
         self.max_inflight_generations = max_inflight
-        self._inflight_sema = _TwoLaneSemaphore(max_inflight)
+        self.normal_training_inflight_generations = max_inflight
+        self.pre_validation_training_inflight_generations = (
+            pre_validation_training_limit
+        )
+        self._active_training_inflight_limit = max_inflight
+        self._inflight_sema = _TwoLaneSemaphore(
+            max_inflight,
+            low_priority_limit=self._active_training_inflight_limit,
+        )
 
         # Track how many held semaphore permits belong to training vs validation
         # rollouts, plus the peak held during the current window (reset around
@@ -378,10 +436,7 @@ class AsyncTrajectoryCollector:
                         prompt_idx, prompt_idx + 1
                     ).repeat_interleave(num_generations)
 
-                    self._acquire_inflight_permit("training")
-
-                    if not self.running:
-                        self._release_inflight_permit("training")
+                    if not self._acquire_training_permit_for_start():
                         break
 
                     generation_weight_version = self.current_weight_version
@@ -448,7 +503,8 @@ class AsyncTrajectoryCollector:
                 single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
                 repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
 
-                self._acquire_inflight_permit("training")
+                if not self._acquire_training_permit_for_start():
+                    break
                 worker = _threading.Thread(
                     target=self._run_prompt_group_worker,
                     args=(
@@ -492,6 +548,26 @@ class AsyncTrajectoryCollector:
         with self._threads_lock:
             return len(self._inflight_threads)
 
+    def _acquire_training_permit_for_start(self) -> bool:
+        """Acquire a training permit only when collection is still allowed to start."""
+        while self.running:
+            self._acquire_inflight_permit("training")
+            if (
+                self.running
+                and self._manual_pause_cleared.is_set()
+                and self._refit_pause_cleared.is_set()
+            ):
+                return True
+
+            self._release_inflight_permit("training")
+            if not self.running:
+                return False
+            if not self._manual_pause_cleared.is_set():
+                self._manual_pause_cleared.wait()
+            if not self._refit_pause_cleared.is_set():
+                self._refit_pause_cleared.wait()
+        return False
+
     def _acquire_inflight_permit(self, kind: Literal["training", "validation"]) -> None:
         """Acquire a shared ``_inflight_sema`` permit and count it by rollout kind."""
         self._inflight_sema.acquire(0 if kind == "validation" else 1)
@@ -514,7 +590,34 @@ class AsyncTrajectoryCollector:
                 self._validation_inflight = max(0, self._validation_inflight - 1)
             else:
                 self._training_inflight = max(0, self._training_inflight - 1)
-        self._inflight_sema.release()
+        self._inflight_sema.release(0 if kind == "validation" else 1)
+
+    def set_validation_headroom_active(self, active: bool) -> dict[str, int]:
+        """Toggle pre-validation training headroom and return current limits."""
+        training_limit = (
+            self.pre_validation_training_inflight_generations
+            if active
+            else self.normal_training_inflight_generations
+        )
+        self._inflight_sema.set_low_priority_limit(training_limit)
+        self._active_training_inflight_limit = training_limit
+        return self.get_generation_concurrency_limits()
+
+    def get_generation_concurrency_limits(self) -> dict[str, int]:
+        """Return current generation concurrency limits for metrics/debugging."""
+        return {
+            "max_inflight_generations": self.max_inflight_generations,
+            "active_training_inflight_limit": self._active_training_inflight_limit,
+            "normal_training_inflight_generations": (
+                self.normal_training_inflight_generations
+            ),
+            "pre_validation_training_inflight_generations": (
+                self.pre_validation_training_inflight_generations
+            ),
+            "validation_reserved_generations": (
+                self.max_inflight_generations - self._active_training_inflight_limit
+            ),
+        }
 
     def get_inflight_split(self) -> dict[str, int]:
         """Return live held-permit counts split by training vs validation rollouts."""
