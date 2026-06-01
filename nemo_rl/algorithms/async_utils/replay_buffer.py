@@ -138,8 +138,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.target_weight_versions.pop(idx)
             self.trajectories.pop(idx)
 
-    def _evict_stale_unforced(self, min_valid_version: int) -> None:
-        """Evict stale trajectories for unforced-lag mode."""
+    def _evict_stale(self, min_valid_version: int) -> None:
+        """Evict stale trajectories."""
         stale_indices = [
             i for i, v in enumerate(self.trajectory_versions) if v < min_valid_version
         ]
@@ -148,7 +148,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
         self._remove_indices(stale_indices)
         print(
-            f"🗑️ ReplayBuffer(unforced) evicted {len(stale_indices)} stale trajectories "
+            f"🗑️ ReplayBuffer evicted {len(stale_indices)} stale trajectories "
             f"(older than weight_version {min_valid_version})"
         )
 
@@ -177,7 +177,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             min_valid_version = max(0, current_weight_version - max_age_steps)
 
             if self.lag_mode == "unforced":
-                self._evict_stale_unforced(min_valid_version)
+                self._evict_stale(min_valid_version)
                 available = len(self.trajectories)
                 print(
                     f"🔍 ReplayBuffer(unforced).sample: requested={num_prompt_groups}, "
