@@ -2636,10 +2636,7 @@ def async_grpo_train(
             )
 
     # Import async utilities only when needed
-    from nemo_rl.algorithms.async_utils import (
-        AsyncTrajectoryCollector,
-        ReplayBuffer,
-    )
+    from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 
     async_cfg = master_config.grpo["async_grpo"]
     lag_mode = async_cfg.get("lag_mode", "forced")
@@ -2729,11 +2726,10 @@ def async_grpo_train(
     # Each weight version generates exactly num_prompts_per_step trajectories
     # With max_age_steps, we keep trajectories from multiple weight versions
     num_prompts_per_step = master_config.grpo["num_prompts_per_step"]
-    max_inflight_generations = (
-        num_prompts_per_step * max_trajectory_age_steps
-    ) or 1
     late_arrival_slack = 2
-    optimal_buffer_size = max_inflight_generations * late_arrival_slack
+    optimal_buffer_size = (
+        num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
+    )
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size,

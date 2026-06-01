@@ -28,10 +28,7 @@ os.environ["RAY_TEMP_DIR"] = _temp_dir
 os.environ["RAY_TMPDIR"] = _temp_dir  # Alternative env var
 os.environ["TMPDIR"] = _temp_dir  # System temp dir
 
-from nemo_rl.algorithms.async_utils import (
-    AsyncTrajectoryCollector,
-    ReplayBuffer,
-)
+from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
 from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl, ReplayBufferNew
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
@@ -154,12 +151,16 @@ class TestReplayBuffer:
 
         # Push trajectories
         status1 = ray.get(
-            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
+            buffer.add.remote(
+                trajectory1, weight_version=0, target_weight_version=1
+            )
         )
         assert status1 == "success"
 
         status2 = ray.get(
-            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
+            buffer.add.remote(
+                trajectory2, weight_version=1, target_weight_version=2
+            )
         )
         assert status2 == "success"
 
@@ -186,17 +187,23 @@ class TestReplayBuffer:
 
         # Push first two trajectories
         status1 = ray.get(
-            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
+            buffer.add.remote(
+                trajectory1, weight_version=0, target_weight_version=1
+            )
         )
         status2 = ray.get(
-            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
+            buffer.add.remote(
+                trajectory2, weight_version=1, target_weight_version=2
+            )
         )
         assert status1 == "success"
         assert status2 == "success"
 
         # Try to push third trajectory (should return "full")
         status3 = ray.get(
-            buffer.add.remote(trajectory3, weight_version=2, target_weight_version=3)
+            buffer.add.remote(
+                trajectory3, weight_version=2, target_weight_version=3
+            )
         )
         assert status3 == "full"
 
@@ -251,7 +258,9 @@ class TestReplayBuffer:
         # Push only one trajectory
         trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
         ray.get(
-            buffer.add.remote(trajectory, weight_version=0, target_weight_version=1)
+            buffer.add.remote(
+                trajectory, weight_version=0, target_weight_version=1
+            )
         )
 
         # Try to sample more trajectories than available for current step
@@ -279,7 +288,9 @@ class TestReplayBuffer:
         }
 
         ray.get(
-            buffer.add.remote(old_trajectory, weight_version=0, target_weight_version=1)
+            buffer.add.remote(
+                old_trajectory, weight_version=0, target_weight_version=1
+            )
         )
         ray.get(
             buffer.add.remote(
@@ -317,10 +328,14 @@ class TestReplayBuffer:
         }
 
         ray.get(
-            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
+            buffer.add.remote(
+                trajectory1, weight_version=0, target_weight_version=1
+            )
         )
         ray.get(
-            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=2)
+            buffer.add.remote(
+                trajectory2, weight_version=1, target_weight_version=2
+            )
         )
 
         # Sample for current step 1 - should only get trajectory intended for step 1
@@ -351,10 +366,14 @@ class TestReplayBuffer:
         trajectory2 = {"batch": {"data": "test2"}, "rollout_metrics": {"reward": 2.0}}
 
         ray.get(
-            buffer.add.remote(trajectory1, weight_version=0, target_weight_version=1)
+            buffer.add.remote(
+                trajectory1, weight_version=0, target_weight_version=1
+            )
         )
         ray.get(
-            buffer.add.remote(trajectory2, weight_version=1, target_weight_version=3)
+            buffer.add.remote(
+                trajectory2, weight_version=1, target_weight_version=3
+            )
         )
 
         existing_weights = ray.get(buffer.get_existing_target_weights.remote())
@@ -369,7 +388,9 @@ class TestReplayBuffer:
         # Push some trajectories
         trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
         ray.get(
-            buffer.add.remote(trajectory, weight_version=0, target_weight_version=1)
+            buffer.add.remote(
+                trajectory, weight_version=0, target_weight_version=1
+            )
         )
 
         # Verify buffer has content
