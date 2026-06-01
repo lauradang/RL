@@ -14,12 +14,13 @@
 
 import threading as _threading
 import time
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 import ray
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.async_utils.interfaces import LagMode, validate_lag_mode
 from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -30,7 +31,6 @@ from nemo_rl.experience.rollouts import (
 from nemo_rl.models.generation.interfaces import GenerationInterface
 
 TokenizerType = PreTrainedTokenizerBase
-LagMode = Literal["forced", "unforced"]
 
 
 @ray.remote  # pragma: no cover
@@ -47,18 +47,13 @@ class AsyncTrajectoryCollector:
         start_step: int = 0,
         lag_mode: LagMode = "forced",
     ):
-        if lag_mode not in ("forced", "unforced"):
-            raise ValueError(
-                f"lag_mode must be 'forced' or 'unforced', got {lag_mode!r}"
-            )
-
         self.policy_generation = policy_generation
         self.tokenizer = tokenizer
         self.task_to_env = task_to_env
         self.master_config = master_config
         self.replay_buffer = replay_buffer
         self.running = False
-        self.lag_mode = lag_mode
+        self.lag_mode = validate_lag_mode(lag_mode)
 
         self._pg_lock: _threading.Lock = _threading.Lock()
 
@@ -89,7 +84,6 @@ class AsyncTrajectoryCollector:
             int(self.master_config.grpo["num_prompts_per_step"])
             * int(self.master_config.grpo["async_grpo"]["max_trajectory_age_steps"])
         ) or 1
-        self.max_inflight_generations = max_inflight
         self._inflight_sema = _threading.Semaphore(max_inflight)
 
         # Simple lock to prevent race conditions when checking/spawning workers

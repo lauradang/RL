@@ -2642,13 +2642,12 @@ def async_grpo_train(
 
     # Import async utilities only when needed
     from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+    from nemo_rl.algorithms.async_utils.interfaces import validate_lag_mode
 
     async_cfg = master_config.grpo["async_grpo"]
-    lag_mode = async_cfg.get("lag_mode", "forced")
-    if lag_mode not in ("forced", "unforced"):
-        raise ValueError(
-            f"Unknown async_grpo.lag_mode={lag_mode!r}; expected 'forced' or 'unforced'."
-        )
+    lag_mode = validate_lag_mode(
+        async_cfg.get("lag_mode", "forced"), context="async_grpo.lag_mode"
+    )
     print(f"📐 Async GRPO lag mode: {lag_mode}")
 
     timer = Timer()

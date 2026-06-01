@@ -14,13 +14,15 @@
 
 import threading as _threading
 from collections import Counter
-from typing import Any, Iterable, Literal, Optional
+from typing import Any, Iterable, Optional
 
 import ray
 
-from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
-
-LagMode = Literal["forced", "unforced"]
+from nemo_rl.algorithms.async_utils.interfaces import (
+    LagMode,
+    ReplayBufferProtocol,
+    validate_lag_mode,
+)
 
 
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
@@ -34,12 +36,8 @@ class ReplayBufferImpl(ReplayBufferProtocol):
     def __init__(self, max_size: int, lag_mode: LagMode = "forced"):
         if max_size <= 0:
             raise ValueError(f"max_size must be positive, got {max_size}")
-        if lag_mode not in ("forced", "unforced"):
-            raise ValueError(
-                f"lag_mode must be 'forced' or 'unforced', got {lag_mode!r}"
-            )
         self.max_size = max_size
-        self.lag_mode = lag_mode
+        self.lag_mode = validate_lag_mode(lag_mode)
         self.trajectories: list[dict[str, Any]] = []
         # If trajectory_version is 1 and target_weight_version is 4 it means that weight version 1 was used for generating a trajectory and this trajectory will be used for training when weight version is 4.
         self.trajectory_versions: list[
@@ -111,7 +109,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
         """Get debug information about buffer state."""
         return {
             "total_trajectories": len(self.trajectories),
-            "trajectory_versions": list(self.trajectory_versions),
+            "trajectory_versions": self.trajectory_versions,
             "target_weight_versions": []
             if self.lag_mode == "unforced"
             else self.target_weight_versions,
@@ -292,11 +290,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 "trajectories": sampled_items,
                 "avg_trajectory_age": avg_trajectory_age,
             }
-
-    def evict(self) -> None:
-        """Evict old trajectories."""
-        # Adding for backward compatibility.
-        pass
 
     def size(self) -> int:
         """Return current buffer size."""

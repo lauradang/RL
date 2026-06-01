@@ -12,7 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Optional, Protocol
+from typing import Any, Literal, Optional, Protocol
+
+LagMode = Literal["forced", "unforced"]
+
+
+def validate_lag_mode(lag_mode: Any, *, context: str = "lag_mode") -> LagMode:
+    """Return lag_mode unchanged if valid, otherwise raise ValueError."""
+    if lag_mode not in ("forced", "unforced"):
+        raise ValueError(
+            f"{context} must be 'forced' or 'unforced', got {lag_mode!r}"
+        )
+    return lag_mode
 
 
 class ReplayBufferProtocol(Protocol):
