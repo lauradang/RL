@@ -114,6 +114,39 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
+    def test_forced_replay_buffer_requires_target_weight(self):
+        """Forced-lag mode requires target metadata."""
+        buffer = ReplayBufferImpl(max_size=10)
+        trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
+
+        with pytest.raises(ValueError, match="requires `target_weight_version`"):
+            buffer.add(trajectory, weight_version=0)
+
+    def test_unforced_replay_buffer_ignores_target_weight(self):
+        """Unforced-lag mode accepts the shared add contract and ignores targets."""
+        buffer = ReplayBufferImpl(max_size=10, lag_mode="unforced")
+        trajectory = {"batch": {"data": "test"}, "rollout_metrics": {"reward": 1.0}}
+
+        status = buffer.add(
+            trajectory,
+            weight_version=5,
+            target_weight_version=99,
+        )
+
+        assert status == "success"
+        assert buffer.get_existing_target_weights() == set()
+        assert buffer.get_debug_info()["target_weight_versions"] == []
+
+        sample_result = buffer.sample(
+            num_prompt_groups=1,
+            current_weight_version=5,
+            max_age_steps=1,
+        )
+
+        assert sample_result is not None
+        assert sample_result["trajectories"][0]["batch"]["data"] == "test"
+        assert buffer.size() == 0
+
     def test_replay_buffer_push_and_size(self):
         """Test pushing trajectories to buffer."""
         buffer = ReplayBuffer.remote(max_size=3)

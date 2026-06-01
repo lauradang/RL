@@ -41,12 +41,13 @@ class ReplayBufferProtocol(Protocol):
         current_weight_version: int,
         max_age_steps: int,
     ) -> Optional[dict[str, Any]]:
-        """Sample per-prompt trajectory groups intended for the current training step.
+        """Sample per-prompt trajectory groups for the current training step.
 
-        Only returns trajectories with target_weight_version == current_weight_version.
-        If insufficient trajectories are available, returns None to stall training
-        until the remaining trajectories are generated. This ensures no trajectory
-        loses its last chance to be used for its intended training step.
+        Forced-lag buffers only return trajectories with
+        target_weight_version == current_weight_version. Unforced-lag buffers
+        evict stale trajectories and return FIFO groups from what remains.
+        If insufficient trajectories are available, returns None to stall
+        training until enough groups are ready.
 
         Returns:
             Dictionary with 'trajectories' and 'avg_trajectory_age' keys, or None if insufficient data
