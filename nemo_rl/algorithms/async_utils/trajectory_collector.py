@@ -336,12 +336,7 @@ class AsyncTrajectoryCollector:
         self._manual_pause_cleared.clear()  # Signal collection to pause
         with self._threads_lock:
             inflight = len(self._inflight_threads)
-        if self.lag_mode == "unforced":
-            print(
-                f"[unforced] Trajectory collection paused ({inflight} threads still in flight)"
-            )
-        else:
-            print(f"Trajectory collection paused ({inflight} threads still in flight)")
+        print(f"Trajectory collection paused ({inflight} threads still in flight)")
         return inflight
 
     def get_inflight_count(self) -> int:
@@ -352,10 +347,7 @@ class AsyncTrajectoryCollector:
     def resume(self) -> None:
         """Resume trajectory collection."""
         self._manual_pause_cleared.set()  # Signal collection to resume
-        if self.lag_mode == "unforced":
-            print("[unforced] Trajectory collection resumed")
-        else:
-            print("Trajectory collection resumed")
+        print("Trajectory collection resumed")
 
     def prepare_for_refit(self) -> None:
         """Pause new generation starts and optionally wait for pending generations.
