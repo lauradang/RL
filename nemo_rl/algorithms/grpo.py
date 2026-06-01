@@ -2702,15 +2702,14 @@ def async_grpo_train(
     print(f"   - train_global_batch_size: {train_gbs}")
     print(f"   - min_trajectories_needed: {min_trajectories_needed} (async mode)")
 
-    replay_buffer_fqn = "nemo_rl.algorithms.async_utils.ReplayBuffer"
-    collector_fqn = "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
-
-    _replay_py_exec = get_actor_python_env(replay_buffer_fqn)
+    _replay_py_exec = get_actor_python_env(
+        "nemo_rl.algorithms.async_utils.ReplayBuffer"
+    )
     if _replay_py_exec.startswith("uv"):
         # Lazily build a dedicated venv across all Ray nodes on-demand.
         _replay_py_exec = create_local_venv_on_each_node(
             _replay_py_exec,
-            replay_buffer_fqn,
+            "nemo_rl.algorithms.async_utils.ReplayBuffer",
         )
 
     _replay_py_venv = os.path.dirname(
@@ -2741,11 +2740,13 @@ def async_grpo_train(
         lag_mode=lag_mode,
     )
 
-    _tc_py_exec = get_actor_python_env(collector_fqn)
+    _tc_py_exec = get_actor_python_env(
+        "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector"
+    )
     if _tc_py_exec.startswith("uv"):
         _tc_py_exec = create_local_venv_on_each_node(
             _tc_py_exec,
-            collector_fqn,
+            "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector",
         )
 
     _tc_py_venv = os.path.dirname(
@@ -2761,7 +2762,10 @@ def async_grpo_train(
         },
     }
 
-    collector_kwargs = dict(
+    # Initialize trajectory collector with synchronized collection
+    trajectory_collector = AsyncTrajectoryCollector.options(
+        runtime_env=_tc_runtime_env
+    ).remote(
         policy_generation=policy_generation,
         tokenizer=tokenizer,
         task_to_env=task_to_env,
@@ -2770,11 +2774,6 @@ def async_grpo_train(
         start_step=step,
         lag_mode=lag_mode,
     )
-
-    # Initialize trajectory collector with synchronized collection
-    trajectory_collector = AsyncTrajectoryCollector.options(
-        runtime_env=_tc_runtime_env
-    ).remote(**collector_kwargs)
 
     # Start trajectory collection in background
     collection_task = trajectory_collector.start_collection.remote(dataloader)
@@ -2823,13 +2822,6 @@ def async_grpo_train(
         inflight_at_pause = ray.get(trajectory_collector.pause.remote())
         logger.log_metrics(
             {"collector_inflight_at_pause": inflight_at_pause},
-            step,
-            prefix="timing/validation",
-        )
-        _drain_start = time.time()
-        ray.get(trajectory_collector.wait_for_pending_generations.remote())
-        logger.log_metrics(
-            {"collector_drain_time": time.time() - _drain_start},
             step,
             prefix="timing/validation",
         )
@@ -3190,13 +3182,6 @@ def async_grpo_train(
                     inflight_at_pause = ray.get(trajectory_collector.pause.remote())
                     logger.log_metrics(
                         {"collector_inflight_at_pause": inflight_at_pause},
-                        step + 1,
-                        prefix="timing/validation",
-                    )
-                    _drain_start = time.time()
-                    ray.get(trajectory_collector.wait_for_pending_generations.remote())
-                    logger.log_metrics(
-                        {"collector_drain_time": time.time() - _drain_start},
                         step + 1,
                         prefix="timing/validation",
                     )

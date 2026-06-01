@@ -32,10 +32,7 @@ from nemo_rl.algorithms.async_utils import (
     AsyncTrajectoryCollector,
     ReplayBuffer,
 )
-from nemo_rl.algorithms.async_utils.replay_buffer import (
-    ReplayBufferImpl,
-    ReplayBufferNew,
-)
+from nemo_rl.algorithms.async_utils.replay_buffer import ReplayBufferImpl, ReplayBufferNew
 from nemo_rl.algorithms.grpo import (
     MasterConfig,
     add_grpo_token_loss_masks_and_generation_logprobs,
