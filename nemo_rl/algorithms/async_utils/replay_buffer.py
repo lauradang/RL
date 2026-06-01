@@ -152,96 +152,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             f"(older than weight_version {min_valid_version})"
         )
 
-    def _select_sample_indices(
-        self,
-        num_prompt_groups: int,
-        current_weight_version: int,
-        max_age_steps: int,
-    ) -> Optional[list[int]]:
-        """Select sample indices for the configured lag mode.
-
-        Must be called with self._lock held.
-        """
-        total_trajectories = len(self.trajectories)
-        min_valid_version = max(0, current_weight_version - max_age_steps)
-
-        if self.lag_mode == "unforced":
-            self._evict_stale_unforced(min_valid_version)
-            available = len(self.trajectories)
-            print(
-                f"🔍 ReplayBuffer(unforced).sample: requested={num_prompt_groups}, "
-                f"available={available}, current_weight_version={current_weight_version}, "
-                f"max_age_steps={max_age_steps}, min_valid_version={min_valid_version}"
-            )
-            if available < num_prompt_groups:
-                print(f"   ⏸️ STALLING: have {available}, need {num_prompt_groups}")
-                return None
-            return list(range(num_prompt_groups))
-
-        print("🔍 ReplayBuffer sampling debug:")
-        print(f"   {current_weight_version=}, {max_age_steps=}")
-        print(f"   {self.trajectory_versions=}")
-
-        version_counts = Counter(self.trajectory_versions)
-        print(f"   {version_counts=}")
-        print(f"   {min_valid_version=}")
-
-        old_trajectories = [
-            v for v in self.trajectory_versions if v < min_valid_version
-        ]
-        if old_trajectories:
-            raise ValueError(
-                f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}"
-            )
-
-        valid_indices = [
-            i
-            for i, v in enumerate(self.trajectory_versions)
-            if min_valid_version <= v <= current_weight_version
-        ]
-        print(
-            f"   valid_indices: {len(valid_indices)}/{total_trajectories} trajectories within age window"
-        )
-        if not valid_indices:
-            print("No trajectories available for sampling.")
-            return None
-
-        if len(valid_indices) < num_prompt_groups:
-            print(
-                f"Insufficient valid groups: have {len(valid_indices)}, "
-                f"need {num_prompt_groups}. Waiting for buffer to fill."
-            )
-            return None
-
-        intended_indices = [
-            i
-            for i in valid_indices
-            if self.target_weight_versions[i] == current_weight_version
-        ]
-
-        print(
-            f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}"
-        )
-
-        if len(intended_indices) < num_prompt_groups:
-            print(
-                f"   ⏸️ STALLING: Need {num_prompt_groups} trajectories "
-                f"for step {current_weight_version}, but only "
-                f"{len(intended_indices)} are ready"
-            )
-            print(
-                "   ⏸️ Training will wait for remaining "
-                f"{num_prompt_groups - len(intended_indices)} trajectories "
-                "to be generated"
-            )
-            return None
-
-        selected = intended_indices[:num_prompt_groups]
-        print(
-            f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
-        )
-        return selected
-
     def sample(
         self,
         num_prompt_groups: int,
@@ -264,13 +174,85 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 return None
 
             total_trajectories = len(self.trajectories)
-            selected = self._select_sample_indices(
-                num_prompt_groups=num_prompt_groups,
-                current_weight_version=current_weight_version,
-                max_age_steps=max_age_steps,
-            )
-            if selected is None:
-                return None
+            min_valid_version = max(0, current_weight_version - max_age_steps)
+
+            if self.lag_mode == "unforced":
+                self._evict_stale_unforced(min_valid_version)
+                available = len(self.trajectories)
+                print(
+                    f"🔍 ReplayBuffer(unforced).sample: requested={num_prompt_groups}, "
+                    f"available={available}, current_weight_version={current_weight_version}, "
+                    f"max_age_steps={max_age_steps}, min_valid_version={min_valid_version}"
+                )
+                if available < num_prompt_groups:
+                    print(
+                        f"   ⏸️ STALLING: have {available}, need {num_prompt_groups}"
+                    )
+                    return None
+                selected = list(range(num_prompt_groups))
+            else:
+                print("🔍 ReplayBuffer sampling debug:")
+                print(f"   {current_weight_version=}, {max_age_steps=}")
+                print(f"   {self.trajectory_versions=}")
+
+                version_counts = Counter(self.trajectory_versions)
+                print(f"   {version_counts=}")
+                print(f"   {min_valid_version=}")
+
+                old_trajectories = [
+                    v for v in self.trajectory_versions if v < min_valid_version
+                ]
+                if old_trajectories:
+                    raise ValueError(
+                        f"Found {len(old_trajectories)} trajectories older than min_valid_version {min_valid_version}"
+                    )
+
+                valid_indices = [
+                    i
+                    for i, v in enumerate(self.trajectory_versions)
+                    if min_valid_version <= v <= current_weight_version
+                ]
+                print(
+                    f"   valid_indices: {len(valid_indices)}/{total_trajectories} trajectories within age window"
+                )
+                if not valid_indices:
+                    print("No trajectories available for sampling.")
+                    return None
+
+                if len(valid_indices) < num_prompt_groups:
+                    print(
+                        f"Insufficient valid groups: have {len(valid_indices)}, "
+                        f"need {num_prompt_groups}. Waiting for buffer to fill."
+                    )
+                    return None
+
+                intended_indices = [
+                    i
+                    for i in valid_indices
+                    if self.target_weight_versions[i] == current_weight_version
+                ]
+
+                print(
+                    f"   🎯 Found {len(intended_indices)} trajectories intended for current step {current_weight_version}"
+                )
+
+                if len(intended_indices) < num_prompt_groups:
+                    print(
+                        f"   ⏸️ STALLING: Need {num_prompt_groups} trajectories "
+                        f"for step {current_weight_version}, but only "
+                        f"{len(intended_indices)} are ready"
+                    )
+                    print(
+                        "   ⏸️ Training will wait for remaining "
+                        f"{num_prompt_groups - len(intended_indices)} trajectories "
+                        "to be generated"
+                    )
+                    return None
+
+                selected = intended_indices[:num_prompt_groups]
+                print(
+                    f"   ✅ Selected {len(selected)} trajectories all intended for step {current_weight_version}"
+                )
 
             sampled_weights = [self.trajectory_versions[i] for i in selected]
             avg_trajectory_age = current_weight_version - sum(sampled_weights) / len(
