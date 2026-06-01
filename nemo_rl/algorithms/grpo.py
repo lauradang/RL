@@ -1566,6 +1566,7 @@ def grpo_train(
                 maybe_gpu_profile_step(policy_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
+            step_wall_start = time.monotonic()
             with timer.time("total_step_time"):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
@@ -2153,7 +2154,11 @@ def grpo_train(
                     grpo_save_state["total_steps"] = total_steps + 1
                     grpo_save_state["current_epoch"] = current_epoch
                     grpo_save_state["total_valid_tokens"] = total_valid_tokens
-                    grpo_save_state["cumulative_train_time"] = cumulative_train_time
+                    # Include the in-flight step's elapsed time; the timer-based
+                    # increment of cumulative_train_time runs after this block.
+                    grpo_save_state["cumulative_train_time"] = (
+                        cumulative_train_time + (time.monotonic() - step_wall_start)
+                    )
                     if val_metrics is not None:
                         grpo_save_state["val_reward"] = val_metrics["accuracy"]
                     elif "val_reward" in grpo_save_state:
@@ -2880,6 +2885,7 @@ def async_grpo_train(
             if policy != policy_generation:
                 maybe_gpu_profile_step(policy_generation, step + 1)
 
+            step_wall_start = time.monotonic()
             with timer.time("total_step_time"):
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
@@ -3293,7 +3299,11 @@ def async_grpo_train(
                 ):
                     grpo_save_state["current_step"] = step + 1
                     grpo_save_state["total_valid_tokens"] = total_valid_tokens
-                    grpo_save_state["cumulative_train_time"] = cumulative_train_time
+                    # Include the in-flight step's elapsed time; the timer-based
+                    # increment of cumulative_train_time runs after this block.
+                    grpo_save_state["cumulative_train_time"] = (
+                        cumulative_train_time + (time.monotonic() - step_wall_start)
+                    )
                     if val_metrics is not None:
                         grpo_save_state["val_reward"] = val_metrics["accuracy"]
                     elif "val_reward" in grpo_save_state:
