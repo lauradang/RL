@@ -109,18 +109,12 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
     def get_debug_info(self) -> dict:
         """Get debug information about buffer state."""
-        if self.lag_mode == "unforced":
-            return {
-                "total_trajectories": len(self.trajectories),
-                "trajectory_versions": list(self.trajectory_versions),
-                "target_weight_versions": [],
-                "max_size": self.max_size,
-            }
-
         return {
             "total_trajectories": len(self.trajectories),
-            "trajectory_versions": self.trajectory_versions,
-            "target_weight_versions": self.target_weight_versions,
+            "trajectory_versions": list(self.trajectory_versions),
+            "target_weight_versions": []
+            if self.lag_mode == "unforced"
+            else self.target_weight_versions,
             "max_size": self.max_size,
         }
 
