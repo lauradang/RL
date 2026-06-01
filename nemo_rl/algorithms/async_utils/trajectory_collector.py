@@ -189,80 +189,18 @@ class AsyncTrajectoryCollector:
         except Exception:
             return False
 
-    def _log_prefix(self) -> str:
-        return "[unforced] " if self.lag_mode == "unforced" else ""
-
-    def _wait_for_manual_pause(self) -> bool:
-        if not self._manual_pause_cleared.is_set() and self.running:
-            self._manual_pause_cleared.wait()
-        return self.running
-
-    def _wait_for_refit_pause(self, *, before_prompt: bool) -> bool:
-        if self._refit_pause_cleared.is_set() or not self.running:
-            return self.running
-
-        if before_prompt:
-            with self._threads_lock:
-                active_threads = len(self._inflight_threads)
-            print(
-                f"⏸️ {self._log_prefix()}Waiting for refit before starting new generation "
-                f"({active_threads} threads still active)"
-            )
-            if self.lag_mode == "forced":
-                print(
-                    "   Note: With vLLM V1 async engine, active threads can complete during weight update"
-                )
-            self._refit_pause_cleared.wait()
-        else:
-            print(f"⏸️ {self._log_prefix()}Pausing collection for refit...")
-            self._refit_pause_cleared.wait()
-            print(f"▶️ {self._log_prefix()}Refit completed, resuming collection")
-
-        return self.running
-
-    def _wait_for_generation_limit_clear(self) -> bool:
-        if not self._should_pause_for_generation_limits() or not self.running:
-            return self.running
-
-        if self._last_limit_warning_version != self.current_weight_version:
-            async_cfg = self.master_config.grpo.get("async_grpo", {})
-            max_trajectory_age = async_cfg["max_trajectory_age_steps"]
-            target_weights = [
-                self.current_weight_version + i for i in range(max_trajectory_age)
-            ]
-
-            print(
-                f"⏸️ Pausing collection: all target weights {target_weights} "
-                f"for weight version {self.current_weight_version} "
-                f"already exist in buffer. Waiting for weight update..."
-            )
-            self._last_limit_warning_version = self.current_weight_version
-            self._generation_limit_cleared.clear()
-
-        self._generation_limit_cleared.wait()
-        return self.running
-
     def start_collection(self, dataloader: StatefulDataLoader) -> None:
         """Start collecting trajectories from dataloader."""
         self.running = True
         self.dataloader = dataloader
 
-        if self.lag_mode == "unforced":
-            print(
-                "[unforced] Started continuous trajectory collection "
-                f"(max in-flight rollouts={self.max_inflight_generations})"
-            )
-        else:
-            print("Started continuous trajectory collection")
+        print("Started continuous trajectory collection")
 
         self.collection_thread = _threading.Thread(target=self._collection_loop)
         self.collection_thread.daemon = True
         self.collection_thread.start()
 
-        if self.lag_mode == "unforced":
-            print("[unforced] Collection thread started, start_collection returning")
-        else:
-            print("Collection thread started, start_collection returning")
+        print("Collection thread started, start_collection returning")
 
     def _collection_loop(self):
         """Run the collection loop in background thread."""
@@ -271,11 +209,43 @@ class AsyncTrajectoryCollector:
                 if not self.running:
                     break
 
-                if not self._wait_for_manual_pause():
-                    break
-                if not self._wait_for_refit_pause(before_prompt=False):
-                    break
-                if not self._wait_for_generation_limit_clear():
+                # Check if manually paused and wait
+                if not self._manual_pause_cleared.is_set() and self.running:
+                    self._manual_pause_cleared.wait()
+
+                # Check if refit is in progress and wait
+                if not self._refit_pause_cleared.is_set() and self.running:
+                    print("⏸️ Pausing collection for refit...")
+                    self._refit_pause_cleared.wait()
+                    print("▶️ Refit completed, resuming collection")
+
+                # Check if generation limits require pausing collection
+                if self._should_pause_for_generation_limits() and self.running:
+                    # Only log warning once per weight version
+                    if self._last_limit_warning_version != self.current_weight_version:
+                        async_cfg = self.master_config.grpo.get("async_grpo", {})
+                        max_trajectory_age = async_cfg["max_trajectory_age_steps"]
+                        target_weights = [
+                            self.current_weight_version + i
+                            for i in range(max_trajectory_age)
+                        ]
+
+                        print(
+                            f"⏸️ Pausing collection: all target weights {target_weights} for weight version {self.current_weight_version} "
+                            f"already exist in buffer. Waiting for weight update..."
+                        )
+                        self._last_limit_warning_version = self.current_weight_version
+
+                        self._generation_limit_cleared.clear()  # Clear the event to pause
+
+                    # Efficiently wait for generation limits to be cleared (no polling!)
+                    self._generation_limit_cleared.wait()
+
+                    # Double-check we're still running after being woken up
+                    if not self.running:
+                        break
+
+                if not self.running:
                     break
 
                 self._process_batch(batch)
@@ -287,7 +257,7 @@ class AsyncTrajectoryCollector:
             traceback.print_exc()
         finally:
             self.running = False
-            print(f"🛑 {self._log_prefix()}Trajectory collection stopped")
+            print("🛑 Trajectory collection stopped")
 
     def _process_batch(self, batch: BatchedDataDict[DatumSpec]) -> None:
         """Process a single batch and generate for one target weight."""
@@ -309,31 +279,46 @@ class AsyncTrajectoryCollector:
                     return
 
                 print(
-                    f"🎯 Generating for target weight {target_weight} "
-                    f"from generation_weight_version {generation_weight_version}"
+                    f"🎯 Generating for target weight {target_weight} from generation_weight_version {generation_weight_version}"
                 )
 
+            # Generate for all prompts in this batch for the target weight
             for prompt_idx in range(num_prompts):
-                if not self.running:
-                    break
-                if not self._wait_for_manual_pause():
-                    break
-                refit_was_paused = not self._refit_pause_cleared.is_set()
-                if not self._wait_for_refit_pause(before_prompt=True):
-                    break
+                # Wait for refit to complete if in progress
+                if not self._refit_pause_cleared.is_set() and self.running:
+                    with self._threads_lock:
+                        active_threads = len(self._inflight_threads)
+                    print(
+                        f"⏸️ Waiting for refit to complete before starting new generation ({active_threads} threads still active)"
+                    )
+                    print(
+                        "   Note: With vLLM V1 async engine, active threads can complete during weight update"
+                    )
+                    self._refit_pause_cleared.wait()
 
-                if self.lag_mode == "unforced" or refit_was_paused:
+                    # After refit finishes if weight version has updated, reflect that in the new trajectories
+                    generation_weight_version = self.current_weight_version
+
+                if self.lag_mode == "unforced":
                     generation_weight_version = self.current_weight_version
 
                 single_prompt_batch = batch.slice(prompt_idx, prompt_idx + 1)
                 repeated_batch = single_prompt_batch.repeat_interleave(num_generations)
-                if not self._start_prompt_group_worker(
-                    repeated_batch=repeated_batch,
-                    generation_weight_version=generation_weight_version,
-                    target_weight_version=target_weight,
-                    prompt_idx=prompt_idx,
-                ):
-                    break
+
+                self._inflight_sema.acquire()
+                worker = _threading.Thread(
+                    target=self._run_prompt_group_worker,
+                    args=(
+                        repeated_batch,
+                        generation_weight_version,
+                        target_weight,
+                        prompt_idx,
+                    ),
+                    daemon=True,
+                )
+                with self._threads_lock:
+                    self._inflight_threads.add(worker)
+                worker.start()
 
             self._cleanup_finished_threads()
 
@@ -342,34 +327,6 @@ class AsyncTrajectoryCollector:
             import traceback
 
             traceback.print_exc()
-
-    def _start_prompt_group_worker(
-        self,
-        repeated_batch: BatchedDataDict[DatumSpec],
-        generation_weight_version: int,
-        target_weight_version: Optional[int],
-        prompt_idx: int,
-    ) -> bool:
-        self._inflight_sema.acquire()
-
-        if not self.running:
-            self._inflight_sema.release()
-            return False
-
-        worker = _threading.Thread(
-            target=self._run_prompt_group_worker,
-            args=(
-                repeated_batch,
-                generation_weight_version,
-                target_weight_version,
-                prompt_idx,
-            ),
-            daemon=True,
-        )
-        with self._threads_lock:
-            self._inflight_threads.add(worker)
-        worker.start()
-        return True
 
     def get_weight_version(self) -> int:
         return self.current_weight_version
