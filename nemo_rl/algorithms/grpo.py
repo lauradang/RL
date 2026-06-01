@@ -2730,28 +2730,11 @@ def async_grpo_train(
     # Each weight version generates exactly num_prompts_per_step trajectories
     # With max_age_steps, we keep trajectories from multiple weight versions
     num_prompts_per_step = master_config.grpo["num_prompts_per_step"]
+    max_inflight_generations = (
+        num_prompts_per_step * max_trajectory_age_steps
+    ) or 1
     late_arrival_slack = 2
-    optimal_buffer_size = (
-        num_prompts_per_step * max_trajectory_age_steps * late_arrival_slack
-    )
-    if lag_mode == "unforced":
-        # In unforced mode the in-flight cap bounds how
-        # much can sit in the buffer; size the buffer to hold (cap + slack) entries
-        # so that "full" backpressure only fires when truly saturated.
-        # The cap is shared with the collector:
-        # max_trajectory_age_steps * num_prompts_per_step.
-        # In NeMo-RL rollout/prompt-group units the per-prompt G factor is already
-        # implicit in a single rollout entry, so we only multiply by P.
-        max_inflight_generations = max_trajectory_age_steps * num_prompts_per_step
-        optimal_buffer_size = max(
-            optimal_buffer_size,
-            max_inflight_generations + num_prompts_per_step,
-        )
-        print(
-            f"📐 Unforced lag: max_inflight_generations={max_inflight_generations} "
-            f"= max_trajectory_age_steps * num_prompts_per_step "
-            f"= {max_trajectory_age_steps} * {num_prompts_per_step}"
-        )
+    optimal_buffer_size = max_inflight_generations * late_arrival_slack
 
     replay_buffer = ReplayBuffer.options(runtime_env=_replay_runtime_env).remote(
         max_size=optimal_buffer_size,
