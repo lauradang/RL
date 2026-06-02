@@ -124,8 +124,7 @@ class AsyncGRPOConfig(TypedDict):
     # Selects how trajectory lag is managed.
     # - "forced" (default, current behaviour): each prompt batch is reserved for
     #   a specific future training step at generation time, and the trainer
-    #   stalls until trajectories tagged for the current step are ready. This
-    #   matches Megatron-LM's `--rl-num-parallel-generation-batches=L+1` mode.
+    #   stalls until trajectories tagged for the current step are ready.
     # - "unforced": trajectories are not pre-assigned to a target step. The
     #   collector uses the same in-flight cap as forced mode:
     #   `max_trajectory_age_steps * num_prompts_per_step` rollouts in flight
@@ -2648,6 +2647,12 @@ def async_grpo_train(
     lag_mode = validate_lag_mode(
         async_cfg.get("lag_mode", "forced"), context="async_grpo.lag_mode"
     )
+    if lag_mode == "unforced" and not async_cfg.get("in_flight_weight_updates", False):
+        raise ValueError(
+            "lag_mode='unforced' requires async_grpo.in_flight_weight_updates=True. "
+            "With in-flight updates disabled, prepare_for_refit drains pending generations, "
+            "which distorts the lag distribution that unforced mode depends on."
+        )
     print(f"📐 Async GRPO lag mode: {lag_mode}")
 
     timer = Timer()
@@ -2931,6 +2936,11 @@ def async_grpo_train(
 
                         time.sleep(0.5)
                         continue
+
+                    if lag_mode == "unforced":
+                        trajectory_collector.release_slots.remote(
+                            len(sample_result["trajectories"])
+                        )
 
                     # Extract trajectories and metadata from sample result
                     trajectories = sample_result["trajectories"]

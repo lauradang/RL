@@ -338,6 +338,16 @@ class AsyncTrajectoryCollector:
         with self._threads_lock:
             return len(self._inflight_threads)
 
+    def release_slots(self, n: int) -> None:
+        """Release n semaphore slots after the trainer consumes samples."""
+        for _ in range(n):
+            try:
+                self._inflight_sema.release()
+            except Exception as e:
+                print(f"❌ Error in releasing semaphore slot: {e}")
+                import traceback
+                traceback.print_exc()
+
     def resume(self) -> None:
         """Resume trajectory collection."""
         self._manual_pause_cleared.set()  # Signal collection to resume
@@ -452,6 +462,7 @@ class AsyncTrajectoryCollector:
         target_weight_version: Optional[int] = None,
         prompt_idx: Optional[int] = None,
     ) -> None:
+        buffered = False
         try:
             # Import here to avoid circular dependency
             from nemo_rl.algorithms.grpo import _should_use_nemo_gym
@@ -508,6 +519,7 @@ class AsyncTrajectoryCollector:
                     )
 
                     if status == "success":
+                        buffered = True
                         if self.lag_mode == "unforced":
                             print(
                                 f"📦 [unforced] Buffered prompt group "
@@ -565,9 +577,7 @@ class AsyncTrajectoryCollector:
                 current = _threading.current_thread()
                 if current in self._inflight_threads:
                     self._inflight_threads.remove(current)
-            try:
-                self._inflight_sema.release()
-            except Exception:
-                import traceback
 
-                traceback.print_exc()
+
+            if self.lag_mode == "forced" or not buffered:
+                self.release_slots(1)

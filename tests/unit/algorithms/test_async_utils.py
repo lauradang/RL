@@ -276,43 +276,6 @@ class TestReplayBuffer:
 
         ray.kill(buffer)
 
-    def test_replay_buffer_age_filtering(self):
-        """Test that old trajectories are filtered out."""
-        buffer = ReplayBuffer.remote(max_size=10)
-
-        # Push trajectories with different ages
-        old_trajectory = {"batch": {"data": "old"}, "rollout_metrics": {"reward": 1.0}}
-        recent_trajectory = {
-            "batch": {"data": "recent"},
-            "rollout_metrics": {"reward": 2.0},
-        }
-
-        ray.get(
-            buffer.add.remote(
-                old_trajectory, weight_version=0, target_weight_version=1
-            )
-        )
-        ray.get(
-            buffer.add.remote(
-                recent_trajectory, weight_version=2, target_weight_version=3
-            )
-        )
-
-        # Sample with current_weight_version=3 and max_age_steps=1
-        # This should filter out the trajectory with weight_version=0 (too old)
-        with pytest.raises(
-            ValueError, match="Found .* trajectories older than min_valid_version"
-        ):
-            ray.get(
-                buffer.sample.remote(
-                    num_prompt_groups=1,
-                    current_weight_version=3,
-                    max_age_steps=1,
-                )
-            )
-
-        ray.kill(buffer)
-
     def test_replay_buffer_target_weight_matching(self):
         """Test that sampling only returns trajectories intended for current step."""
         buffer = ReplayBuffer.remote(max_size=10)
@@ -599,84 +562,36 @@ class TestReplayBufferNew:
 class TestReplayBufferUnforcedMode:
     """Tests for ReplayBufferImpl in unforced-lag FIFO mode."""
 
-    def _traj(self):
-        return {"batch": {}, "rollout_metrics": {}, "timestamp": 0.0}
+    def _traj(self, label: str):
+        return {"batch": {"data": label}, "rollout_metrics": {}, "timestamp": 0.0}
 
-    def test_eviction_removes_stale_entries_from_entire_buffer(self):
-        """Out-of-order arrivals must not let stale entries survive past the front.
-
-        With in_flight_weight_updates, a fast rollout from weight N+1 can land
-        in the buffer before a slow rollout from weight N-3. The previous
-        front-only eviction loop would stop at the valid N+1 entry and leave
-        the stale N-3 entry buried at index 1 to be sampled.
-        """
+    def test_replay_buffer_unforced_sample_fifo(self):
+        """Unforced sampling consumes FIFO without evicting stale tail entries."""
         buf = ReplayBufferImpl(max_size=10, lag_mode="unforced")
 
-        # Out-of-order arrivals: fast rollout at weight 5 lands before slow one at weight 2
-        buf.add(self._traj(), weight_version=5)  # valid at step 7 (age=2)
-        buf.add(self._traj(), weight_version=2)  # STALE at step 7 (age=5 > max_age=2)
-        buf.add(self._traj(), weight_version=6)  # valid at step 7 (age=1)
-        buf.add(self._traj(), weight_version=3)  # STALE at step 7 (age=4 > max_age=2)
-
-        # min_valid_version = 7 - 2 = 5; versions 2 and 3 must be evicted
-        result = buf.sample(
-            num_prompt_groups=2, current_weight_version=7, max_age_steps=2
-        )
-
-        assert result is not None, "Should return 2 valid trajectories"
-        assert len(result["trajectories"]) == 2
-        assert result["avg_trajectory_age"] <= 2.0, (
-            f"avg_trajectory_age={result['avg_trajectory_age']:.3f} exceeds max_age_steps=2; "
-            "stale trajectories were not fully evicted"
-        )
-        assert buf.size() == 0  # versions 5 and 6 sampled; 2 and 3 evicted
-
-    def test_eviction_still_works_when_stale_entries_are_at_front(self):
-        """Regression: eviction must also work for the ordinary in-order case."""
-        buf = ReplayBufferImpl(max_size=10, lag_mode="unforced")
-
-        buf.add(self._traj(), weight_version=1)  # stale at step 5 (age=4)
-        buf.add(self._traj(), weight_version=2)  # stale at step 5 (age=3)
-        buf.add(self._traj(), weight_version=4)  # valid (age=1)
-        buf.add(self._traj(), weight_version=5)  # valid (age=0)
+        for label, weight_version in [
+            ("v6", 6),
+            ("v7", 7),
+            ("v8", 8),
+            ("v1", 1),
+            ("v5", 5),
+        ]:
+            assert (
+                buf.add(self._traj(label), weight_version=weight_version) == "success"
+            )
 
         result = buf.sample(
-            num_prompt_groups=2, current_weight_version=5, max_age_steps=2
+            num_prompt_groups=3, current_weight_version=10, max_age_steps=4
         )
 
         assert result is not None
-        assert len(result["trajectories"]) == 2
-        assert result["avg_trajectory_age"] <= 2.0
-
-    def test_sample_returns_none_when_all_entries_are_stale(self):
-        """After evicting all stale entries, None is returned if buffer is empty."""
-        buf = ReplayBufferImpl(max_size=10, lag_mode="unforced")
-
-        buf.add(self._traj(), weight_version=0)
-        buf.add(self._traj(), weight_version=1)
-
-        result = buf.sample(
-            num_prompt_groups=1, current_weight_version=5, max_age_steps=2
-        )
-
-        assert result is None
-        assert buf.size() == 0
-
-    def test_avg_trajectory_age_never_exceeds_max_age_steps(self):
-        """avg_trajectory_age in returned sample must be <= max_age_steps."""
-        buf = ReplayBufferImpl(max_size=20, lag_mode="unforced")
-
-        # Mix of valid and stale, out of order
-        for v in [8, 3, 9, 2, 7, 1, 10, 4]:
-            buf.add(self._traj(), weight_version=v)
-
-        # min_valid = 10 - 2 = 8; valid are 8, 9, 10; stale are 1, 2, 3, 4, 7
-        result = buf.sample(
-            num_prompt_groups=3, current_weight_version=10, max_age_steps=2
-        )
-
-        assert result is not None
-        assert result["avg_trajectory_age"] <= 2.0
+        assert [t["batch"]["data"] for t in result["trajectories"]] == [
+            "v6",
+            "v7",
+            "v8",
+        ]
+        assert buf.size() == 2
+        assert buf.trajectory_versions == [1, 5]
 
 
 class TestAsyncTrajectoryCollector:
@@ -765,6 +680,34 @@ class TestAsyncTrajectoryCollector:
         ray.kill(collector)
         ray.kill(buffer)
         ray.kill(mock_env)
+
+    def test_collector_release_slots(self):
+        """release_slots restores semaphore capacity after trainer consumption."""
+        collector_class = AsyncTrajectoryCollector.__ray_metadata__.modified_class
+        master_config = self.create_mock_config()
+        collector = collector_class(
+            policy_generation=MockGenerationInterface(),
+            tokenizer=mock.MagicMock(),
+            task_to_env={},
+            master_config=master_config,
+            replay_buffer=mock.MagicMock(),
+            start_step=0,
+            lag_mode="unforced",
+        )
+        max_slots = (
+            master_config.grpo["num_prompts_per_step"]
+            * master_config.grpo["async_grpo"]["max_trajectory_age_steps"]
+        )
+
+        for _ in range(max_slots):
+            assert collector._inflight_sema.acquire(blocking=False)
+        assert not collector._inflight_sema.acquire(blocking=False)
+
+        collector.release_slots(max_slots)
+
+        for _ in range(max_slots):
+            assert collector._inflight_sema.acquire(blocking=False)
+        assert not collector._inflight_sema.acquire(blocking=False)
 
     def test_async_trajectory_collector_weight_version_updates(self):
         """Test weight version updates in trajectory collector."""

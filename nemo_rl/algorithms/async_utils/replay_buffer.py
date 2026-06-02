@@ -136,20 +136,6 @@ class ReplayBufferImpl(ReplayBufferProtocol):
             self.target_weight_versions.pop(idx)
             self.trajectories.pop(idx)
 
-    def _evict_stale(self, min_valid_version: int) -> None:
-        """Evict stale trajectories."""
-        stale_indices = [
-            i for i, v in enumerate(self.trajectory_versions) if v < min_valid_version
-        ]
-        if not stale_indices:
-            return
-
-        self._remove_indices(stale_indices)
-        print(
-            f"🗑️ ReplayBuffer evicted {len(stale_indices)} stale trajectories "
-            f"(older than weight_version {min_valid_version})"
-        )
-
     def sample(
         self,
         num_prompt_groups: int,
@@ -160,7 +146,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
 
         Forced-lag mode only returns trajectories with
         target_weight_version == current_weight_version. Unforced-lag mode
-        evicts stale trajectories and returns the oldest remaining groups.
+        returns the oldest groups.
         If insufficient trajectories are available, returns None to stall
         training until enough groups are ready.
 
@@ -172,15 +158,13 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                 return None
 
             total_trajectories = len(self.trajectories)
-            min_valid_version = max(0, current_weight_version - max_age_steps)
 
             if self.lag_mode == "unforced":
-                self._evict_stale(min_valid_version)
                 available = len(self.trajectories)
                 print(
                     f"🔍 ReplayBuffer(unforced).sample: requested={num_prompt_groups}, "
                     f"available={available}, current_weight_version={current_weight_version}, "
-                    f"max_age_steps={max_age_steps}, min_valid_version={min_valid_version}"
+                    f"max_age_steps={max_age_steps}"
                 )
                 if available < num_prompt_groups:
                     print(
@@ -189,6 +173,7 @@ class ReplayBufferImpl(ReplayBufferProtocol):
                     return None
                 selected = list(range(num_prompt_groups))
             else:
+                min_valid_version = max(0, current_weight_version - max_age_steps)
                 print("🔍 ReplayBuffer sampling debug:")
                 print(f"   {current_weight_version=}, {max_age_steps=}")
                 print(f"   {self.trajectory_versions=}")
