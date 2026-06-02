@@ -328,8 +328,7 @@ class AsyncTrajectoryCollector:
     def pause(self) -> int:
         """Pause trajectory collection. Returns the number of in-flight threads at pause time."""
         self._manual_pause_cleared.clear()  # Signal collection to pause
-        with self._threads_lock:
-            inflight = len(self._inflight_threads)
+        inflight = self.get_inflight_count()
         print(f"Trajectory collection paused ({inflight} threads still in flight)")
         return inflight
 
