@@ -1,0 +1,294 @@
+checkpointing:
+  checkpoint_dir: /lustre/fsw/portfolios/nemotron/users/laurad/nemoRL_wdafwi6s_sweagent_unforced_age6_prompts128_gens16_5arm64
+  checkpoint_must_save_by: 00:03:40:00
+  enabled: true
+  higher_is_better: true
+  keep_top_k: 1000000
+  metric_name: val:total_reward/mean
+  save_optimizer: true
+  save_period: 256
+cluster:
+  gpus_per_node: 4
+  num_nodes: 24
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+  - data_path: /scratch/fsw/portfolios/nemotron/users/laurad/nemo-gym-swe-agent-data/swe_agents/swegym_for_sweagent_and_openhands.nrl.arm64-5sif-train.jsonl
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    system_prompt_file: null
+    repeat: 100000
+  validation:
+  - data_path: /scratch/fsw/portfolios/nemotron/users/laurad/nemo-gym-swe-agent-data/swe_agents/swegym_for_sweagent_and_openhands.nrl.arm64-5sif-val.jsonl
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    processor: nemo_gym_data_processor
+    prompt_file: null
+    system_prompt_file: null
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    is_trajectory_collection: false
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          container_formatter: /scratch/fsw/portfolios/nemotron/users/laurad/swegym-arm64-sifs/sweb.eval.arm64.{instance_id}.sif
+          dataset_path: /scratch/fsw/portfolios/nemotron/users/laurad/nemo-gym-swe-agent-data/swe_agents/swegym_for_sweagent_and_openhands.nrl.arm64-5sif-train.jsonl
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          container_formatter: /scratch/fsw/portfolios/nemotron/users/laurad/swegym-arm64-sifs/sweb.eval.arm64.{instance_id}.sif
+          dataset_path: /scratch/fsw/portfolios/nemotron/users/laurad/nemo-gym-swe-agent-data/swe_agents/swegym_for_sweagent_and_openhands.nrl.arm64-5sif-val.jsonl
+grpo:
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+    lag_mode: unforced
+    max_trajectory_age_steps: 6
+  batch_multiplier: 1
+  max_num_epochs: 1
+  max_num_steps: 1000000
+  max_rollout_turns: 1
+  max_val_samples: null
+  normalize_rewards: true
+  num_generations_per_prompt: 16
+  num_prompts_per_step: 128
+  num_val_generations_per_prompt: 4
+  overlong_filtering: true
+  reward_scaling:
+    enabled: false
+  reward_shaping:
+    enabled: false
+  seed: 42
+  seq_logprob_error_threshold: 2
+  use_dynamic_sampling: false
+  use_leave_one_out_baseline: true
+  val_at_end: false
+  val_at_start: false
+  val_batch_size: 256
+  val_period: 256
+logger:
+  gpu_monitoring:
+    collection_interval: 10
+    flush_interval: 10
+  log_dir: results/nemoRL_wdafwi6s_sweagent
+  mlflow:
+    experiment_name: grpo-dev
+    run_name: grpo-dev-logger
+  mlflow_enabled: false
+  monitor_gpus: true
+  num_val_samples_to_print: 0
+  swanlab_enabled: false
+  tensorboard_enabled: false
+  wandb:
+    name: nemoRL_wdafwi6s_sweagent_unforced_age6_prompts128_gens16_5arm64
+    project: nano-v3-megatron-inference
+  wandb_enabled: true
+loss_fn:
+  disable_ppo_ratio: false
+  force_on_policy_ratio: false
+  kl_input_clamp_value: null
+  kl_output_clamp_value: null
+  ratio_clip_c: null
+  ratio_clip_max: 0.28
+  ratio_clip_min: 0.2
+  reference_policy_kl_penalty: 0
+  reference_policy_kl_type: k3
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+  truncated_importance_sampling_ratio: null
+  truncated_importance_sampling_ratio_min: null
+  truncated_importance_sampling_type: null
+  use_importance_sampling_correction: true
+  use_kl_in_reward: false
+  use_on_policy_kl_approximation: true
+policy:
+  dtensor_cfg:
+    _v2: true
+    activation_checkpointing: false
+    context_parallel_size: 1
+    cpu_offload: false
+    custom_parallel_plan: null
+    enabled: false
+    sequence_parallel: false
+    tensor_parallel_size: 1
+  dynamic_batching:
+    enabled: false
+    logprob_mb_tokens: 49152
+    sequence_length_round: 64
+    train_mb_tokens: 49152
+  generation:
+    _pad_token_id: 11
+    backend: vllm
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 8
+    max_new_tokens: 8192
+    mcore_generation_config:
+      async_engine: true
+      block_size_tokens: 256
+      buffer_size_gb: 20
+      context_parallel_size: 1
+      cuda_graph_scope: full_iteration_inference
+      enable_chunked_prefill: true
+      enable_prefix_caching: true
+      expert_model_parallel_size: 8
+      expert_tensor_parallel_size: 1
+      expose_http_server: true
+      kv_cache_management_mode: persist
+      mamba_inference_ssm_states_dtype: float32
+      materialize_only_last_token_logits: true
+      max_tokens: 16384
+      moe_pad_experts_for_cuda_graph_inference: false
+      num_cuda_graphs: -1
+      num_speculative_tokens: 0
+      parsers:
+      - deepseek-r1-reasoning
+      - qwen3-coder-tool
+      pipeline_model_parallel_size: 1
+      sequence_parallel: true
+      static_kv_memory_pointers: true
+      tensor_model_parallel_size: 2
+      transformer_impl: inference_optimized
+      unified_memory_level: 0
+      use_cuda_graphs_for_non_decode_steps: true
+    stop_strings: null
+    stop_token_ids: null
+    temperature: 1
+    top_k: null
+    top_p: 1
+    vllm_cfg:
+      async_engine: true
+      enforce_eager: false
+      expert_parallel_size: 1
+      expose_http_server: true
+      gpu_memory_utilization: 0.85
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        reasoning_parser: deepseek_r1
+        tool_parser: qwen3_coder
+      kv_cache_dtype: auto
+      load_format: dummy
+      max_model_len: 49152
+      max_num_batched_tokens: 32768
+      max_num_seqs: 1024
+      num_first_layers_in_bf16: 0
+      num_last_layers_in_bf16: 0
+      pipeline_parallel_size: 1
+      precision: bfloat16
+      skip_tokenizer_init: false
+      tensor_parallel_size: 2
+      use_deep_gemm: false
+    vllm_kwargs:
+      compilation_config:
+        backend: eager
+      mamba_ssm_cache_dtype: float32
+  generation_batch_size: 64
+  logprob_batch_size: 1
+  logprob_chunk_size: 2048
+  make_sequence_length_divisible_by: 8
+  max_grad_norm: 1
+  max_total_sequence_length: 49152
+  megatron_cfg:
+    activation_checkpointing: false
+    apply_rope_fusion: true
+    batch_invariant_mode: false
+    bias_activation_fusion: false
+    context_parallel_size: 2
+    converter_type: LlamaForCausalLM
+    cuda_graph_impl: local
+    cuda_graph_scope: full_iteration
+    defer_fp32_logits: true
+    distributed_data_parallel_config:
+      average_in_collective: false
+      data_parallel_sharding_strategy: optim_grads_params
+      grad_reduce_in_fp32: false
+      overlap_grad_reduce: false
+      overlap_param_gather: true
+      use_custom_fsdp: false
+    empty_unused_memory_level: 1
+    enabled: true
+    env_vars: null
+    expert_model_parallel_size: 4
+    expert_tensor_parallel_size: 1
+    freeze_moe_router: true
+    gradient_accumulation_fusion: false
+    inference_rng_tracker: false
+    moe_aux_loss_coeff: 0
+    moe_enable_deepep: false
+    moe_pad_experts_for_cuda_graph_inference: true
+    moe_per_layer_logging: true
+    moe_permute_fusion: true
+    moe_router_bias_update_rate: 0.001
+    moe_router_dtype: fp32
+    moe_router_enable_expert_bias: true
+    moe_router_load_balancing_type: none
+    moe_shared_expert_overlap: false
+    moe_token_dispatcher_type: alltoall
+    num_layers_in_first_pipeline_stage: null
+    num_layers_in_last_pipeline_stage: null
+    optimizer:
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+      adam_eps: 1.0e-08
+      bf16: true
+      clip_grad: 1
+      fp16: false
+      lr: 3.0e-06
+      min_lr: 3.0e-06
+      optimizer: adam
+      optimizer_cpu_offload: false
+      optimizer_offload_fraction: 0
+      params_dtype: float32
+      sgd_momentum: 0.9
+      use_distributed_optimizer: true
+      use_precision_aware_optimizer: true
+      weight_decay: 0
+    pipeline_dtype: bfloat16
+    pipeline_model_parallel_size: 1
+    scheduler:
+      end_weight_decay: 0
+      lr_decay_iters: null
+      lr_decay_style: constant
+      lr_warmup_init: 3.0e-07
+      lr_warmup_iters: 10
+      start_weight_decay: 0
+      weight_decay_incr_style: constant
+    sequence_parallel: true
+    tensor_model_parallel_size: 2
+    track_moe_metrics: true
+    use_te_rng_tracker: true
+  model_name: /scratch/fsw/portfolios/nemotron/users/tene/checkpoints/nano-v3-sft-64gbs-nickel-capybara-5e-5-constant-wd-0-load-bal-1e-4-lcx3-pretool-base-temp1-iter-0013600-hf
+  offload_optimizer_for_logprob: false
+  optimizer: null
+  precision: bfloat16
+  scheduler: null
+  sequence_packing:
+    algorithm: modified_first_fit_decreasing
+    enabled: true
+    logprob_mb_tokens: 49152
+    sequence_length_round: 64
+    train_mb_tokens: 49152
+  tokenizer:
+    name: /scratch/fsw/portfolios/nemotron/users/tene/checkpoints/nano-v3-sft-64gbs-nickel-capybara-5e-5-constant-wd-0-load-bal-1e-4-lcx3-pretool-base-temp1-iter-0013600-hf
+  train_global_batch_size: 128
+  train_micro_batch_size: 1

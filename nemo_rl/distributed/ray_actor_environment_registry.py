@@ -26,6 +26,9 @@ SGLANG_EXECUTABLE = (
 MCORE_EXECUTABLE = (
     PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.MCORE
 )
+NEMO_GYM_EXECUTABLE = (
+    PY_EXECUTABLES.SYSTEM if USE_SYSTEM_EXECUTABLE else PY_EXECUTABLES.NEMO_GYM
+)
 
 ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
@@ -42,9 +45,9 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     "nemo_rl.environments.code_jaccard_environment.CodeJaccardEnvironment": PY_EXECUTABLES.SYSTEM,
     "nemo_rl.environments.games.sliding_puzzle.SlidingPuzzleEnv": PY_EXECUTABLES.SYSTEM,
     # AsyncTrajectoryCollector needs vLLM environment to handle exceptions from VllmGenerationWorker
-    "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector": PY_EXECUTABLES.VLLM,
+    "nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector": VLLM_EXECUTABLE,
     # ReplayBuffer needs vLLM environment to handle trajectory data from VllmGenerationWorker
-    "nemo_rl.algorithms.async_utils.ReplayBuffer": PY_EXECUTABLES.VLLM,
+    "nemo_rl.algorithms.async_utils.ReplayBuffer": VLLM_EXECUTABLE,
     # SyncRolloutActor doesn't import vllm directly — policy_generation is a
     # Ray actor handle. The VLLM env is needed because (1) transfer_queue is
     # bundled into the VLLM venv (and the policy training venvs), and the
@@ -53,7 +56,7 @@ ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
     # venv caches.
     "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": PY_EXECUTABLES.VLLM,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": PY_EXECUTABLES.SYSTEM,
-    "nemo_rl.environments.nemo_gym.NemoGym": PY_EXECUTABLES.NEMO_GYM,
+    "nemo_rl.environments.nemo_gym.NemoGym": NEMO_GYM_EXECUTABLE,
 }
 
 from nemo_rl.modelopt.registry import MODELOPT_ACTOR_REGISTRY

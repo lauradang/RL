@@ -1092,6 +1092,93 @@ def _calculate_single_metric(
     }
 
 
+_NEMO_GYM_DIAGNOSTIC_COLUMNS = [
+    "rowidx",
+    "agent_name",
+    "instance_id",
+    "dataset_name",
+    "split",
+    "reward",
+    "resolved",
+    "patch_exists",
+    "agent_timed_out",
+    "eval_timed_out",
+    "failure_stage",
+    "failure_error",
+    "ray_queue_time",
+    "openhands_run_time",
+    "generation_apptainer_spinup_time",
+    "create_runtime_time",
+    "connect_to_runtime_time",
+    "initialize_runtime_time",
+    "total_command_exec_time",
+    "total_model_call_time",
+    "final_eval_apptainer_spinup_time",
+    "final_eval_time",
+]
+
+
+def _compact_wandb_table_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    value = str(value)
+    max_len = 500
+    if len(value) > max_len:
+        return value[: max_len - 3] + "..."
+    return value
+
+
+def _compact_wandb_table_number(value: Any) -> float | int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    return None
+
+
+def _compact_wandb_table_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    return None
+
+
+def _build_nemo_gym_diagnostic_row(
+    nemo_gym_row: dict[str, Any], full_result: dict[str, Any], agent_name: str
+) -> list[Any]:
+    responses_create_params = full_result.get("responses_create_params")
+    if not isinstance(responses_create_params, dict):
+        responses_create_params = nemo_gym_row.get("responses_create_params", {})
+
+    metadata = responses_create_params.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    return [
+        _compact_wandb_table_number(nemo_gym_row.get("_rowidx")),
+        _compact_wandb_table_text(agent_name),
+        _compact_wandb_table_text(metadata.get("instance_id")),
+        _compact_wandb_table_text(metadata.get("dataset_name")),
+        _compact_wandb_table_text(metadata.get("split")),
+        _compact_wandb_table_number(full_result.get("reward")),
+        _compact_wandb_table_bool(full_result.get("resolved")),
+        _compact_wandb_table_bool(full_result.get("patch_exists")),
+        _compact_wandb_table_bool(full_result.get("agent_timed_out")),
+        _compact_wandb_table_bool(full_result.get("eval_timed_out")),
+        _compact_wandb_table_text(full_result.get("failure_stage")),
+        _compact_wandb_table_text(full_result.get("failure_error")),
+        _compact_wandb_table_number(full_result.get("ray_queue_time")),
+        _compact_wandb_table_number(full_result.get("openhands_run_time")),
+        _compact_wandb_table_number(full_result.get("generation_apptainer_spinup_time")),
+        _compact_wandb_table_number(full_result.get("create_runtime_time")),
+        _compact_wandb_table_number(full_result.get("connect_to_runtime_time")),
+        _compact_wandb_table_number(full_result.get("initialize_runtime_time")),
+        _compact_wandb_table_number(full_result.get("total_command_exec_time")),
+        _compact_wandb_table_number(full_result.get("total_model_call_time")),
+        _compact_wandb_table_number(full_result.get("final_eval_apptainer_spinup_time")),
+        _compact_wandb_table_number(full_result.get("final_eval_time")),
+    ]
+
+
 def run_async_nemo_gym_rollout(
     policy_generation: GenerationInterface,
     input_batch: BatchedDataDict[DatumSpec],
@@ -1235,10 +1322,17 @@ def run_async_nemo_gym_rollout(
     # Per-agent misc metrics
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
+        agent_to_diagnostic_rows: dict[str, list[list[Any]]] = defaultdict(list)
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
             agent_ref = nemo_gym_row["agent_ref"]
             agent_name = agent_ref["name"]
-            agent_to_results[agent_name].append(result["full_result"])
+            full_result = result["full_result"]
+            agent_to_results[agent_name].append(full_result)
+            agent_to_diagnostic_rows[agent_name].append(
+                _build_nemo_gym_diagnostic_row(
+                    nemo_gym_row, full_result, agent_name
+                )
+            )
             result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
@@ -1261,6 +1355,10 @@ def run_async_nemo_gym_rollout(
             to_log = [[json.dumps(r, separators=((",", ":")))] for r in agent_results]
             per_agent_metrics[f"{agent_name}/full_result"] = Table(
                 data=to_log, columns=["Full result"]
+            )
+            per_agent_metrics[f"{agent_name}/rollout_diagnostics"] = Table(
+                data=agent_to_diagnostic_rows[agent_name],
+                columns=_NEMO_GYM_DIAGNOSTIC_COLUMNS,
             )
 
         rollout_metrics.update(per_agent_metrics)

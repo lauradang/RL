@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, TypedDict
 
@@ -119,7 +120,7 @@ Depending on your data shape, you may want to change these values."""
         nemo_gym_examples: list[dict],
         tokenizer: PreTrainedTokenizerBase,
         timer_prefix: str,
-    ) -> list[dict]:
+    ) -> tuple[list[dict], dict[str, Any]]:
         timer = Timer()
 
         timer.start("_run_rollouts_total")
@@ -196,13 +197,19 @@ Depending on your data shape, you may want to change these values."""
             if "generation_token_ids" not in output_item_dict:
                 continue
 
-            assert (
-                seen_token_ids
-                == output_item_dict["prompt_token_ids"][: len(seen_token_ids)]
-            ), f"""Non-contiguous messages found! This may be a tokenization issue where certain tokens are combined when messages are concatenated, or it may be due to part of the chat history being truncated (like if super long history is truncated or if reasoning is stripped out).
-Seen token IDs: {seen_token_ids}
-Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
-"""
+            if seen_token_ids != output_item_dict["prompt_token_ids"][
+                : len(seen_token_ids)
+            ]:
+                warnings.warn(
+                    "Skipping a non-contiguous NeMo-Gym generation item. This "
+                    "can happen when an agent rewrites, truncates, or compacts "
+                    "its chat history between model calls. "
+                    f"seen_token_count={len(seen_token_ids)} "
+                    f"prompt_token_count={len(output_item_dict['prompt_token_ids'])}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                continue
 
             nemo_rl_message_log.append(
                 {

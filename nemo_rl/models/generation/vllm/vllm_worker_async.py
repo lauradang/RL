@@ -107,18 +107,18 @@ def _replace_prefix_tokens(
         if model_prefix_token_ids[-1] == eos_token_id:
             model_cut_end -= 1
 
-    # Assert here to prepare for the logic below
-    assert len(template_token_ids) > len(
-        template_prefix_token_ids
-    ), f"""Found possibly non-monotonically increasing trajectory!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
-"""
+    if len(template_token_ids) < len(template_prefix_token_ids):
+        warnings.warn(
+            "Skipping NeMo-RL prefix replacement because the chat-template "
+            "prefix is longer than the request prompt. This can happen when "
+            "an agent rewrites, truncates, or compacts its chat history between "
+            "model calls. "
+            f"template_prefix_len={len(template_prefix_token_ids)} "
+            f"template_len={len(template_token_ids)}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return template_token_ids
 
     # We take everything starting with the EOS token ID.
     template_cut_start = -1
@@ -127,17 +127,14 @@ Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}
             template_cut_start = pos
             break
 
-    # This should never be the case, but
-    assert (
-        template_cut_start >= 0
-    ), f"""No EOS token ID found in the chat-templated messages!
-Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}
-
-Template token IDs (everything that was sent to the model endpoint): {template_token_ids}
-
-Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}
-
-Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"""
+    if template_cut_start < 0:
+        warnings.warn(
+            "Skipping NeMo-RL prefix replacement because no EOS token was "
+            "found in the chat-template prefix.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return template_token_ids
 
     return (
         model_prefix_token_ids[:model_cut_end] + template_token_ids[template_cut_start:]

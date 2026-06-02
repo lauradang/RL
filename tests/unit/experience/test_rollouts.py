@@ -37,6 +37,8 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleMetadata,
 )
 from nemo_rl.experience.rollouts import (
+    _NEMO_GYM_DIAGNOSTIC_COLUMNS,
+    _build_nemo_gym_diagnostic_row,
     _calculate_single_metric,
     run_async_multi_turn_rollout,
     run_async_nemo_gym_rollout,
@@ -98,6 +100,62 @@ class TestCalculateSingleMetric:
         result = _calculate_single_metric([5.0, 5.0], batch_size=2, key_name="test")
 
         assert result["test/stddev"] == 0.0
+
+
+class TestNemoGymDiagnosticRows:
+    def test_missing_numeric_values_do_not_force_string_table_types(self):
+        from wandb import Table
+
+        nemo_gym_row = {
+            "_rowidx": 0,
+            "responses_create_params": {
+                "metadata": {
+                    "instance_id": "example__repo-1",
+                    "dataset_name": "SWE-Gym/SWE-Gym",
+                    "split": "train",
+                }
+            },
+        }
+        first_result = {
+            "reward": 0.0,
+            "resolved": False,
+            "patch_exists": False,
+            "agent_timed_out": True,
+            "eval_timed_out": False,
+            "failure_stage": "agent",
+            "failure_error": "timeout",
+        }
+        second_result = {
+            "responses_create_params": nemo_gym_row["responses_create_params"],
+            "reward": 1.0,
+            "resolved": True,
+            "patch_exists": True,
+            "agent_timed_out": False,
+            "eval_timed_out": False,
+            "failure_stage": "",
+            "failure_error": "",
+            "ray_queue_time": 0.1,
+            "openhands_run_time": 2.0,
+            "generation_apptainer_spinup_time": 3.0,
+            "create_runtime_time": 4.0,
+            "connect_to_runtime_time": 5.0,
+            "initialize_runtime_time": 6.0,
+            "total_command_exec_time": 7.0,
+            "total_model_call_time": 8.0,
+            "final_eval_apptainer_spinup_time": 9.0,
+            "final_eval_time": 10.0,
+        }
+
+        rows = [
+            _build_nemo_gym_diagnostic_row(
+                nemo_gym_row, first_result, "swe_agents_train"
+            ),
+            _build_nemo_gym_diagnostic_row(
+                nemo_gym_row, second_result, "swe_agents_train"
+            ),
+        ]
+
+        Table(data=rows, columns=_NEMO_GYM_DIAGNOSTIC_COLUMNS)
 
 
 @pytest.fixture(scope="function")
@@ -907,6 +965,7 @@ def test_run_async_nemo_gym_rollout(
             "truncation_rate": None,
             # per agent metrics
             "example_multi_step_simple_agent/full_result": None,
+            "example_multi_step_simple_agent/rollout_diagnostics": None,
             "example_multi_step_simple_agent/accuracy/histogram": None,
             "example_multi_step_simple_agent/accuracy/max": 0.0,
             "example_multi_step_simple_agent/accuracy/mean": 0.0,

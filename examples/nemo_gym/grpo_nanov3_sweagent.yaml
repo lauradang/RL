@@ -1,0 +1,141 @@
+# GRPO Nano v3 configuration for NeMo-Gym SWE-agent/OpenHands rollouts.
+#
+# This inherits the Nano v3 Megatron recipe and swaps the NeMo-Gym data and
+# Gym resource config from the previous prepared-data flow to SWE-agent.
+defaults: grpo_nanov3.yaml
+
+grpo:
+  num_prompts_per_step: 128
+  num_generations_per_prompt: 16
+  val_period: 256
+  # run_grpo_nemo_gym.py sets these to the validation dataset length.
+  max_val_samples: null
+  val_batch_size: 256
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 6
+    in_flight_weight_updates: true
+    lag_mode: "unforced"
+
+checkpointing:
+  checkpoint_dir: >-
+    /lustre/fsw/portfolios/nemotron/users/laurad/nemoRL_gb300_24n96g_sweagent_unforced_age6_seqpack_mfix_val256_ckpt256_prompts128_gens16
+  save_period: 256
+
+policy:
+  model_name: >-
+    /scratch/fsw/portfolios/nemotron/users/tene/checkpoints/nano-v3-sft-64gbs-nickel-capybara-5e-5-constant-wd-0-load-bal-1e-4-lcx3-pretool-base-temp1-iter-0013600-hf
+  tokenizer:
+    name: ${policy.model_name}
+  train_global_batch_size: 128
+  generation:
+    backend: "vllm"
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    stop_token_ids: null
+    stop_strings: null
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      kv_cache_dtype: auto
+      precision: ${policy.precision}
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.85
+      max_model_len: ${policy.max_total_sequence_length}
+      max_num_batched_tokens: 32768
+      max_num_seqs: 1024
+      load_format: dummy
+      skip_tokenizer_init: false
+      enforce_eager: false
+      use_deep_gemm: false
+      num_last_layers_in_bf16: 0
+      num_first_layers_in_bf16: 0
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: deepseek_r1
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 8
+  megatron_cfg:
+    activation_checkpointing: false
+    batch_invariant_mode: false
+    context_parallel_size: 2
+    converter_type: "LlamaForCausalLM"
+    cuda_graph_impl: "local"
+    cuda_graph_scope: "full_iteration"
+    expert_model_parallel_size: 4
+    inference_rng_tracker: false
+    moe_pad_experts_for_cuda_graph_inference: true
+    pipeline_model_parallel_size: 1
+    tensor_model_parallel_size: 2
+    use_te_rng_tracker: true
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+
+data:
+  max_input_seq_length: null
+  shuffle: false
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    # Uses SWE-Gym train rows currently targeted by the ARM64 SIF cache build.
+    # The unfiltered 1,955-row file is present beside this file; switch to it
+    # once the full source-built ARM64 cache has passed smoke checks.
+    data_path: >-
+      /scratch/fsw/portfolios/nemotron/users/laurad/nemo-gym-swe-agent-data/swe_agents/swegym_for_sweagent_and_openhands.nrl.available-sifs.jsonl
+  validation:
+    # v0.0.1 is downloaded too, but lacks test_patch in the registry rows.
+    # v0.0.2 is the current-Gym-compatible fallback.
+    data_path: >-
+      /scratch/fsw/portfolios/nemotron/users/laurad/nemo-gym-swe-agent-data/swe_agents/swebench_verified_for_sweagent_and_openhands.v0.0.2.nrl.jsonl
+  default:
+    dataset_name: NemoGymDataset
+    env_name: "nemo_gym"
+    prompt_file: null
+    system_prompt_file: null
+    processor: "nemo_gym_data_processor"
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  nemo_gym:
+    skip_venv_if_present: true
+    rollout_max_attempts_to_avoid_lp_nan: 1
+    is_trajectory_collection: false
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/swe_agents/configs/swebench_openhands_training.yaml
+    swe_agents_train:
+      responses_api_agents:
+        swe_agents:
+          # Native ARM64 SWE-Gym train SIFs built from SWE-Gym harness specs.
+          container_formatter: >-
+            /scratch/fsw/portfolios/nemotron/users/laurad/swegym-arm64-sifs/sweb.eval.arm64.{instance_id}.sif
+          dataset_path: >-
+            /scratch/fsw/portfolios/nemotron/users/laurad/nemo-gym-swe-agent-data/swe_agents/swegym_for_sweagent_and_openhands.nrl.available-sifs.jsonl
+    swe_agents_val:
+      responses_api_agents:
+        swe_agents:
+          container_formatter: >-
+            /scratch/fsw/portfolios/nemotron/projects/nemotron_n3_post/users/igitman/images/swe-bench/swebench_sweb.eval.x86_64.{instance_id}.sif
+          dataset_path: >-
+            /scratch/fsw/portfolios/nemotron/users/laurad/nemo-gym-swe-agent-data/swe_agents/swebench_verified_for_sweagent_and_openhands.v0.0.2.nrl.jsonl
+
+logger:
+  log_dir: "logs/nemoRL_gb300_24n96g_sweagent_unforced_age6_seqpack_mfix_val256_ckpt256_prompts128_gens16"
+  wandb_enabled: true
+  wandb:
+    project: "nano-v3-megatron-inference"
+    name: "nemoRL_gb300_24n96g_sweagent_unforced_age6_seqpack_mfix_val256_ckpt256_prompts128_gens16"
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 24
