@@ -33,7 +33,7 @@ set -x
 # Function to extract config from a script
 extract_config() {
     local script_path="$1"
-    local config=$(sed -n '/^# =\+ BEGIN CONFIG =\+/,/^# =\+ END CONFIG =\+/p' "$script_path" |
+    local config=$(sed -n '/^# ==* BEGIN CONFIG ==*/,/^# ==* END CONFIG ==*/p' "$script_path" |
                    grep -v "^#" |
                    grep "=" )
     if [[ -z "$config" ]]; then
@@ -93,7 +93,20 @@ MOUNTS=${MOUNTS:-}
 DRYRUN=${DRYRUN:-}
 IS_RELEASE=${IS_RELEASE:-}  # Adds extra configuration for wandb to track this in the right project
 EXCLUDE_GRES=${EXCLUDE_GRES:-} # If set, will not include --gres=gpu:$GPUS_PER_NODE in the sbatch invocation
+PROFILE=${PROFILE:-none} # none, megatron-logprobs, megatron-all, e2e-async
+PROFILE_RANGE=${PROFILE_RANGE:-4:6}
+PROFILE_POST_RUN_LOG_SYNC_SLEEP=${PROFILE_POST_RUN_LOG_SYNC_SLEEP:-90}
+PROFILE_RAY_LOG_SYNC_FREQUENCY=${PROFILE_RAY_LOG_SYNC_FREQUENCY:-30}
 NOW=$(date '+%y%m%d-%H%M%S')
+
+case "$PROFILE" in
+    none|megatron-logprobs|megatron-all|e2e-async) ;;
+    *)
+        echo "[ERROR]: Unsupported PROFILE=$PROFILE"
+        echo "[ERROR]: Expected one of: none, megatron-logprobs, megatron-all, e2e-async"
+        exit 1
+        ;;
+esac
 
 if [[ -n "$MOUNTS" ]]; then
     # Comma needed since we always mount PWD
@@ -165,15 +178,31 @@ for SCRIPT in $SCRIPTS; do
             GRES_ARG=""
         fi
 
+        base_command="uv run $rel_script ${script_args[*]}"
+        run_command="$base_command"
+        profile_sbatch_env_line=""
+        if [[ "$PROFILE" != "none" ]]; then
+            rel_script_dir=$(dirname "$rel_script")
+            profile_result_dir="$SNAPSHOT_DIR/$rel_script_dir/$EXP_NAME"
+            profile_slurm_log_dir='\${SLURM_SUBMIT_DIR}/\${SLURM_JOB_ID}-logs'
+            profile_sbatch_env_line="export RAY_LOG_SYNC_FREQUENCY=\"\${RAY_LOG_SYNC_FREQUENCY:-$PROFILE_RAY_LOG_SYNC_FREQUENCY}\""
+            run_command="uv run tools/profile_megatron_inference/run_profiled_command.py --profile $PROFILE --profile-range $PROFILE_RANGE --result-dir $profile_result_dir --slurm-log-dir $profile_slurm_log_dir --post-run-log-sync-sleep $PROFILE_POST_RUN_LOG_SYNC_SLEEP -- $base_command"
+        fi
+        extra_env_line=""
+        if [[ -n "${EXTRA_ENV:-}" ]]; then
+            extra_env_line="${EXTRA_ENV} \\"
+        fi
+
         cat <<EOF >$SNAPSHOT_DIR/continue.sh
 #!/bin/bash
 SCRIPT_DIR=\$( cd -- "\$( dirname -- "\${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 cd \$SCRIPT_DIR
 
-${EXTRA_ENV:-} \\
+${profile_sbatch_env_line}
+${extra_env_line}
 HF_HOME=$HF_HOME \\
 HF_DATASETS_CACHE=$HF_DATASETS_CACHE \\
-COMMAND="uv run $rel_script ${script_args[@]}" \\
+COMMAND="$run_command" \\
 CONTAINER=$CONTAINER \\
 MOUNTS="$SNAPSHOT_DIR:$SNAPSHOT_DIR${MOUNTS}" \\
 sbatch \\
