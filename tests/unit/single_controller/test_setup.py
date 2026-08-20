@@ -59,6 +59,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
+from nemo_rl.data.utils import WeightedTaskDatasets
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import SC_ROLLOUT_SCHEMA_FIELDS
 from nemo_rl.experience.rollouts import EffortLevelsConfig
@@ -144,6 +145,7 @@ def _make_master_config(
             num_prompts_per_step=num_prompts_per_step,
             num_generations_per_prompt=2,
             max_rollout_turns=1,
+            use_dynamic_sampling=False,
             val_period=0,
             val_at_start=False,
             val_at_end=False,
@@ -644,9 +646,62 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    def test_multiple_dataloader_not_supported(self):
+    def test_multiple_dataloader_requires_explicit_weights(self):
         mc = _make_master_config(use_multiple_dataloader=True)
-        with pytest.raises(NotImplementedError, match="use_multiple_dataloader"):
+        with pytest.raises(ValueError, match="explicit `weight`"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_weighted_datasets_build_quota_sized_finite_loader(self, patched_factories):
+        mc = _make_master_config(use_multiple_dataloader=True, num_prompts_per_step=4)
+        mc.data["train"] = [
+            {"dataset_name": "a", "env_name": "math", "weight": 3.0},
+            {"dataset_name": "b", "env_name": "math", "weight": 1.0},
+        ]
+        datasets = WeightedTaskDatasets(
+            datasets={"a": object(), "b": object()},
+            weights={"a": 0.75, "b": 0.25},
+        )
+        patched_factories["setup_response_data"].return_value = (
+            datasets,
+            None,
+            patched_factories["env_handles"],
+            {},
+        )
+        finite_loader = MagicMock()
+        finite_loader.__len__.return_value = 2
+
+        with patch.object(
+            sc_setup_mod,
+            "FiniteWeightedDataloader",
+            return_value=finite_loader,
+        ) as finite_loader_cls:
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert actor_args.task_quota == {"a": 3, "b": 1}
+        assert actor_args.dataloader is finite_loader
+        assert [
+            call.kwargs["batch_size"]
+            for call in patched_factories["StatefulDataLoader"].call_args_list
+        ] == [3, 1]
+        finite_loader_cls.assert_called_once()
+
+    def test_weighted_datasets_reject_dynamic_sampling(self):
+        mc = _make_master_config(use_multiple_dataloader=True)
+        mc.data["train"] = [{"dataset_name": "a", "env_name": "math", "weight": 1.0}]
+        mc.grpo.use_dynamic_sampling = True
+        with pytest.raises(ValueError, match="use_dynamic_sampling"):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    def test_evaluation_only_rejected_until_sc_validation_exists(self):
+        mc = _make_master_config()
+        mc.data["train"] = [
+            {
+                "dataset_name": "eval",
+                "env_name": "math",
+                "evaluation_only": True,
+            }
+        ]
+        with pytest.raises(NotImplementedError, match="evaluation_only"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
     @pytest.mark.parametrize(

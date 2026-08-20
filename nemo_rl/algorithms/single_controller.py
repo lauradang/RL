@@ -50,7 +50,7 @@ import threading
 import time
 import uuid
 import warnings
-from collections import deque
+from collections import Counter, defaultdict, deque
 from collections.abc import Iterator
 from functools import partial
 from pathlib import Path
@@ -59,6 +59,7 @@ from typing import Any, Awaitable, Callable, Optional, Union, cast
 import ray
 import torch
 from ray.exceptions import RayActorError
+from wandb import Histogram
 
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.async_utils.replay_buffer import (
@@ -104,12 +105,15 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
     tensor_field,
 )
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.weights import TaskQuota
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
     ROLLOUT_METRICS,
+    ROLLOUT_METRIC_SAMPLES,
+    ROLLOUT_TASK_NAMES,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_context_lost
@@ -127,6 +131,7 @@ from nemo_rl.experience.rollout_recovery import (
 )
 from nemo_rl.models.generation.fleet_health import ShardState
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
+from nemo_rl.experience.metric_utils import MetricSamples
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.tq_policy import TQPolicy
@@ -170,6 +175,62 @@ def _train_fields_for_step(
         if (policy_logprobs_required or field != "prev_logprobs")
         and (reference_logprobs_required or field != "reference_policy_logprobs")
     )
+
+
+def _aggregate_task_rollout_metrics(
+    task_quota: TaskQuota,
+    sampled_task_names: list[str],
+    rollout_metrics: list[dict[str, object]],
+    rollout_metric_samples: Optional[list[MetricSamples]] = None,
+) -> dict[str, object]:
+    """Summarize weighted selection and scalar rollout metrics per task."""
+    sampled_counts = Counter(sampled_task_names)
+    total_quota = sum(task_quota.values())
+    output: dict[str, object] = {}
+    numeric_samples: dict[str, dict[str, list[float]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for task_name, metrics in zip(sampled_task_names, rollout_metrics, strict=True):
+        for metric_name, value in metrics.items():
+            if isinstance(value, bool | int | float):
+                numeric_value = float(value)
+                if math.isfinite(numeric_value):
+                    numeric_samples[task_name][metric_name].append(numeric_value)
+
+    raw_samples: dict[str, MetricSamples] = defaultdict(lambda: defaultdict(list))
+    if rollout_metric_samples is not None:
+        for task_name, group_samples in zip(
+            sampled_task_names, rollout_metric_samples, strict=True
+        ):
+            for metric_name, values in group_samples.items():
+                raw_samples[task_name][metric_name].extend(values)
+
+    for task_name, quota in task_quota.items():
+        count = sampled_counts[task_name]
+        prefix = f"tasks/{task_name}"
+        output[f"{prefix}/configured_quota"] = quota
+        output[f"{prefix}/configured_share"] = quota / total_quota
+        output[f"{prefix}/sampled_count"] = count
+        output[f"{prefix}/sampled_share"] = count / total_quota
+        output[f"{prefix}/deficit"] = max(0, quota - count)
+        for metric_name, values in numeric_samples[task_name].items():
+            metric_key = f"{prefix}/rollout/{metric_name}"
+            if metric_name.endswith("/min"):
+                output[metric_key] = min(values)
+            elif metric_name.endswith("/max"):
+                output[metric_key] = max(values)
+            else:
+                output[metric_key] = sum(values) / len(values)
+            output[f"{metric_key}/group_histogram"] = Histogram(values)
+        for metric_name, values in raw_samples[task_name].items():
+            if not values:
+                continue
+            metric_key = f"{prefix}/rollout/rollout_metrics/nemo_gym/{metric_name}"
+            output[f"{metric_key}/mean"] = sum(values) / len(values)
+            output[f"{metric_key}/min"] = min(values)
+            output[f"{metric_key}/max"] = max(values)
+            output[f"{metric_key}/histogram"] = Histogram(values)
+    return output
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -252,6 +313,7 @@ class SingleControllerActor:
         self._trainer: TQPolicy = actor_args.trainer_handle
         self._value: Optional[TQValue] = getattr(actor_args, "value_handle", None)
         self._dataloader = actor_args.dataloader
+        self._task_quota = dict(actor_args.task_quota)
         self._weight_synchronizer = actor_args.weight_synchronizer
         self._advantage_estimator = actor_args.advantage_estimator
         self._loss_fn = actor_args.loss_fn
@@ -1730,7 +1792,10 @@ class SingleControllerActor:
             step_open = False
             chunks_dispatched = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
+            remaining_task_quota = dict(self._task_quota) if self._task_quota else None
+            sampled_task_names: list[str] = []
             selected_rollout_metrics: list[dict[str, Any]] = []
+            selected_rollout_metric_samples: list[MetricSamples] = []
             # One chunk per step on the PPO path, so these are the step's own
             # model updates -- the last epoch's, when there is more than one.
             policy_result: Optional[dict[str, Any]] = None
@@ -1783,6 +1848,7 @@ class SingleControllerActor:
                             current_train_weight=self._trainer_version,
                             min_prompt_groups=min_prompt_groups,
                             max_prompt_groups=max_prompt_groups,
+                            remaining_task_quota=remaining_task_quota,
                         )
 
                         # If no batch is selectable, sleep and retry
@@ -1805,10 +1871,32 @@ class SingleControllerActor:
                                     f"step was assembled: dispatched "
                                     f"{groups_dispatched}/{target_groups} prompt "
                                     f"groups with {buffered_groups} group(s) "
-                                    f"remaining in the buffer"
+                                    f"remaining in the buffer; per-task deficits="
+                                    f"{remaining_task_quota}"
                                 )
                             await asyncio.sleep(0.005)
                             continue
+
+                        selected_task_names = train_meta.extra_info.pop(
+                            ROLLOUT_TASK_NAMES, []
+                        )
+                        if remaining_task_quota is not None:
+                            if len(selected_task_names) != num_groups:
+                                raise RuntimeError(
+                                    "Weighted replay selection returned task metadata "
+                                    f"for {len(selected_task_names)}/{num_groups} groups"
+                                )
+                            sampled_task_names.extend(selected_task_names)
+                            for task_name in selected_task_names:
+                                remaining_task_quota[task_name] -= 1
+                                if remaining_task_quota[task_name] < 0:
+                                    raise RuntimeError(
+                                        f"Sampler exceeded quota for task {task_name!r}"
+                                    )
+
+                        selected_rollout_metric_samples.extend(
+                            train_meta.extra_info.pop(ROLLOUT_METRIC_SAMPLES, [])
+                        )
 
                         # Release buffer capacity
                         for _ in range(num_groups):
@@ -2038,6 +2126,21 @@ class SingleControllerActor:
                 step_metrics.update(
                     aggregate_rollout_metrics(per_group_rollout_metrics)
                 )
+                if self._task_quota:
+                    assert remaining_task_quota is not None
+                    if any(remaining_task_quota.values()):
+                        raise RuntimeError(
+                            f"Training step ended with per-task deficits "
+                            f"{remaining_task_quota}"
+                        )
+                    step_metrics.update(
+                        _aggregate_task_rollout_metrics(
+                            self._task_quota,
+                            sampled_task_names,
+                            selected_rollout_metrics,
+                            selected_rollout_metric_samples,
+                        )
+                    )
                 if self._gen is not None:
                     try:
                         step_metrics.update(

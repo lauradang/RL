@@ -29,6 +29,11 @@ GLOBAL_FORWARD_PAD_SEQLEN = "global_forward_pad_seqlen"
 # pump pops it off the meta before dispatch. sync_rollout_actor.py writes the
 # same string with a flat-dict shape, so this constant is not a drop-in there.
 ROLLOUT_METRICS = "rollout_metrics"
+# Per-prompt-group task attribution and raw metric samples. Like
+# ROLLOUT_METRICS, these are controller-only sidecars that the train pump removes
+# before dispatching tensor metadata to workers.
+ROLLOUT_TASK_NAMES = "rollout_task_names"
+ROLLOUT_METRIC_SAMPLES = "rollout_metric_samples"
 
 # Skeleton field names from `shard_meta_for_dp`.
 INPUT_IDS = "input_ids"

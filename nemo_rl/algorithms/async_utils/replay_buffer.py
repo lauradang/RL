@@ -39,9 +39,15 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.interfaces import ReplayBufferProtocol
+from nemo_rl.data.weights import UNWEIGHTED_TASK_NAME
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTED_EXPERTS_FIELD
+from nemo_rl.data_plane.schema import (
+    ROLLOUT_METRICS,
+    ROLLOUT_METRIC_SAMPLES,
+    ROLLOUT_TASK_NAMES,
+    ROUTED_EXPERTS_FIELD,
+)
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_TASK_INDEX_KEY,
     NEXT_NEMO_GYM_TASK_INDEX_KEY,
@@ -148,7 +154,11 @@ def _canonical_manifest_extra_info(value: Any, *, path: str) -> Any:
     do not identify the replay rows bound to the native TQ checkpoint.
     """
     if isinstance(value, Mapping):
-        value = {key: item for key, item in value.items() if key != ROLLOUT_METRICS}
+        value = {
+            key: item
+            for key, item in value.items()
+            if key not in (ROLLOUT_METRICS, ROLLOUT_METRIC_SAMPLES)
+        }
     return _canonical_manifest_value(value, path=path)
 
 
@@ -983,8 +993,8 @@ class ReplayBuffer(ReplayBufferImpl):
 class TQReplayBuffer:
     """Meta cache + TQ writer with reserve-then-commit slot semantics.
 
-    meta_list, weight_list, ready_list, _group_ids are parallel; a slot stays
-    ready=False until commit fills it.
+    Tensor metadata, weight/target versions, readiness, and
+    group IDs are parallel slot state; a slot stays ready=False until commit.
     """
 
     def __init__(
@@ -1142,7 +1152,18 @@ class TQReplayBuffer:
                     sample_ids=list(sample_ids),
                     fields=list(fields.keys()),
                     sequence_lengths=[int(s) for s in lengths.tolist()],
-                    extra_info={ROLLOUT_METRICS: [dict(record.rollout_metrics)]},
+                    extra_info={
+                        ROLLOUT_METRICS: [dict(record.rollout_metrics)],
+                        ROLLOUT_TASK_NAMES: [
+                            record.metadata.get("task_name", UNWEIGHTED_TASK_NAME)
+                        ],
+                        ROLLOUT_METRIC_SAMPLES: [
+                            {
+                                name: list(values)
+                                for name, values in record.rollout_metric_samples.items()
+                            }
+                        ],
+                    },
                     tags=[dict(t) for t in tags],
                 )
 

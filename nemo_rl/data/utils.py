@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import torch
@@ -29,8 +30,28 @@ from nemo_rl.data.datasets import (
     update_single_dataset_config,
 )
 from nemo_rl.data.processors import preference_preprocessor
+from nemo_rl.data.weights import (
+    TaskName,
+    TaskWeights,
+    TaskWeightSpec,
+    normalize_weights,
+)
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.utils import create_env
+
+
+@dataclass(frozen=True)
+class WeightedTaskDatasets:
+    """Processed training datasets and normalized weights keyed by task."""
+
+    datasets: dict[TaskName, AllTaskProcessedDataset]
+    weights: TaskWeights
+
+    def items(self):
+        return self.datasets.items()
+
+    def __len__(self) -> int:
+        return len(self.datasets)
 
 
 def get_train_dataset_name(data_config: DataConfig) -> Optional[str]:
@@ -111,11 +132,11 @@ def setup_response_data(
     is_vlm: bool = False,
 ) -> Union[
     tuple[
-        Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
+        Union[AllTaskProcessedDataset, WeightedTaskDatasets],
         Optional[AllTaskProcessedDataset],
     ],
     tuple[
-        Union[AllTaskProcessedDataset, dict[str, AllTaskProcessedDataset]],
+        Union[AllTaskProcessedDataset, WeightedTaskDatasets],
         Optional[AllTaskProcessedDataset],
         dict[str, EnvironmentInterface],
         dict[str, EnvironmentInterface],
@@ -167,6 +188,8 @@ def setup_response_data(
     task_data_preprocessors = {}
     task_to_env = {}
     data_list = []
+    eval_only_data_list = []
+    weight_specs: list[TaskWeightSpec] = []
 
     if isinstance(data_config["train"], dict):
         data_config["train"] = [data_config["train"]]
@@ -176,17 +199,37 @@ def setup_response_data(
         if "default" in data_config and data_config["default"] is not None:
             update_single_dataset_config(cfg, data_config["default"])
         data = load_response_dataset(cfg)
-        data_list.append(data)
-        print(
-            f"  - Loaded training dataset {data.task_name} with {len(data.dataset)} samples."
-        )
         # bind task_name to task_data_processors and task_to_env
         task_name = data.task_name
+        evaluation_only = bool(cfg.get("evaluation_only"))
+        weight_specs.append(
+            TaskWeightSpec(
+                task_name=task_name,
+                weight=cfg.get("weight"),
+                evaluation_only=evaluation_only,
+            )
+        )
         task_data_processors[task_name] = (data.task_spec, data.processor)
         if hasattr(data, "preprocessor") and data.preprocessor is not None:
             task_data_preprocessors[task_name] = data.preprocessor
         if has_envs:
             task_to_env[task_name] = envs[cfg["env_name"]]
+
+        if evaluation_only:
+            eval_only_data_list.append(data)
+            print(
+                f"  - Loaded evaluation-only dataset {task_name} with "
+                f"{len(data.dataset)} samples."
+            )
+        else:
+            data_list.append(data)
+            print(
+                f"  - Loaded training dataset {task_name} with "
+                f"{len(data.dataset)} samples."
+            )
+
+    if not data_list:
+        raise ValueError("At least one data.train entry must not be evaluation_only")
 
     # merge datasets
     if (
@@ -194,18 +237,25 @@ def setup_response_data(
         and data_config["use_multiple_dataloader"]
     ):
         # merge datasets into a dictionary of task name to dataset
-        dataset = {
-            data.task_name: AllTaskProcessedDataset(
-                data.dataset,
-                tokenizer,
-                None,
-                task_data_processors,
-                task_data_preprocessors=task_data_preprocessors,
-                max_seq_length=data_config["max_input_seq_length"],
-            )
-            for data in data_list
-        }
+        dataset = WeightedTaskDatasets(
+            datasets={
+                data.task_name: AllTaskProcessedDataset(
+                    data.dataset,
+                    tokenizer,
+                    None,
+                    task_data_processors,
+                    task_data_preprocessors=task_data_preprocessors,
+                    max_seq_length=data_config["max_input_seq_length"],
+                )
+                for data in data_list
+            },
+            weights=normalize_weights(weight_specs),
+        )
     else:
+        if any(spec.weight is not None for spec in weight_specs):
+            raise ValueError(
+                "Per-dataset `weight` requires data.use_multiple_dataloader=true"
+            )
         # merge datasets into a single dataset
         merged_data = merge_datasets([data.dataset for data in data_list])
         dataset = AllTaskProcessedDataset(
@@ -226,6 +276,15 @@ def setup_response_data(
     val_task_data_preprocessors = {}
     val_task_to_env = {}
     val_data_list = []
+
+    for data in eval_only_data_list:
+        val_data_list.append(data.dataset)
+        task_name = data.task_name
+        val_task_data_processors[task_name] = task_data_processors[task_name]
+        if task_name in task_data_preprocessors:
+            val_task_data_preprocessors[task_name] = task_data_preprocessors[task_name]
+        if has_envs:
+            val_task_to_env[task_name] = task_to_env[task_name]
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
     for data in data_list:

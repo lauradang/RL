@@ -46,7 +46,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_buffer_checkpoint,
 )
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROLLOUT_TASK_NAMES
 
 
 class FakeBuffer:
@@ -69,12 +69,16 @@ class FakeBuffer:
         ready: bool = True,
         target_step: int | None = None,
         rollout_metrics: dict[str, float] | None = None,
+        task_name: str = "task",
     ) -> None:
         meta = KVBatchMeta(
             partition_id=self._partition_id,
             task_name=None,
             sample_ids=[f"{group_id}_g0"],
-            extra_info={ROLLOUT_METRICS: [dict(rollout_metrics or {})]},
+            extra_info={
+                ROLLOUT_METRICS: [dict(rollout_metrics or {})],
+                ROLLOUT_TASK_NAMES: [task_name],
+            },
             tags=[{"weight_version": weight, "group_id": group_id}],
         )
         self.meta_list.append(meta if ready else None)
@@ -516,7 +520,7 @@ class TestWeightFifoSelect:
         meta, n = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
         )
-        assert n == 2  # both weight-3 groups; weight-5 waits its turn
+        assert n == 2
         assert buf.start_weight_list == [5]
 
     def test_waits_for_partial_oldest_batch(self):
@@ -590,6 +594,27 @@ class TestInOrderSelect:
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
         ) == (None, 0)
+
+    def test_quota_prevents_fast_task_from_displacing_slow_task(self):
+        buf = FakeBuffer()
+        buf.add("fast1", weight=0, target_step=0, task_name="fast")
+        buf.add("fast2", weight=0, target_step=0, task_name="fast")
+        buf.add("slow", weight=0, target_step=0, task_name="slow")
+        sampler = InOrderSampler(buf, max_lookahead_versions=1)
+
+        meta, num_groups = _run(
+            sampler.select(
+                current_train_weight=0,
+                min_prompt_groups=2,
+                max_prompt_groups=2,
+                remaining_task_quota={"fast": 1, "slow": 1},
+            )
+        )
+
+        assert num_groups == 2
+        assert meta is not None
+        assert meta.extra_info[ROLLOUT_TASK_NAMES] == ["fast", "slow"]
+        assert len(buf.start_weight_list) == 1
 
 
 class TestDefaultEvictSkipsUnready:

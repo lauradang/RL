@@ -33,7 +33,11 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     replay_manifest_digest,
 )
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS
+from nemo_rl.data_plane.schema import (
+    ROLLOUT_METRICS,
+    ROLLOUT_METRIC_SAMPLES,
+    ROLLOUT_TASK_NAMES,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.interfaces import PromptGroupRecord
 
@@ -169,13 +173,14 @@ def _make_record(
     rollout_metrics: dict[str, Any] | None = None,
     *,
     prompt_idx: int = 0,
+    task_name: str = "_unweighted",
 ) -> PromptGroupRecord:
     """Opaque PromptGroupRecord — converter is stubbed, so contents are unused."""
     return PromptGroupRecord(
         prompt_idx=prompt_idx,
         prompt=[],
         extra_env_info=None,
-        metadata={},
+        metadata={"task_name": task_name},
         completions=[],
         rollout_metrics=dict(rollout_metrics or {}),
     )
@@ -206,6 +211,7 @@ def _add_group(
     end_weight: int | None = None,
     target_step: int | None = None,
     rollout_metrics: dict[str, Any] | None = None,
+    task_name: str = "_unweighted",
 ) -> KVBatchMeta:
     if end_weight is None:
         end_weight = weight
@@ -213,7 +219,7 @@ def _add_group(
     return _run(
         buf.commit(
             group_id,
-            _make_record(rollout_metrics),
+            _make_record(rollout_metrics, task_name=task_name),
             start_weight_version=weight,
             end_weight_version=end_weight,
         )
@@ -469,6 +475,29 @@ class TestTQReplayBufferReserveCommit:
         assert dp.depth() == 0
         assert dp.put_calls == []
 
+    def test_commit_preserves_rollout_metrics(self):
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp)
+        group_id = buf.reserve(weight_version=3)
+        record = _make_record(task_name="math")
+        record.rollout_metrics = {"reward/mean": 0.75}
+        record.rollout_metric_samples = {"resolved": [1.0, 0.0]}
+
+        _run(
+            buf.commit(
+                group_id,
+                record,
+                start_weight_version=3,
+                end_weight_version=3,
+            )
+        )
+
+        meta = buf.meta_list[0]
+        assert meta is not None
+        assert meta.extra_info[ROLLOUT_TASK_NAMES] == ["math"]
+        assert meta.extra_info[ROLLOUT_METRICS] == [{"reward/mean": 0.75}]
+        assert meta.extra_info[ROLLOUT_METRIC_SAMPLES] == [{"resolved": [1.0, 0.0]}]
+
     def test_commit_writes_tq_then_fills_meta(self, monkeypatch):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
@@ -651,7 +680,7 @@ class TestTQReplayBufferRemove:
     def test_remove_drops_indices_and_clears_dp_when_requested(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
-        metas = [_add_group(buf, weight=g) for g in range(3)]
+        metas = [_add_group(buf, weight=g, task_name=f"task-{g}") for g in range(3)]
 
         n = _run(buf.remove([0, 2], remove_in_dp=True))
 
@@ -660,6 +689,7 @@ class TestTQReplayBufferRemove:
         assert buf.start_weight_list == [1]
         assert buf.end_weight_list == [1]
         assert buf.meta_list[0].sample_ids == list(metas[1].sample_ids)
+        assert buf.meta_list[0].extra_info[ROLLOUT_TASK_NAMES] == ["task-1"]
         assert dp.depth() == _N_GENS
         assert set(dp._rows) == set(metas[1].sample_ids)
 

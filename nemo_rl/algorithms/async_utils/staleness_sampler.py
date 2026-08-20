@@ -58,8 +58,13 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneMutationCut,
     TQReplayBuffer,
 )
+from nemo_rl.data.weights import TaskQuota, UNWEIGHTED_TASK_NAME
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS
+from nemo_rl.data_plane.schema import (
+    ROLLOUT_METRICS,
+    ROLLOUT_METRIC_SAMPLES,
+    ROLLOUT_TASK_NAMES,
+)
 
 # Poll interval for the rollout-pump admission gate.
 _GATE_POLL_SECONDS = 0.005
@@ -92,6 +97,7 @@ class PromptGroupSampler(Protocol):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        remaining_task_quota: Optional[TaskQuota] = None,
     ) -> tuple[Optional[KVBatchMeta], int]:
         """Pick up to ``max_prompt_groups`` eligible groups; drop them locally."""
         ...
@@ -212,6 +218,7 @@ class BaseSampler(abc.ABC):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        remaining_task_quota: Optional[TaskQuota] = None,
     ) -> tuple[Optional[KVBatchMeta], int]: ...
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -268,25 +275,65 @@ class BaseSampler(abc.ABC):
         valid_idxs: list[int],
         min_prompt_groups: int,
         max_prompt_groups: int,
+        remaining_task_quota: Optional[TaskQuota] = None,
     ) -> tuple[Optional[KVBatchMeta], int]:
         """Cap, drop from the buffer, and concat the chosen groups.
 
         Greedy without waiting: returns all currently-eligible groups up to
         ``max_prompt_groups`` (never fewer on purpose, never waits to fill it),
-        or ``(None, 0)`` below ``min_prompt_groups``.
+        or ``None`` below ``min_prompt_groups``.
         """
-        if len(valid_idxs) < min_prompt_groups:
+        selected_idxs: list[int] = []
+        quota = dict(remaining_task_quota) if remaining_task_quota is not None else None
+        for index in valid_idxs:
+            if len(selected_idxs) >= max_prompt_groups:
+                break
+            if quota is not None:
+                meta = self._buffer.meta_list[index]
+                assert meta is not None
+                task_names = meta.extra_info.get(ROLLOUT_TASK_NAMES)
+                if not (
+                    isinstance(task_names, list)
+                    and len(task_names) == 1
+                    and isinstance(task_names[0], str)
+                ):
+                    raise RuntimeError(
+                        "Weighted replay selection requires exactly one task name "
+                        "on every prompt group"
+                    )
+                task_name = task_names[0]
+                if quota.get(task_name, 0) <= 0:
+                    continue
+                quota[task_name] -= 1
+            selected_idxs.append(index)
+        if len(selected_idxs) < min_prompt_groups:
             return None, 0
-        requested_groups = min(len(valid_idxs), max_prompt_groups)
-        selected_idxs = valid_idxs[:requested_groups]
         selected_metas = [self._buffer.meta_list[i] for i in selected_idxs]
         selected_rollout_metrics = [
             metrics
             for meta in selected_metas
             for metrics in meta.extra_info.get(ROLLOUT_METRICS, [])  # type: ignore[union-attr]
         ]
+        selected_task_names = [
+            task_name
+            for meta in selected_metas
+            for task_name in meta.extra_info.get(  # type: ignore[union-attr]
+                ROLLOUT_TASK_NAMES, [UNWEIGHTED_TASK_NAME]
+            )
+        ]
+        selected_rollout_metric_samples = [
+            samples
+            for meta in selected_metas
+            for samples in meta.extra_info.get(  # type: ignore[union-attr]
+                ROLLOUT_METRIC_SAMPLES, [{}]
+            )
+        ]
         selected_meta = selected_metas[0].concat(*selected_metas[1:])  # type: ignore[union-attr]
         selected_meta.extra_info[ROLLOUT_METRICS] = selected_rollout_metrics
+        selected_meta.extra_info[ROLLOUT_TASK_NAMES] = selected_task_names
+        selected_meta.extra_info[ROLLOUT_METRIC_SAMPLES] = (
+            selected_rollout_metric_samples
+        )
         await self._buffer.remove(selected_idxs, remove_in_dp=False)
         return selected_meta, len(selected_idxs)
 
@@ -355,6 +402,7 @@ class WindowedSampler(BaseSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        remaining_task_quota: Optional[TaskQuota] = None,
     ) -> tuple[Optional[KVBatchMeta], int]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
@@ -372,7 +420,10 @@ class WindowedSampler(BaseSampler):
                 )
             )
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            remaining_task_quota,
         )
 
 
@@ -466,6 +517,7 @@ class ReadyFirstSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        remaining_task_quota: Optional[TaskQuota] = None,
     ) -> tuple[Optional[KVBatchMeta], int]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         valid_idxs = [
@@ -474,7 +526,10 @@ class ReadyFirstSampler(_GatedSampler):
             if weight <= current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            remaining_task_quota,
         )
 
     async def evict(self, *, current_train_weight: int) -> int:
@@ -502,6 +557,7 @@ class WeightFifoSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        remaining_task_quota: Optional[TaskQuota] = None,
     ) -> tuple[Optional[KVBatchMeta], int]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         min_valid_version = max(0, current_train_weight - self.max_staleness_versions)
@@ -519,7 +575,10 @@ class WeightFifoSampler(_GatedSampler):
             if weight == target_version and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            remaining_task_quota,
         )
 
 
@@ -572,6 +631,7 @@ class InOrderSampler(_GatedSampler):
         current_train_weight: int,
         min_prompt_groups: int,
         max_prompt_groups: int,
+        remaining_task_quota: Optional[TaskQuota] = None,
     ) -> tuple[Optional[KVBatchMeta], int]:
         self._validate_group_bounds(min_prompt_groups, max_prompt_groups)
         valid_idxs = [
@@ -580,7 +640,10 @@ class InOrderSampler(_GatedSampler):
             if target == current_train_weight and self._buffer.ready_list[i]
         ]
         return await self._finalize_selection(
-            valid_idxs, min_prompt_groups, max_prompt_groups
+            valid_idxs,
+            min_prompt_groups,
+            max_prompt_groups,
+            remaining_task_quota,
         )
 
     async def evict(self, *, current_train_weight: int) -> int:

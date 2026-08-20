@@ -74,7 +74,11 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
-from nemo_rl.data.utils import extract_necessary_env_names, load_dataloader_state
+from nemo_rl.data.utils import (
+    WeightedTaskDatasets,
+    extract_necessary_env_names,
+    load_dataloader_state,
+)
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -511,7 +515,11 @@ def shutdown_environments(
 def setup(
     master_config: MasterConfig,
     tokenizer: TokenizerType,
-    dataset: AllTaskProcessedDataset | dict[str, AllTaskProcessedDataset],
+    dataset: (
+        AllTaskProcessedDataset
+        | dict[str, AllTaskProcessedDataset]
+        | WeightedTaskDatasets
+    ),
     val_dataset: Optional[AllTaskProcessedDataset],
     processor: Optional[AutoProcessor] = None,
     policy_factory: Optional[Callable[..., ColocatablePolicyInterface]] = None,
@@ -552,6 +560,11 @@ def setup(
     logger_config = master_config.logger
     cluster_config = master_config.cluster
     checkpointing_config = master_config.checkpointing
+    if isinstance(dataset, WeightedTaskDatasets) and dataset.weights:
+        raise NotImplementedError(
+            "Weighted dataset mixing is implemented by the SingleController "
+            "entrypoint. Run examples/run_grpo_single_controller.py instead."
+        )
 
     checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:

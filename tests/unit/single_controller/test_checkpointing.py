@@ -562,6 +562,7 @@ def _make_actor_args(
         inference_cluster=None,  # type: ignore[arg-type]
         dp_client=dp_client if dp_client is not None else _FakeDPClient(),
         dataloader=dataloader if dataloader is not None else _FakeDataloader(),
+        task_quota={},
         weight_synchronizer=_FakeWeightSynchronizer(),  # type: ignore[arg-type]
         advantage_estimator=None,
         loss_fn=object(),  # type: ignore[arg-type]

@@ -107,6 +107,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         gen_handle=None,
         trainer_handle=None,
         dataloader=None,
+        task_quota={},
         weight_synchronizer=FakeWeightSynchronizer(),
         advantage_estimator=None,
         loss_fn=None,
@@ -134,6 +135,33 @@ def _init_controller(master_config, actor_args):
     )
 
 
+def test_aggregate_weighted_task_metrics_reports_quota_and_rollouts() -> None:
+    metrics = single_controller._aggregate_task_rollout_metrics(
+        {"fast": 3, "slow": 1},
+        ["fast", "fast", "fast", "slow"],
+        [
+            {"reward": 1.0},
+            {"reward": 2.0},
+            {"reward": 3.0},
+            {"reward": 8.0},
+        ],
+        [
+            {"resolved": [1.0, 0.0]},
+            {"resolved": [1.0]},
+            {"resolved": [0.0]},
+            {"resolved": [1.0, 1.0]},
+        ],
+    )
+
+    assert metrics["tasks/fast/configured_share"] == 0.75
+    assert metrics["tasks/fast/sampled_count"] == 3
+    assert metrics["tasks/fast/deficit"] == 0
+    assert metrics["tasks/fast/rollout/reward"] == 2.0
+    assert metrics["tasks/slow/rollout/reward"] == 8.0
+    assert metrics["tasks/fast/rollout/rollout_metrics/nemo_gym/resolved/mean"] == 0.5
+    assert metrics["tasks/slow/rollout/rollout_metrics/nemo_gym/resolved/min"] == 1.0
+
+
 def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
     monkeypatch.setattr(single_controller, "Logger", lambda _: object())
     master_config = MasterConfig.model_construct(
@@ -156,6 +184,7 @@ def test_rejects_multiple_optimizer_steps_per_rl_step(monkeypatch) -> None:
         gen_handle=None,
         trainer_handle=None,
         dataloader=None,
+        task_quota={},
         weight_synchronizer=None,
         advantage_estimator=None,
         loss_fn=None,

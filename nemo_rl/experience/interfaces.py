@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from nemo_rl.data.interfaces import LLMMessageLogType, VLMMessageLogType
@@ -58,3 +58,5 @@ class PromptGroupRecord:
     metadata: dict[str, Any]
     completions: list["Completion"]
     rollout_metrics: dict[str, Any]
+    # Raw scalar samples retained for lossless per-task aggregation in SC.
+    rollout_metric_samples: dict[str, list[float]] = field(default_factory=dict)

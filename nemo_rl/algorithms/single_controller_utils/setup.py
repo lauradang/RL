@@ -69,7 +69,13 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.utils import load_dataloader_state, setup_response_data
+from nemo_rl.data.dataloader import FiniteDataloader, FiniteWeightedDataloader
+from nemo_rl.data.utils import (
+    WeightedTaskDatasets,
+    load_dataloader_state,
+    setup_response_data,
+)
+from nemo_rl.data.weights import TaskQuota, compute_quota
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
     DataPlaneClient,
@@ -143,7 +149,8 @@ class SingleControllerActorArgs:
     train_cluster: RayVirtualCluster
     inference_cluster: RayVirtualCluster
     dp_client: DataPlaneClient
-    dataloader: StatefulDataLoader
+    dataloader: FiniteDataloader
+    task_quota: TaskQuota
     weight_synchronizer: WeightSynchronizer
     advantage_estimator: Any
     loss_fn: LossFunction
@@ -696,7 +703,7 @@ def _generation_max_seq_len(generation_config) -> int:
 
 
 def _clamp_max_num_steps(
-    master_config: MasterConfig, dataloader: StatefulDataLoader
+    master_config: MasterConfig, dataloader: FiniteDataloader
 ) -> None:
     """Clamp max_num_steps to max_num_epochs * len(dataloader)."""
     algo_cfg = algo_config(master_config)
@@ -979,16 +986,52 @@ def setup_single_controller(
         "single_controller_utils.setup requires policy.generation in master_config"
     )
 
-    if data_config["use_multiple_dataloader"]:
+    train_configs = data_config["train"]
+    if isinstance(train_configs, dict):
+        train_configs = [train_configs]
+    if any(bool(cfg.get("evaluation_only")) for cfg in train_configs):
         raise NotImplementedError(
-            "single_controller_utils does not support "
-            "data.use_multiple_dataloader=True yet."
+            "SingleController does not support evaluation_only datasets because "
+            "validation is not implemented yet"
         )
     if opd_module.is_opd_enabled(master_config) and processor is not None:
         raise NotImplementedError(
             "SingleController MOPD currently supports text-only teacher inputs. "
             "Use the legacy controller for multimodal MOPD."
         )
+    if data_config["use_multiple_dataloader"]:
+        if is_ppo_run(master_config):
+            raise NotImplementedError(
+                "Weighted multi-dataset SingleController training currently "
+                "supports GRPO only"
+            )
+        missing_weights = [
+            cfg.get("dataset_name", cfg.get("data_path", "<unnamed>"))
+            for cfg in train_configs
+            if not cfg.get("evaluation_only") and cfg.get("weight") is None
+        ]
+        if missing_weights:
+            raise ValueError(
+                "SingleController data.use_multiple_dataloader=true requires an "
+                f"explicit `weight` on every training dataset; missing: {missing_weights}"
+            )
+        grpo_config = cast(GRPOMasterConfig, master_config).grpo
+        if grpo_config.use_dynamic_sampling:
+            raise ValueError(
+                "Weighted multi-dataset SingleController training does not support "
+                "grpo.use_dynamic_sampling=true"
+            )
+        failure_config = master_config.async_rl.rollout_failure
+        if (
+            failure_config.max_skipped_prompts
+            + failure_config.max_consecutive_dropped_prompts
+            > 0
+        ):
+            raise ValueError(
+                "Weighted multi-dataset SingleController training requires "
+                "rollout drop budgets to be zero so every optimizer step can "
+                "satisfy its exact per-task quota"
+            )
 
     checkpointing_pretrained = master_config.checkpointing.get("pretrained_checkpoint")
     if checkpointing_pretrained is not None:
@@ -1043,14 +1086,53 @@ def setup_single_controller(
         )
         assert len(response_data) == 4
         dataset, _val_dataset, env_handles, _val_env_handles = response_data
-    dataloader = StatefulDataLoader(
-        dataset,
-        batch_size=algo_cfg.num_prompts_per_step,
-        shuffle=data_config["shuffle"],
-        collate_fn=rl_collate_fn,
-        drop_last=True,
-        num_workers=data_config["num_workers"],
-    )
+    task_quota: TaskQuota = {}
+    if data_config["use_multiple_dataloader"]:
+        if not isinstance(dataset, WeightedTaskDatasets) or not dataset.weights:
+            raise ValueError(
+                "SingleController data.use_multiple_dataloader=true requires "
+                "an explicit `weight` on every training dataset"
+            )
+        task_quota = compute_quota(algo_cfg.num_prompts_per_step, dataset.weights)
+        zero_quota_tasks = [
+            task_name
+            for task_name, weight in dataset.weights.items()
+            if weight > 0 and task_quota.get(task_name, 0) == 0
+        ]
+        if zero_quota_tasks:
+            raise ValueError(
+                "Every positive-weight dataset must receive at least one prompt "
+                "per step; increase grpo.num_prompts_per_step or adjust weights. "
+                f"Zero-quota tasks: {zero_quota_tasks}"
+            )
+        if sum(task_quota.values()) != algo_cfg.num_prompts_per_step:
+            raise RuntimeError(
+                f"Task quota {task_quota} does not sum to "
+                f"num_prompts_per_step={algo_cfg.num_prompts_per_step}"
+            )
+        task_dataloaders = {
+            task_name: StatefulDataLoader(
+                dataset.datasets[task_name],
+                batch_size=task_quota[task_name],
+                shuffle=data_config["shuffle"],
+                collate_fn=rl_collate_fn,
+                drop_last=True,
+                num_workers=data_config["num_workers"],
+            )
+            for task_name in task_quota
+        }
+        dataloader: FiniteDataloader = FiniteWeightedDataloader(
+            task_dataloaders, task_quota
+        )
+    else:
+        dataloader = StatefulDataLoader(
+            dataset,
+            batch_size=algo_cfg.num_prompts_per_step,
+            shuffle=data_config["shuffle"],
+            collate_fn=rl_collate_fn,
+            drop_last=True,
+            num_workers=data_config["num_workers"],
+        )
     if last_checkpoint_path is not None:
         print(f"📦 Restoring dataloader state from checkpoint: {last_checkpoint_path}")
         load_dataloader_state(dataloader, last_checkpoint_path, data_config)
@@ -1454,6 +1536,7 @@ def setup_single_controller(
         inference_cluster=inference_cluster,
         dp_client=dp_client,
         dataloader=dataloader,
+        task_quota=task_quota,
         weight_synchronizer=weight_synchronizer,
         advantage_estimator=advantage_estimator,
         loss_fn=loss_fn,

@@ -360,6 +360,7 @@ def test_train_pump_drives_mcore_training_step(
             inference_cluster=None,  # type: ignore[arg-type]
             dp_client=dp_client,
             dataloader=None,  # type: ignore[arg-type]  # _rollout_pump not started
+            task_quota={},
             weight_synchronizer=weight_sync,  # type: ignore[arg-type]
             advantage_estimator=adv_est,
             loss_fn=SimpleLossFn(),

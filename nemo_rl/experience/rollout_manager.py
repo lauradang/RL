@@ -43,7 +43,12 @@ from nemo_rl.experience.failures import (
     classify_rollout_failure,
 )
 from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    calculate_single_metric,
+    collect_nemo_gym_metric_samples,
+    pct,
+    summarize_nemo_gym_metric_samples,
+)
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     RolloutRecoveryLedger,
@@ -822,14 +827,23 @@ class AsyncNemoGymRolloutImpl:
 
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
+        health_samples = collect_nemo_gym_metric_samples(
+            [completion.env_extras or {} for completion in completions],
+            message_logs=[completion.message_log for completion in completions],
+        )
+        rollout_metrics.update(summarize_nemo_gym_metric_samples(health_samples))
 
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
             prompt=prompt_message_log,
             extra_env_info=input_sample["extra_env_info"],
-            metadata={"task_name": "nemo_gym"},
+            # Multiple datasets may share the NeMo-Gym environment; preserve
+            # the dataset task so weighted quotas and per-task metrics remain
+            # attributable.
+            metadata={"task_name": input_sample["task_name"]},
             completions=completions,
             rollout_metrics=rollout_metrics,
+            rollout_metric_samples=health_samples,
         )
 
     def _validate_init_params(self) -> None:

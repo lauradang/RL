@@ -1224,6 +1224,7 @@ def test_rollout_pump_writes_expected_tq_data(
         inference_cluster=None,  # type: ignore[arg-type]
         dp_client=dp_adapter,
         dataloader=dataloader,
+        task_quota={},
         weight_synchronizer=object(),  # type: ignore[arg-type]
         advantage_estimator=None,
         loss_fn=None,  # type: ignore[arg-type]

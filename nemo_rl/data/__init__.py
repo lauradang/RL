@@ -38,6 +38,11 @@ class ResponseDatasetConfig(TypedDict):
     video_temporal_patch_size: NotRequired[int]
     video_maintain_aspect_ratio: NotRequired[bool]
     min_generation_tokens: NotRequired[int]
+    # Relative sampling weight. When one train entry sets this, every
+    # non-evaluation entry must set it and use_multiple_dataloader must be true.
+    weight: NotRequired[float]
+    # Register this dataset for evaluation without drawing training prompts.
+    evaluation_only: NotRequired[bool]
 
 
 class PreferenceDatasetConfig(TypedDict):
