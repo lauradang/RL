@@ -438,6 +438,12 @@ class _FakeWeightSynchronizer:
     def shutdown(self) -> None:
         self.shutdown_count += 1
 
+    def blocks_training(self) -> bool:
+        return False
+
+    def wake_carries_weight_updates(self) -> bool:
+        return False
+
 
 class _FakeRolloutManager:
     def __init__(self) -> None:
