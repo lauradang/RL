@@ -685,10 +685,7 @@ def _spinup_gym(
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
         # Ledger config rides into Gym's policy model server.
         token_capture=(
-            {
-                **master_config.token_capture.model_dump(),
-                "generation_backend": generation_config["backend"],
-            }
+            master_config.token_capture.model_dump()
             if master_config.token_capture.enabled
             else None
         ),
@@ -890,6 +887,25 @@ def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
         max_consecutive_dropped_prompts=failure_config.max_consecutive_dropped_prompts,
         max_gym_row_attempts=failure_config.nemo_gym.max_row_attempts,
     )
+
+
+def _raise_missing_nemo_gym_error(error: Exception, backend: str) -> None:
+    """Raise backend-specific remediation for a missing Gym capture extra."""
+    if backend == "megatron":
+        raise RuntimeError(
+            "Megatron token capture requires nemo_gym in the driver environment. "
+            "Launch the driver with `uv run --extra nemo_gym ...` or run "
+            "`uv sync --extra nemo_gym` before rerunning."
+        ) from error
+    # Worker venvs are cached by actor class name (nemo_rl/utils/venvs.py), so a
+    # venv prebuilt before token capture predates the nemo_gym extra and is reused.
+    raise RuntimeError(
+        "vLLM token capture requires nemo_gym in the "
+        "VllmAsyncGenerationWorker environment, but the cached worker venv "
+        "predates it. Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
+        "delete $NEMO_RL_VENV_DIR/nemo_rl.models.generation.vllm."
+        "vllm_worker_async.VllmAsyncGenerationWorker and rerun."
+    ) from error
 
 
 def setup_single_controller(
@@ -1126,8 +1142,9 @@ def setup_single_controller(
             ] = PY_EXECUTABLES.VLLM_GYM
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
-        # per-run control-plane bearer token and the process-shared capture
-        # directory used by every Gym worker.
+        # per-run control-plane bearer token, the process-shared capture
+        # directory used by every Gym worker, and the capture-host backend.
+        token_capture_cfg.generation_backend = generation_config["backend"]
         if token_capture_cfg.control_auth_token is None:
             # Deferred import: only needed on the capture path.
             import secrets
@@ -1707,16 +1724,7 @@ def setup_single_controller(
             )
         except Exception as error:
             if "No module named 'nemo_gym'" in str(error):
-                # Worker venvs are cached by actor class name
-                # (nemo_rl/utils/venvs.py), so a venv prebuilt before token
-                # capture predates the nemo_gym extra and is reused as-is.
-                raise RuntimeError(
-                    "token_capture.enabled requires nemo_gym in the capture "
-                    "host environment, but the cached environment predates it. "
-                    "Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
-                    "delete $NEMO_RL_VENV_DIR/nemo_rl.models.generation.vllm."
-                    "vllm_worker_async.VllmAsyncGenerationWorker and rerun."
-                ) from error
+                _raise_missing_nemo_gym_error(error, generation_config["backend"])
             raise
         generation.set_rollout_weight_version(0)
 

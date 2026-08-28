@@ -240,6 +240,19 @@ _TOKEN_CAPTURE_CONTROL_PREFIX = "/training-token-capture/control"
 _TOKEN_CAPTURE_CONTROL_ENV = "NEMO_GYM_TOKEN_CAPTURE_CONTROL_TOKEN"
 
 
+def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
+    """Map the setup-derived generation backend to Gym's capture backend."""
+    generation_backend = token_capture.get("generation_backend")
+    if generation_backend == "vllm":
+        return "vllm_worker"
+    if generation_backend == "megatron":
+        return "megatron_ledger"
+    raise ValueError(
+        "token_capture.enabled requires setup-derived generation_backend to be "
+        f"'vllm' or 'megatron'; got {generation_backend!r}"
+    )
+
+
 def _detect_invalid_tool_call_and_malformed_thinking(
     output_item_dict: dict[str, Any],
     invalid_tool_call_patterns: list[str] | None = None,
@@ -468,11 +481,6 @@ Depending on your data shape, you may want to change these values."""
         # policy model server (via the policy_model global-config override
         # block the env yamls already use) and disable the legacy token echo.
         token_capture = self.cfg.get("token_capture") or None
-        generation_backend = (
-            token_capture.pop("generation_backend", "vllm")
-            if token_capture is not None
-            else "vllm"
-        )
         self._token_capture_enabled = bool(
             token_capture and token_capture.get("enabled")
         )
@@ -506,11 +514,7 @@ Depending on your data shape, you may want to change these values."""
                 "lineage_store": ("nemo_gym.token_id_capture.lineage:FileLineageStore"),
                 "lineage_store_kwargs": {"root": os.path.join(capture_dir, "lineage")},
                 "external_staging": True,
-                "external_staging_backend": (
-                    "megatron_ledger"
-                    if generation_backend == "megatron"
-                    else "vllm_worker"
-                ),
+                "external_staging_backend": _external_staging_backend(token_capture),
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
             # Gym resolves the credential inside each serving process. Keep
