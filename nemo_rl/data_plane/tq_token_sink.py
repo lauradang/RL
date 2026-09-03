@@ -59,7 +59,8 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
 )
-from nemo_rl.experience.route_assembly import RouteFragment
+from nemo_rl.experience.route_assembly import ROUTE_MISSING_SENTINEL, RouteFragment
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
@@ -347,6 +348,40 @@ class MegatronPayloadStageResult:
     response_metadata: dict[str, Any]
 
 
+def _delta_align_minf_routing_indices(
+    routing_indices: Any,
+    *,
+    total_tokens: int,
+    prev_len: int,
+) -> torch.Tensor:
+    """Convert MInf ``[T - 1, L, K]`` routes to Gym's delta-token layout."""
+    routes = torch.as_tensor(routing_indices)
+    if routes.dim() != 3:
+        raise ValueError(
+            "MInf routing_indices must have shape [tokens, layers, topk], "
+            f"got {tuple(routes.shape)}"
+        )
+    expected_routes = total_tokens - 1
+    if routes.shape[0] != expected_routes:
+        raise ValueError(
+            "MInf routing_indices must contain one row for every non-final token: "
+            f"got {routes.shape[0]}, expected {expected_routes}"
+        )
+    if routes.shape[1] <= 0 or routes.shape[2] <= 0:
+        raise ValueError(
+            "MInf routing_indices layer and top-k dimensions must be positive"
+        )
+    aligned = torch.full(
+        (total_tokens, routes.shape[1], routes.shape[2]),
+        ROUTE_MISSING_SENTINEL,
+        dtype=routes.dtype,
+        device=routes.device,
+    )
+    if expected_routes:
+        aligned[:-1].copy_(routes)
+    return aligned[prev_len:]
+
+
 class TQMegatronPromptPreparer:
     """Resolve a Gym-authorized staged prefix before MInf admits a request."""
 
@@ -505,6 +540,7 @@ class TQMegatronTokenStager:
         prompt_token_ids = getattr(payload, "prompt_token_ids", None)
         generated_token_ids = getattr(payload, "generated_token_ids", None)
         generated_log_probs = getattr(payload, "generated_log_probs", None)
+        routing_indices = getattr(payload, "routing_indices", None)
         if prompt_token_ids is None:
             raise ValueError("MInf offloaded payload carries no prompt_token_ids")
         if generated_token_ids is None:
@@ -516,11 +552,22 @@ class TQMegatronTokenStager:
             admission,
             weight_version=self._weight_version(finished_metadata),
         )
+        prompt_token_ids = [int(token_id) for token_id in prompt_token_ids]
+        generated_token_ids = [int(token_id) for token_id in generated_token_ids]
+        extras = None
+        if routing_indices is not None:
+            routed_experts = _delta_align_minf_routing_indices(
+                routing_indices,
+                total_tokens=len(prompt_token_ids) + len(generated_token_ids),
+                prev_len=admission.prev_len,
+            )
+            extras = {"routed_experts": encode_routed_experts(routed_experts)}
         coords = self._capture.complete_call(
             call,
-            prompt_token_ids=[int(token_id) for token_id in prompt_token_ids],
-            generated_token_ids=[int(token_id) for token_id in generated_token_ids],
+            prompt_token_ids=prompt_token_ids,
+            generated_token_ids=generated_token_ids,
             generated_logprobs=[float(value) for value in generated_log_probs],
+            extras=extras,
         )
         return MegatronPayloadStageResult(
             response_metadata={

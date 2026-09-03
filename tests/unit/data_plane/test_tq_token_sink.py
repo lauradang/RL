@@ -27,6 +27,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
@@ -37,6 +38,7 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
     StagingSource as TokenSourceProtocol,
 )
 
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     STAGING_FIELDS,
     TQMegatronPromptPreparer,
@@ -76,7 +78,7 @@ def test_tq_sink_source_passes_gym_golden_vectors():
 def staging_partition(tq_client):
     tq_client.register_partition(
         partition_id=STAGING_PARTITION,
-        fields=list(STAGING_FIELDS),
+        fields=list(STAGING_FIELDS) + [ROUTED_EXPERTS_FIELD],
         num_samples=64,
         consumer_tasks=["finalize"],
     )
@@ -234,6 +236,14 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
         prompt_token_ids=[10, 11],
         generated_token_ids=[12, 13],
         generated_log_probs=[-0.25, -0.5],
+        routing_indices=torch.tensor(
+            [
+                [[1, 2], [3, 4]],
+                [[5, 6], [7, 8]],
+                [[9, 10], [11, 12]],
+            ],
+            dtype=torch.int32,
+        ),
     )
     admission = nemo_gym.CaptureAdmission(
         rollout_id="minf-r0",
@@ -259,6 +269,42 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
     assert snapshot.token_ids_delta == [10, 11, 12, 13]
     assert snapshot.token_mask_delta == [0.0, 0.0, 1.0, 1.0]
     assert snapshot.generation_log_probs_delta == [0.0, 0.0, -0.25, -0.5]
+    [fetched] = TQTokenSource(
+        tq_client, staging_partition=staging_partition
+    ).fetch_for_finalization(["minf-r0/c1"], include_route_fragments=True)
+    assert fetched.routed_len == 4
+    assert fetched.fragment is not None
+    assert fetched.fragment.routes.tolist() == [
+        [[1, 2], [3, 4]],
+        [[5, 6], [7, 8]],
+        [[9, 10], [11, 12]],
+        [[-1, -1], [-1, -1]],
+    ]
+
+
+def test_megatron_stager_rejects_misaligned_routes(tq_client, staging_partition):
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition)
+    )
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0",
+        model_call_id="c1",
+        mode="text",
+    )
+
+    result = stager.stage(
+        "minf-response-1",
+        SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            generated_token_ids=[12],
+            generated_log_probs=[-0.25],
+            routing_indices=torch.tensor([[[1, 2]]], dtype=torch.int32),
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        request_metadata={"ng_capture": admission.model_dump(mode="json")},
+    )
+
+    assert result is None
 
 
 @pytest.mark.parametrize("prefix_source", ["staging_chain", "capture_admission"])
