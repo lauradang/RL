@@ -1734,7 +1734,11 @@ def setup_single_controller(
         from nemo_rl.data_plane.schema import (
             ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
         )
-        from nemo_rl.data_plane.tq_token_sink import STAGING_FIELDS
+        from nemo_rl.data_plane.tq_token_sink import (
+            MINF_OPTIONAL_PAYLOAD_FIELDS,
+            MINF_PAYLOAD_FIELDS,
+            STAGING_FIELDS,
+        )
 
         r3_enabled = router_replay_enabled(master_config.policy)
         if token_capture_cfg.defer_routed_experts_to_policy and not r3_enabled:
@@ -1747,12 +1751,14 @@ def setup_single_controller(
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
+            + list(MINF_PAYLOAD_FIELDS)
+            + list(MINF_OPTIONAL_PAYLOAD_FIELDS)
             + ([STAGING_ROUTED_EXPERTS_FIELD] if r3_enabled else []),
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
-        # vLLM stages in its serving workers. MInf enables its local ledgers
-        # and installs one driver-side ledger-to-TQ converter.
+        # Both backends stage in serving workers. vLLM writes canonical Gym
+        # rows; MInf writes its raw RequestPayloadStager payload by response UID.
         try:
             generation.setup_token_capture(
                 dp_config, token_capture_cfg.staging_partition

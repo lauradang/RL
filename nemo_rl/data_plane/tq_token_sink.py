@@ -13,13 +13,12 @@
 # limitations under the License.
 """TransferQueue implementations of NeMo-Gym's token staging protocols.
 
-``TQTokenSink``/``TQTokenSource`` are NeMo-RL's providers for the
-ledger-authoritative capture design:
-the sink is the worker-side write of one model call's token delta to the
-``rollout_staging`` partition — the design's only heavy token hop — and the
-source is the finalizer's read-back of those rows by staging key. This module
-is the only hot-path file that knows tokens live in TQ; Gym sees opaque
-staging keys.
+``TQStagingStore`` is NeMo RL's single keyed-row transport for token custody.
+The vLLM-facing ``TQTokenSink`` codec writes canonical Gym call deltas, while
+the MInf-facing ``TQRequestPayloadStager`` codec writes engine-native payloads
+under response UIDs. Their matching sources read the rows back for the
+finalizer. This module is the only hot-path file that knows tokens live in TQ;
+Gym sees opaque staging keys.
 
 Each staged row carries three jagged columns (``token_ids_delta``,
 ``token_mask_delta``, ``generation_logprobs_delta``), the complete receipt
@@ -33,8 +32,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import ray
 import torch
@@ -84,6 +84,23 @@ STAGING_FIELDS = [
     ROUTED_LEN_FIELD,
 ]
 
+# MInf's RequestPayloadStager writes the engine-native completion payload
+# immediately, before the stripped HTTP response is released.  These columns
+# intentionally live in the same partition as the canonical vLLM rows: only
+# one backend is active in a run, and finalization selects the corresponding
+# schema explicitly.
+MINF_PAYLOAD_FIELDS = [
+    "minf_prompt_token_ids",
+    "minf_generated_token_ids",
+    "minf_generated_logprobs",
+    "minf_weight_version",
+]
+MINF_OPTIONAL_PAYLOAD_FIELDS = [
+    "minf_prompt_logprobs",
+    "minf_routing_indices",
+    "minf_routing_shape",
+]
+
 _ROUTE_ENCODING_NONE = 0
 _ROUTE_ENCODING_ENVELOPE = 1
 _ROUTE_ENCODING_LIST = 2
@@ -114,6 +131,19 @@ class FetchedStagedCall:
     routed_len: int
 
 
+@dataclass(frozen=True)
+class FetchedMInfPayload:
+    """One MInf request payload read from TQ by its response UID."""
+
+    request_uid: str
+    prompt_token_ids: list[int]
+    generated_token_ids: list[int]
+    generated_log_probs: list[float]
+    prompt_log_probs: list[float] | None
+    routing_indices: torch.Tensor | None
+    weight_version: int
+
+
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
     """Call a DataPlaneClient method on a local client or a Ray actor handle."""
     method = getattr(dp_client, method_name)
@@ -121,6 +151,185 @@ def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
     if remote is not None:
         return ray.get(remote(**kwargs))
     return method(**kwargs)
+
+
+class TQStagingStore:
+    """Shared keyed-row transport for all token-capture TQ codecs."""
+
+    def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
+        self._dp_client = dp_client
+        self._staging_partition = staging_partition
+
+    def put(
+        self,
+        key: str,
+        field_dict: dict[str, torch.Tensor],
+        *,
+        tags: dict[str, Any] | None = None,
+    ) -> None:
+        _call_dp(
+            self._dp_client,
+            "put_samples",
+            sample_ids=[key],
+            partition_id=self._staging_partition,
+            fields=TensorDict(field_dict, batch_size=[1]),
+            tags=[tags or {}],
+        )
+
+    def get(self, keys: list[str], *, select_fields: list[str]) -> TensorDict:
+        return _call_dp(
+            self._dp_client,
+            "get_samples",
+            sample_ids=list(keys),
+            partition_id=self._staging_partition,
+            select_fields=list(select_fields),
+        )
+
+    def clear(self, keys: list[str]) -> None:
+        if not keys:
+            return
+        _call_dp(
+            self._dp_client,
+            "clear_samples",
+            sample_ids=list(keys),
+            partition_id=self._staging_partition,
+        )
+
+
+class TQRequestPayloadStager:
+    """MInf ``RequestPayloadStager`` backed by the shared TQ row store.
+
+    MInf's protocol has no failure return value.  Consequently ``stage``
+    deliberately propagates TQ failures: the engine must not acknowledge a
+    stripped response unless its payload is durable.
+    """
+
+    def __init__(
+        self,
+        store: TQStagingStore,
+        *,
+        weight_version: int = 0,
+        weight_version_fn: Callable[[str], int] | None = None,
+    ) -> None:
+        self._store = store
+        self._weight_version = 0
+        self._weight_version_fn = weight_version_fn
+        self._lock = threading.Lock()
+        self.set_weight_version(weight_version)
+
+    def set_weight_version(self, version: int) -> None:
+        if type(version) is not int or version < 0:
+            raise ValueError(
+                f"rollout weight version must be a non-negative int, got {version!r}"
+            )
+        with self._lock:
+            self._weight_version = version
+
+    def stage(self, uid: str, payload: Any) -> None:
+        if not isinstance(uid, str) or not uid:
+            raise ValueError("MInf request UID must be a non-empty string")
+        prompt_token_ids = getattr(payload, "prompt_token_ids", None)
+        generated_token_ids = getattr(payload, "generated_token_ids", None)
+        generated_log_probs = getattr(payload, "generated_log_probs", None)
+        if prompt_token_ids is None:
+            raise ValueError("MInf offloaded payload carries no prompt_token_ids")
+        if generated_token_ids is None:
+            raise ValueError("MInf offloaded payload carries no generated_token_ids")
+        if generated_log_probs is None:
+            raise ValueError("MInf offloaded payload carries no generated_log_probs")
+        if len(generated_token_ids) != len(generated_log_probs):
+            raise ValueError(
+                "MInf generated token and log-probability lengths differ: "
+                f"{len(generated_token_ids)} != {len(generated_log_probs)}"
+            )
+
+        prompt_log_probs = getattr(payload, "prompt_log_probs", None)
+        routing_indices = getattr(payload, "routing_indices", None)
+        routing = None
+        routing_shape = None
+        if routing_indices is not None:
+            routing = torch.as_tensor(routing_indices)
+            if routing.dim() != 3:
+                raise ValueError(
+                    "MInf routing_indices must have shape [tokens, layers, topk], "
+                    f"got {tuple(routing.shape)}"
+                )
+            routing_shape = tuple(int(size) for size in routing.shape)
+            routing = routing.to(dtype=torch.int32).reshape(-1)
+
+        with self._lock:
+            weight_version = (
+                self._weight_version_fn(uid)
+                if self._weight_version_fn is not None
+                else self._weight_version
+            )
+            if type(weight_version) is not int or weight_version < 0:
+                raise ValueError(
+                    "MInf payload weight version must be a non-negative int, "
+                    f"got {weight_version!r}"
+                )
+            fields = {
+                "minf_prompt_token_ids": torch.tensor(
+                    [list(prompt_token_ids)], dtype=torch.int64
+                ),
+                "minf_generated_token_ids": torch.tensor(
+                    [list(generated_token_ids)], dtype=torch.int64
+                ),
+                "minf_generated_logprobs": torch.tensor(
+                    [list(generated_log_probs)], dtype=torch.float32
+                ),
+                "minf_weight_version": torch.tensor(
+                    [weight_version], dtype=torch.int64
+                ),
+            }
+            if prompt_log_probs is not None:
+                fields["minf_prompt_logprobs"] = torch.tensor(
+                    [list(prompt_log_probs)], dtype=torch.float32
+                )
+            if routing is not None and routing_shape is not None:
+                fields["minf_routing_indices"] = routing.unsqueeze(0)
+                fields["minf_routing_shape"] = torch.tensor(
+                    [routing_shape], dtype=torch.int64
+                )
+            self._store.put(
+                uid,
+                fields,
+                tags={
+                    "payload_kind": "minf_request",
+                    "request_uid": uid,
+                    "weight_version": weight_version,
+                },
+            )
+
+
+class TQMInfPayloadSource:
+    """Fetch MInf request payloads from TQ by response UID."""
+
+    def __init__(self, store: TQStagingStore) -> None:
+        self._store = store
+
+    def fetch(self, request_uids: list[str]) -> list[FetchedMInfPayload]:
+        if not request_uids:
+            return []
+        if len(set(request_uids)) != len(request_uids):
+            raise KeyError("MInf payload request contains duplicate UIDs")
+        try:
+            rows = self._store.get(
+                request_uids, select_fields=list(MINF_PAYLOAD_FIELDS)
+            )
+        except Exception as error:  # noqa: BLE001 — normalize storage misses
+            raise KeyError(
+                f"MInf payload rows for {len(request_uids)} UIDs could not be fetched: {error}"
+            ) from error
+        n_rows = int(rows.batch_size[0]) if len(rows.batch_size) else 0
+        if n_rows != len(request_uids):
+            raise KeyError(
+                f"MInf payload rows missing: requested {len(request_uids)}, got {n_rows}"
+            )
+        return [
+            _row_to_minf_payload(uid, _select_row(rows, index))
+            for index, uid in enumerate(request_uids)
+        ]
 
 
 class TQTokenSink:
@@ -134,8 +343,7 @@ class TQTokenSink:
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
-        self._dp_client = dp_client
-        self._staging_partition = staging_partition
+        self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
 
     def stage(self, record: StagedCallRecord) -> StageResult:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
@@ -247,7 +455,6 @@ class TQTokenSink:
                 [routed_encoding], dtype=torch.int64
             )
             field_dict[ROUTED_LEN_FIELD] = torch.tensor([routed_len], dtype=torch.int64)
-            fields = TensorDict(field_dict, batch_size=[1])
             tags = [
                 {
                     "rollout_id": record.rollout_id,
@@ -261,14 +468,7 @@ class TQTokenSink:
                     "schema_version": record.schema_version,
                 }
             ]
-            _call_dp(
-                self._dp_client,
-                "put_samples",
-                sample_ids=[key],
-                partition_id=self._staging_partition,
-                fields=fields,
-                tags=tags,
-            )
+            self._store.put(key, field_dict, tags=tags[0])
         except Exception as error:  # noqa: BLE001 — any failure must poison, not crash serving
             # The reason string is dropped downstream (_failed_coords carries
             # only the disposition) — this log line is the only place the
@@ -286,14 +486,7 @@ class TQTokenSink:
 
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""
-        if not staging_keys:
-            return
-        _call_dp(
-            self._dp_client,
-            "clear_samples",
-            sample_ids=list(staging_keys),
-            partition_id=self._staging_partition,
-        )
+        self._store.clear(staging_keys)
 
 
 class TQTokenSource:
@@ -311,7 +504,7 @@ class TQTokenSource:
     """
 
     def __init__(self, dp_client: Any, *, staging_partition: str) -> None:
-        self._dp_client = dp_client
+        self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
         self._staging_partition = staging_partition
 
     def fetch(self, staging_keys: list[str]) -> list[StagedCallSnapshot]:
@@ -323,21 +516,12 @@ class TQTokenSource:
             # try the extended selection first, fall back to the base
             # schema so extras-free rows keep fetching.
             try:
-                rows = _call_dp(
-                    self._dp_client,
-                    "get_samples",
-                    sample_ids=list(staging_keys),
-                    partition_id=self._staging_partition,
+                rows = self._store.get(
+                    staging_keys,
                     select_fields=STAGING_FIELDS + [ROUTED_EXPERTS_FIELD],
                 )
             except Exception:  # noqa: BLE001 — field-not-present probe
-                rows = _call_dp(
-                    self._dp_client,
-                    "get_samples",
-                    sample_ids=list(staging_keys),
-                    partition_id=self._staging_partition,
-                    select_fields=STAGING_FIELDS,
-                )
+                rows = self._store.get(staging_keys, select_fields=STAGING_FIELDS)
         except Exception as error:  # noqa: BLE001 — protocol maps any miss to KeyError
             raise KeyError(
                 f"staged rows for {len(staging_keys)} keys could not be "
@@ -372,11 +556,8 @@ class TQTokenSource:
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("prefix fetch: staging_keys contains duplicates")
         try:
-            rows = _call_dp(
-                self._dp_client,
-                "get_samples",
-                sample_ids=list(staging_keys),
-                partition_id=self._staging_partition,
+            rows = self._store.get(
+                staging_keys,
                 select_fields=["token_ids_delta"],
             )
         except Exception as error:  # noqa: BLE001 — protocol maps any miss to KeyError
@@ -405,13 +586,7 @@ class TQTokenSource:
         if len(set(staging_keys)) != len(staging_keys):
             raise KeyError("finalization staging request contains duplicate keys")
         try:
-            rows = _call_dp(
-                self._dp_client,
-                "get_samples",
-                sample_ids=list(staging_keys),
-                partition_id=self._staging_partition,
-                select_fields=STAGING_FIELDS,
-            )
+            rows = self._store.get(staging_keys, select_fields=STAGING_FIELDS)
         except Exception as error:  # noqa: BLE001 — protocol maps misses to KeyError
             raise KeyError(
                 f"staged rows for {len(staging_keys)} keys could not be "
@@ -453,6 +628,36 @@ def _select_row(rows: TensorDict, index: int) -> dict[str, torch.Tensor]:
     for field in rows.keys():
         row[str(field)] = rows.get(field)[index].unsqueeze(0)
     return row
+
+
+def _row_to_minf_payload(
+    request_uid: str, row: dict[str, torch.Tensor]
+) -> FetchedMInfPayload:
+    """Decode one raw MInf row while preserving float32 wire values."""
+
+    def _values(name: str) -> torch.Tensor:
+        value = row[name]
+        tensor = value[0] if value.dim() > 1 or value.numel() > 1 else value
+        return tensor.reshape(-1)
+
+    return FetchedMInfPayload(
+        request_uid=request_uid,
+        prompt_token_ids=[
+            int(value) for value in _values("minf_prompt_token_ids").tolist()
+        ],
+        generated_token_ids=[
+            int(value) for value in _values("minf_generated_token_ids").tolist()
+        ],
+        generated_log_probs=[
+            float(value) for value in _values("minf_generated_logprobs").tolist()
+        ],
+        # Optional prompt logprobs/routes remain durable when MInf supplies
+        # them, but current Gym finalization neither selects nor consumes
+        # them (MInf router replay is rejected during setup).
+        prompt_log_probs=None,
+        routing_indices=None,
+        weight_version=_row_scalar_int(row, "minf_weight_version"),
+    )
 
 
 def _row_to_snapshot(row: Any, *, include_routes: bool) -> StagedCallSnapshot:

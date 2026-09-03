@@ -18,7 +18,7 @@ import os
 import threading
 import time
 import warnings
-from typing import AsyncGenerator, Optional
+from typing import TYPE_CHECKING, AsyncGenerator, Optional
 
 import requests
 import torch
@@ -70,6 +70,9 @@ from nemo_rl.models.megatron.memory_saver import (
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 
+if TYPE_CHECKING:
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
+
 
 class MegatronGenerationMixin:
     """Engine lifecycle, coordinator, HTTP server, and finish-generation machinery.
@@ -112,6 +115,7 @@ class MegatronGenerationMixin:
         self._inference_loop = None
         self._inference_thread = None
         self._token_capture_enabled = False
+        self._request_payload_stager = None
 
     def _setup_colocated_cuda_graph_managers(self) -> None:
         """Create inference CUDA-graph managers for shared-model colocated generation.
@@ -606,8 +610,10 @@ class MegatronGenerationMixin:
         """Return this worker's OpenAI server base URL (None if not the leader)."""
         return self.base_url
 
-    def setup_token_capture(self) -> bool:
-        """Enable MInf's local offload ledger on this engine rank."""
+    def setup_token_capture(
+        self, dp_cfg: "DataPlaneConfig", staging_partition: str
+    ) -> bool:
+        """Install the TQ payload stager on each MInf model-parallel leader."""
         engine = self.dynamic_inference_engine
         if engine is None:
             raise RuntimeError(
@@ -616,21 +622,68 @@ class MegatronGenerationMixin:
         missing = [
             name
             for name in (
+                "payload_stager",
                 "local_metadata_ledger_enabled",
-                "local_metadata_ledger_offload_enabled",
-                "fetch_from_metadata_ledger",
+                "local_metadata_ledger",
             )
             if not hasattr(engine, name)
         ]
         if missing:
             raise RuntimeError(
-                "Megatron token capture requires the MInf ledger-capture API; "
-                f"missing {', '.join(missing)}"
+                "Megatron token capture requires MInf RequestPayloadStager and "
+                f"per-request epoch metadata support; missing {', '.join(missing)}"
             )
         engine.local_metadata_ledger_enabled = True
-        engine.local_metadata_ledger_offload_enabled = True
         self._token_capture_enabled = True
+        if not engine.is_mp_coordinator:
+            return False
+
+        from nemo_rl.data_plane import build_data_plane_client
+        from nemo_rl.data_plane.tq_token_sink import (
+            TQRequestPayloadStager,
+            TQStagingStore,
+        )
+
+        dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+        stager = TQRequestPayloadStager(
+            TQStagingStore(dp_client, staging_partition=staging_partition),
+            weight_version_fn=self._pop_payload_weight_version,
+        )
+        engine.payload_stager = stager
+        self._request_payload_stager = stager
         return True
+
+    def _pop_payload_weight_version(self, request_uid: str) -> int:
+        """Consume the exact engine epoch recorded for one completed request."""
+        engine = self.dynamic_inference_engine
+        if engine is None:
+            raise RuntimeError("Megatron inference engine is not initialized")
+        record = engine.local_metadata_ledger.pop(request_uid, None)
+        if record is None:
+            raise RuntimeError(
+                f"MInf request {request_uid!r} carries no policy epoch metadata"
+            )
+        policy_epoch = record.policy_epoch
+        if not isinstance(policy_epoch, list) or not policy_epoch:
+            raise ValueError(
+                f"MInf request {request_uid!r} carries no policy_epoch boundaries"
+            )
+        try:
+            versions = {int(boundary[1]) for boundary in policy_epoch}
+        except (IndexError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"MInf request {request_uid!r} has invalid policy_epoch metadata"
+            ) from error
+        if len(versions) != 1:
+            raise ValueError(
+                f"MInf request {request_uid!r} spans policy epochs {sorted(versions)}"
+            )
+        (version,) = versions
+        if version < 0:
+            raise ValueError(
+                f"MInf request {request_uid!r} has negative policy epoch {version}"
+            )
+        return version
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Stamp subsequent MInf requests with the trainer weight version."""
@@ -638,9 +691,13 @@ class MegatronGenerationMixin:
             raise ValueError(
                 f"rollout weight version must be a non-negative int, got {version!r}"
             )
+        if not self._token_capture_enabled:
+            raise RuntimeError("Megatron token capture is not initialized")
+        if self._request_payload_stager is not None:
+            self._request_payload_stager.set_weight_version(version)
         if torch.distributed.get_rank() != 0:
             return
-        if not self._token_capture_enabled or self.inference_client is None:
+        if self.inference_client is None:
             raise RuntimeError("Megatron token capture is not initialized")
         setter = getattr(self.inference_client, "set_generation_epoch", None)
         if not callable(setter):
@@ -648,45 +705,6 @@ class MegatronGenerationMixin:
                 "Megatron token capture requires InferenceClient.set_generation_epoch"
             )
         setter(version)
-
-    @staticmethod
-    def _serialize_token_capture_record(record) -> dict:
-        """Convert an MInf ``FinishedRequestRecord`` into Ray-safe plain data."""
-        routes = record.routing_indices
-        if routes is not None:
-            routes = routes.tolist() if hasattr(routes, "tolist") else list(routes)
-        return {
-            "policy_epoch": record.policy_epoch,
-            "kv_cache_epoch": record.kv_cache_epoch,
-            "num_evictions": int(record.num_evictions),
-            "prompt_token_ids": record.prompt_token_ids,
-            "generated_token_ids": record.generated_token_ids,
-            "generated_log_probs": record.generated_log_probs,
-            "prompt_log_probs": record.prompt_log_probs,
-            "routing_indices": routes,
-        }
-
-    def fetch_token_capture_records(self, request_uids: list[str]) -> dict[str, dict]:
-        """Read requested MInf ledger rows without relinquishing custody."""
-        if not self._token_capture_enabled or self.dynamic_inference_engine is None:
-            raise RuntimeError("Megatron token capture is not initialized")
-        found = self.dynamic_inference_engine.fetch_from_metadata_ledger(
-            request_uids, pop=False
-        )
-        return {
-            uid: self._serialize_token_capture_record(record)
-            for uid, record in found.items()
-        }
-
-    def discard_token_capture_records(self, request_uids: list[str]) -> int:
-        """Delete ledger rows after their whole rollout is durable in TQ."""
-        if not self._token_capture_enabled or self.dynamic_inference_engine is None:
-            raise RuntimeError("Megatron token capture is not initialized")
-        return len(
-            self.dynamic_inference_engine.fetch_from_metadata_ledger(
-                request_uids, pop=True
-            )
-        )
 
     def _build_sampling_params(
         self, greedy: bool, stop_words: Optional[list[str]]
