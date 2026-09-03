@@ -57,8 +57,8 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
     generation = config.get("generation") or {}
     megatron_cfg = config.get("megatron_cfg") or {}
 
-    if generation.get("backend") != "vllm":
-        raise ValueError("router_replay.enabled requires vLLM generation.")
+    if generation.get("backend") not in ("vllm", "megatron"):
+        raise ValueError("router_replay.enabled requires vLLM or Megatron generation.")
     if not megatron_cfg.get("enabled", False):
         raise ValueError("router_replay.enabled requires the Megatron policy backend.")
 

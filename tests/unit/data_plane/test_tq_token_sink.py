@@ -23,6 +23,7 @@ protocol edges the kit does not cover (missing keys, stage failure shape).
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -215,19 +216,25 @@ def test_minf_payload_stager_round_trips_through_shared_store(tq_client):
         generated_token_ids=[12, 13],
         generated_log_probs=[-0.25, -0.5],
         prompt_log_probs=None,
-        routing_indices=torch.tensor([[[1, 2]], [[3, 4]]]),
+        routing_indices=torch.tensor([[[1, 2]], [[3, 4]], [[5, 6]]]),
     )
     try:
         stager.stage("minf-1", payload)
         stager.set_weight_version(4)
         stager.stage("minf-2", payload)
 
-        fetched = TQMInfPayloadSource(store).fetch(["minf-1", "minf-2"])
+        fetched = TQMInfPayloadSource(store).fetch(
+            ["minf-1", "minf-2"], include_routing_indices=True
+        )
         assert [item.request_uid for item in fetched] == ["minf-1", "minf-2"]
         assert [item.weight_version for item in fetched] == [3, 4]
         assert fetched[0].prompt_token_ids == [10, 11]
         assert fetched[0].generated_token_ids == [12, 13]
         assert fetched[0].generated_log_probs == [-0.25, -0.5]
+        assert torch.equal(
+            fetched[0].routing_indices,
+            torch.tensor([[[1, 2]], [[3, 4]], [[5, 6]]], dtype=torch.int32),
+        )
     finally:
         tq_client.clear_samples(sample_ids=None, partition_id=partition)
 
@@ -248,4 +255,20 @@ def test_minf_payload_stager_propagates_tq_failures() -> None:
         routing_indices=None,
     )
     with pytest.raises(RuntimeError, match="controller down"):
+        stager.stage("uid", payload)
+
+
+def test_minf_payload_stager_rejects_misaligned_routes() -> None:
+    stager = TQRequestPayloadStager(
+        TQStagingStore(MagicMock(), staging_partition="staging")
+    )
+    payload = SimpleNamespace(
+        prompt_token_ids=[1, 2],
+        generated_token_ids=[3],
+        generated_log_probs=[-0.1],
+        prompt_log_probs=None,
+        routing_indices=torch.tensor([[[0, 1]]]),
+    )
+
+    with pytest.raises(ValueError, match="every non-final token"):
         stager.stage("uid", payload)

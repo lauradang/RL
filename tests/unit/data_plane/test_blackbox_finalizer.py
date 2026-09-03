@@ -213,6 +213,92 @@ def test_finalize_rollout_rebuilds_uid_keyed_minf_payloads(tq_client, partitions
     assert (row.min_wv, row.max_wv) == (7, 7)
 
 
+def test_finalize_rollout_delta_aligns_minf_routing_indices(tq_client, partitions):
+    root_tokens = [10, 11, 12]
+    child_delta = [13, 14]
+    root_chain_hash = compute_chain_hash(None, root_tokens)
+    child_chain_hash = compute_chain_hash(root_chain_hash, child_delta)
+    receipt = {
+        "rollout_id": "minf-routes",
+        "reward": 1.0,
+        "terminal_model_call_id": "c2",
+        "manifest": [],
+        "pending_manifest": [
+            {
+                "model_call_id": "c1",
+                "parent_call_id": None,
+                "mode": "text",
+                "prev_len": 0,
+                "delta_len": 3,
+                "cum_len": 3,
+                "ledger_request_uid": "minf-routes-1",
+                "chain_hash": root_chain_hash,
+                "cumulative_hash": hash_token_ids(root_tokens),
+                "response_id": "minf-routes-1",
+            },
+            {
+                "model_call_id": "c2",
+                "parent_call_id": "c1",
+                "mode": "token_in",
+                "prev_len": 3,
+                "delta_len": 2,
+                "cum_len": 5,
+                "ledger_request_uid": "minf-routes-2",
+                "chain_hash": child_chain_hash,
+                "cumulative_hash": hash_token_ids(root_tokens + child_delta),
+                "response_id": "minf-routes-2",
+            },
+        ],
+        "capture_poisoned": False,
+        "failure_reason": None,
+        "terminal_selection": "declared",
+    }
+    stager = TQRequestPayloadStager(
+        TQStagingStore(tq_client, staging_partition=STAGING_PARTITION),
+        weight_version=7,
+    )
+    stager.stage(
+        "minf-routes-1",
+        SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            generated_token_ids=[12],
+            generated_log_probs=[-0.25],
+            prompt_log_probs=None,
+            routing_indices=torch.tensor([[[10, 11], [12, 13]], [[20, 21], [22, 23]]]),
+        ),
+    )
+    stager.stage(
+        "minf-routes-2",
+        SimpleNamespace(
+            prompt_token_ids=root_tokens + [13],
+            generated_token_ids=[14],
+            generated_log_probs=[-0.5],
+            prompt_log_probs=None,
+            routing_indices=torch.tensor(
+                [
+                    [[10, 11], [12, 13]],
+                    [[20, 21], [22, 23]],
+                    [[30, 31], [32, 33]],
+                    [[40, 41], [42, 43]],
+                ]
+            ),
+        ),
+    )
+
+    row = _finalizer(tq_client, router_replay_enabled=True).finalize_rollout(
+        "minf-routes", receipt, reward=1.0
+    )
+
+    assert row.valid, row.rejection_reason
+    assert row.routed_experts == [
+        [[10, 11], [12, 13]],
+        [[20, 21], [22, 23]],
+        [[-1, -1], [-1, -1]],
+        [[40, 41], [42, 43]],
+        [[-1, -1], [-1, -1]],
+    ]
+
+
 def test_finalize_rollout_rejections(tq_client, partitions):
     finalizer = _finalizer(tq_client)
     assert (

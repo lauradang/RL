@@ -872,6 +872,16 @@ class TestSetup:
             ("megatron_dtensor_trainer", ValueError, "megatron_cfg.enabled"),
             ("megatron_colocated_small_buffer", ValueError, "max_buffered_rollouts"),
             ("megatron_gym_without_http_server", ValueError, "expose_http_server"),
+            (
+                "megatron_routes_without_capture",
+                ValueError,
+                "router replay requires token_capture.enabled",
+            ),
+            (
+                "megatron_deferred_routes",
+                NotImplementedError,
+                "defer_routed_experts_to_policy",
+            ),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
         ],
     )
@@ -882,7 +892,11 @@ class TestSetup:
         match: str,
         patched_factories,
     ):
-        use_gym = invalid_case in ("megatron_gym_without_http_server", "gym_on_sglang")
+        use_gym = invalid_case in (
+            "megatron_gym_without_http_server",
+            "megatron_deferred_routes",
+            "gym_on_sglang",
+        )
         if invalid_case == "min_groups":
             mc = _make_master_config()
             mc.async_rl.min_groups_for_streaming_train = 5
@@ -927,6 +941,16 @@ class TestSetup:
             mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = (
                 False
             )
+        elif invalid_case == "megatron_routes_without_capture":
+            mc = _make_master_config(
+                colocated=False, backend="megatron", megatron_enabled=True
+            )
+            mc.policy["router_replay"] = {"enabled": True}
+        elif invalid_case == "megatron_deferred_routes":
+            mc = self._make_gym_megatron_config()
+            mc.token_capture.enabled = True
+            mc.token_capture.defer_routed_experts_to_policy = True
+            mc.policy["router_replay"] = {"enabled": True}
         elif invalid_case == "gym_on_sglang":
             mc = _make_master_config(colocated=True, backend="sglang")
         else:  # pragma: no cover

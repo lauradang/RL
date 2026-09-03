@@ -1147,6 +1147,15 @@ def setup_single_controller(
     # give capture-enabled vLLM workers a venv that carries nemo_gym (the
     # worker hosts Gym's capture core + adapter in-process).
     token_capture_cfg = master_config.token_capture
+    if (
+        generation_config["backend"] == "megatron"
+        and router_replay_enabled(master_config.policy)
+        and not token_capture_cfg.enabled
+    ):
+        raise ValueError(
+            "Megatron router replay requires token_capture.enabled=true so "
+            "MInf routing indices can be joined with Gym lineage"
+        )
     if rollout_checkpoint_cfg.interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
@@ -1197,10 +1206,14 @@ def setup_single_controller(
                     "Megatron token capture requires policy.generation."
                     "mcore_generation_config.expose_http_server=true"
                 )
-            if router_replay_enabled(master_config.policy):
+            if (
+                router_replay_enabled(master_config.policy)
+                and token_capture_cfg.defer_routed_experts_to_policy
+            ):
                 raise NotImplementedError(
-                    "Megatron token capture does not yet support router replay: "
-                    "MInf ledger routes are not delta-token aligned"
+                    "Megatron token capture does not support "
+                    "token_capture.defer_routed_experts_to_policy yet; MInf "
+                    "routing indices are aligned in the CPU finalizer"
                 )
         else:
             from nemo_rl.distributed.ray_actor_environment_registry import (

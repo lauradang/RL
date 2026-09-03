@@ -57,11 +57,49 @@ from nemo_rl.experience.route_plan import (
     encoded_route_plan_size_bytes,
 )
 from nemo_rl.experience.row_dump import maybe_dump_train_rows
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 # Keep the finalizer importable in its CPU-only actor without importing the
 # generation package (which eagerly loads backend dependencies). This value is
 # the shared router-replay missing-route wire sentinel.
 _ROUTED_EXPERTS_SENTINEL = -1
+
+
+def _delta_align_minf_routing_indices(
+    routing_indices: torch.Tensor,
+    *,
+    request_uid: str,
+    total_tokens: int,
+    prev_len: int,
+    delta_len: int,
+) -> torch.Tensor:
+    """Convert MInf ``[T - 1, L, K]`` routes to Gym's delta-token layout."""
+    if routing_indices.dim() != 3:
+        raise ValueError(
+            f"MInf request {request_uid!r} routing indices must be rank 3, "
+            f"got {tuple(routing_indices.shape)}"
+        )
+    expected_routes = total_tokens - 1
+    if routing_indices.shape[0] != expected_routes:
+        raise ValueError(
+            f"MInf request {request_uid!r} has {routing_indices.shape[0]} route "
+            f"rows for {total_tokens} tokens; expected {expected_routes}"
+        )
+    aligned = torch.full(
+        (total_tokens, routing_indices.shape[1], routing_indices.shape[2]),
+        _ROUTED_EXPERTS_SENTINEL,
+        dtype=routing_indices.dtype,
+        device=routing_indices.device,
+    )
+    if expected_routes:
+        aligned[:-1].copy_(routing_indices)
+    delta = aligned[prev_len:]
+    if delta.shape[0] != delta_len:
+        raise ValueError(
+            f"MInf request {request_uid!r} route delta has {delta.shape[0]} rows; "
+            f"HTTP lineage requires {delta_len}"
+        )
+    return delta
 
 
 @dataclass(frozen=True)
@@ -274,7 +312,10 @@ class BlackboxFinalizer:
         request_uids = [record.ledger_request_uid for record in pending]
         if len(request_uids) != len(set(request_uids)):
             raise ValueError("pending_manifest contains duplicate MInf request UIDs")
-        payloads = self._minf_source.fetch(request_uids)
+        payloads = self._minf_source.fetch(
+            request_uids,
+            include_routing_indices=self._router_replay_enabled,
+        )
 
         class _MemorySink:
             def __init__(self) -> None:
@@ -320,11 +361,30 @@ class BlackboxFinalizer:
                 parent_chain_hash=parent_chain_hash,
             )
             call = capture.begin_call(admission, weight_version=payload.weight_version)
+            extras = None
+            if self._router_replay_enabled:
+                if payload.routing_indices is None:
+                    raise ValueError(
+                        f"MInf request {record.ledger_request_uid!r} carries no "
+                        "routing indices while router replay is enabled"
+                    )
+                total_tokens = len(payload.prompt_token_ids) + len(
+                    payload.generated_token_ids
+                )
+                routed_experts = _delta_align_minf_routing_indices(
+                    payload.routing_indices,
+                    request_uid=record.ledger_request_uid,
+                    total_tokens=total_tokens,
+                    prev_len=record.prev_len,
+                    delta_len=record.delta_len,
+                )
+                extras = {"routed_experts": encode_routed_experts(routed_experts)}
             coords = capture.complete_call(
                 call,
                 prompt_token_ids=payload.prompt_token_ids,
                 generated_token_ids=payload.generated_token_ids,
                 generated_logprobs=payload.generated_log_probs,
+                extras=extras,
             )
             if coords.disposition != "staged":
                 raise ValueError(
