@@ -254,6 +254,17 @@ class TQRequestPayloadStager:
                     "MInf routing_indices must have shape [tokens, layers, topk], "
                     f"got {tuple(routing.shape)}"
                 )
+            expected_routes = len(prompt_token_ids) + len(generated_token_ids) - 1
+            if routing.shape[0] != expected_routes:
+                raise ValueError(
+                    "MInf routing_indices must contain one row for every "
+                    "non-final token: "
+                    f"got {routing.shape[0]}, expected {expected_routes}"
+                )
+            if routing.shape[1] <= 0 or routing.shape[2] <= 0:
+                raise ValueError(
+                    "MInf routing_indices layer and top-k dimensions must be positive"
+                )
             routing_shape = tuple(int(size) for size in routing.shape)
             routing = routing.to(dtype=torch.int32).reshape(-1)
 
@@ -308,15 +319,18 @@ class TQMInfPayloadSource:
     def __init__(self, store: TQStagingStore) -> None:
         self._store = store
 
-    def fetch(self, request_uids: list[str]) -> list[FetchedMInfPayload]:
+    def fetch(
+        self, request_uids: list[str], *, include_routing_indices: bool = False
+    ) -> list[FetchedMInfPayload]:
         if not request_uids:
             return []
         if len(set(request_uids)) != len(request_uids):
             raise KeyError("MInf payload request contains duplicate UIDs")
+        select_fields = list(MINF_PAYLOAD_FIELDS)
+        if include_routing_indices:
+            select_fields.extend(["minf_routing_indices", "minf_routing_shape"])
         try:
-            rows = self._store.get(
-                request_uids, select_fields=list(MINF_PAYLOAD_FIELDS)
-            )
+            rows = self._store.get(request_uids, select_fields=select_fields)
         except Exception as error:  # noqa: BLE001 — normalize storage misses
             raise KeyError(
                 f"MInf payload rows for {len(request_uids)} UIDs could not be fetched: {error}"
@@ -640,6 +654,26 @@ def _row_to_minf_payload(
         tensor = value[0] if value.dim() > 1 or value.numel() > 1 else value
         return tensor.reshape(-1)
 
+    routing_indices = None
+    if "minf_routing_indices" in row or "minf_routing_shape" in row:
+        if not {"minf_routing_indices", "minf_routing_shape"}.issubset(row):
+            raise ValueError(
+                f"MInf request {request_uid!r} has an incomplete routing payload"
+            )
+        shape = tuple(int(value) for value in _values("minf_routing_shape").tolist())
+        if len(shape) != 3 or any(size <= 0 for size in shape):
+            raise ValueError(
+                f"MInf request {request_uid!r} has invalid routing shape {shape}"
+            )
+        flat_routing = _values("minf_routing_indices").to(dtype=torch.int32)
+        expected_elements = shape[0] * shape[1] * shape[2]
+        if flat_routing.numel() != expected_elements:
+            raise ValueError(
+                f"MInf request {request_uid!r} has {flat_routing.numel()} routing "
+                f"values for shape {shape} ({expected_elements} required)"
+            )
+        routing_indices = flat_routing.reshape(shape)
+
     return FetchedMInfPayload(
         request_uid=request_uid,
         prompt_token_ids=[
@@ -651,11 +685,11 @@ def _row_to_minf_payload(
         generated_log_probs=[
             float(value) for value in _values("minf_generated_logprobs").tolist()
         ],
-        # Optional prompt logprobs/routes remain durable when MInf supplies
-        # them, but current Gym finalization neither selects nor consumes
-        # them (MInf router replay is rejected during setup).
+        # Prompt logprobs remain durable when MInf supplies them, but Gym's
+        # canonical delta builder intentionally synthesizes zeroes for prompt
+        # carry positions.
         prompt_log_probs=None,
-        routing_indices=None,
+        routing_indices=routing_indices,
         weight_version=_row_scalar_int(row, "minf_weight_version"),
     )
 

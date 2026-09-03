@@ -109,6 +109,58 @@ capture builder to construct canonical records in memory for the existing
 `verify_and_linearize()` boundary. The physical UID keys remain the cleanup
 and recovery keys; there is no second heavy-token write.
 
+### MInf router replay
+
+When `policy.router_replay.enabled=true`, MInf records the selected top-k
+expert identities for every MoE layer. Its native payload has shape
+`[T - 1, L, K]`: the last sampled token has no row because it never enters a
+subsequent inference forward pass. Gym's staging contract instead requires
+one route row for each token in the call delta.
+
+The engine cannot perform that conversion because it does not own Gym's
+`prev_len`. The finalizer already has both sides of the join, so it first
+appends an all-`-1` terminal row to form `[T, L, K]`, then slices
+`routes[prev_len:]`. The result has exactly `delta_len` rows and is committed
+as the call's digest-bound `routed_experts` extra. `-1` is the replay fallback
+sentinel: at that position the trainer lets its current router select experts.
+All other positions reuse MInf's expert identities while still computing the
+current policy's router scores and probabilities for those experts.
+
+```mermaid
+flowchart LR
+    subgraph Serve["MInf serving worker"]
+        Forward["MoE forwards<br/>record top-k expert IDs"]
+        Native["OffloadedRequestPayload<br/>routes: [T-1, L, K]"]
+    end
+
+    subgraph Gym["Gym lineage store"]
+        Pending["PendingCallRecord<br/>UID, prev_len, delta_len, parent"]
+        Manifest["token-light rollout manifest"]
+    end
+
+    subgraph TQ["TransferQueue"]
+        Raw["UID-keyed MInf row<br/>tokens, logprobs, raw routes"]
+        Canonical["canonical training row<br/>routed_experts: [B, S, L, K]"]
+    end
+
+    subgraph Finalize["NeMo-RL CPU finalizer"]
+        Join["join row and lineage by UID"]
+        Align["validate T-1<br/>append -1 row<br/>slice from prev_len"]
+        Verify["digest verification<br/>and chain linearization"]
+    end
+
+    Trainer["Megatron trainer<br/>replay expert IDs;<br/>compute current scores"]
+
+    Forward --> Native -->|"stage before HTTP reply"| Raw
+    Forward -->|"token-light HTTP reply"| Pending --> Manifest
+    Raw --> Join
+    Manifest --> Join --> Align --> Verify --> Canonical --> Trainer
+```
+
+This path currently uses finalizer-side route materialization; MInf therefore
+does not support `token_capture.defer_routed_experts_to_policy=true`. The
+default (`false`) publishes the aligned tensor in the canonical training row.
+
 ## Framework-owned receipt and cleanup
 
 NeMo RL fetches the manifest at rollout end and assembles the receipt locally.
