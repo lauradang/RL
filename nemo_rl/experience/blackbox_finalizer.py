@@ -41,7 +41,12 @@ import torch
 
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
-from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
+from nemo_rl.data_plane.tq_token_sink import (
+    TQMInfPayloadSource,
+    TQStagingStore,
+    TQTokenSink,
+    TQTokenSource,
+)
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
@@ -235,11 +240,138 @@ class BlackboxFinalizer:
         # sentinel tensors consistently with the model.
         self._routed_dims: Optional[tuple[int, int]] = None
         self._source = TQTokenSource(dp_client, staging_partition=staging_partition)
+        self._minf_source = TQMInfPayloadSource(
+            TQStagingStore(dp_client, staging_partition=staging_partition)
+        )
         # The sink's clear() is the staging-partition delete; no staging
         # writes happen here.
         self._staging = TQTokenSink(dp_client, staging_partition=staging_partition)
 
     # ── per rollout ─────────────────────────────────────────────────────────
+
+    def _materialize_minf_receipt(
+        self, receipt: dict[str, Any]
+    ) -> tuple[Any, list[Any], list[str]]:
+        """Turn UID-keyed raw MInf payloads into canonical in-memory records."""
+        from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
+        from nemo_gym.token_id_capture.staging.records import (
+            CallRecord,
+            CaptureAdmission,
+            PendingCallRecord,
+            RolloutReceipt,
+            StagedCallSnapshot,
+            StageResult,
+        )
+
+        pending_payloads = receipt.get("pending_manifest")
+        if not isinstance(pending_payloads, list) or not pending_payloads:
+            raise ValueError("pending_manifest must be a non-empty list")
+        if receipt.get("manifest"):
+            raise ValueError("a receipt cannot mix manifest and pending_manifest rows")
+        pending = [
+            PendingCallRecord.model_validate(payload) for payload in pending_payloads
+        ]
+        request_uids = [record.ledger_request_uid for record in pending]
+        if len(request_uids) != len(set(request_uids)):
+            raise ValueError("pending_manifest contains duplicate MInf request UIDs")
+        payloads = self._minf_source.fetch(request_uids)
+
+        class _MemorySink:
+            def __init__(self) -> None:
+                self.records = []
+
+            def stage(self, record: Any) -> Any:
+                self.records.append(record)
+                return StageResult(ok=True, staging_key=record.staging_key)
+
+        sink = _MemorySink()
+        capture = RolloutTokenCapture(sink=sink, weight_version_fn=lambda: 0)
+        pending_by_call_id = {record.model_call_id: record for record in pending}
+        if len(pending_by_call_id) != len(pending):
+            raise ValueError("pending_manifest contains duplicate model_call_id values")
+        committed: list[Any] = []
+        rollout_id = str(receipt["rollout_id"])
+        for record, payload in zip(pending, payloads):
+            if record.prev_len > len(payload.prompt_token_ids):
+                raise ValueError(
+                    f"MInf request {record.ledger_request_uid!r} has a prompt "
+                    f"shorter than prev_len={record.prev_len}"
+                )
+            parent_chain_hash = None
+            if record.parent_call_id is not None:
+                parent = pending_by_call_id.get(record.parent_call_id)
+                if parent is None:
+                    raise ValueError(
+                        f"MInf call {record.model_call_id!r} references missing "
+                        f"parent {record.parent_call_id!r}"
+                    )
+                parent_chain_hash = parent.chain_hash
+            admission = CaptureAdmission(
+                rollout_id=rollout_id,
+                model_call_id=record.model_call_id,
+                parent_call_id=record.parent_call_id,
+                prev_len=record.prev_len,
+                mode=record.mode,
+                required_prefix_token_ids=(
+                    payload.prompt_token_ids[: record.prev_len]
+                    if record.mode == "token_in"
+                    else []
+                ),
+                parent_chain_hash=parent_chain_hash,
+            )
+            call = capture.begin_call(admission, weight_version=payload.weight_version)
+            coords = capture.complete_call(
+                call,
+                prompt_token_ids=payload.prompt_token_ids,
+                generated_token_ids=payload.generated_token_ids,
+                generated_logprobs=payload.generated_log_probs,
+            )
+            if coords.disposition != "staged":
+                raise ValueError(
+                    f"could not rebuild MInf request {record.ledger_request_uid!r}"
+                )
+            if coords.delta_len != record.delta_len or coords.cum_len != record.cum_len:
+                raise ValueError(
+                    f"MInf request {record.ledger_request_uid!r} differs from "
+                    "the HTTP lineage lengths"
+                )
+            if (
+                coords.chain_hash != record.chain_hash
+                or coords.cumulative_hash != record.cumulative_hash
+            ):
+                raise ValueError(
+                    f"MInf request {record.ledger_request_uid!r} token content "
+                    "differs from the HTTP lineage"
+                )
+            committed.append(
+                CallRecord(
+                    model_call_id=coords.model_call_id,
+                    parent_call_id=coords.parent_call_id,
+                    prev_len=coords.prev_len,
+                    delta_len=coords.delta_len,
+                    cum_len=coords.cum_len,
+                    weight_version=coords.weight_version,
+                    digest=coords.digest,
+                    extras_digest=coords.extras_digest,
+                    staging_key=coords.staging_key,
+                    mode=record.mode,
+                    chain_hash=coords.chain_hash,
+                    cumulative_hash=coords.cumulative_hash,
+                    response_id=record.response_id,
+                    logical_request_id=record.logical_request_id,
+                    admitted_at=record.admitted_at,
+                )
+            )
+
+        canonical = dict(receipt)
+        canonical.pop("pending_manifest", None)
+        canonical["manifest"] = [record.model_dump(mode="json") for record in committed]
+        parsed = RolloutReceipt.model_validate(canonical)
+        snapshots = [
+            StagedCallSnapshot.model_validate(record.model_dump(mode="python"))
+            for record in sink.records
+        ]
+        return parsed, snapshots, request_uids
 
     def finalize_rollout(
         self, rollout_id: str, receipt: Optional[dict[str, Any]], *, reward: float
@@ -274,11 +406,36 @@ class BlackboxFinalizer:
 
         if receipt is None:
             return rejected("missing_receipt", [])
+        pending_manifest = receipt.get("pending_manifest")
+        pending_keys = [
+            entry.get("ledger_request_uid")
+            for entry in pending_manifest or []
+            if isinstance(entry, dict)
+            and isinstance(entry.get("ledger_request_uid"), str)
+        ]
+        if pending_manifest:
+            pending_rollout_id = receipt.get("rollout_id")
+            if pending_rollout_id != rollout_id:
+                return rejected(f"identity_mismatch:{pending_rollout_id}", pending_keys)
+            if receipt.get("failure_reason") is not None:
+                return rejected(
+                    f"rollout_failed:{receipt['failure_reason']}", pending_keys
+                )
+            if receipt.get("capture_poisoned"):
+                return rejected("capture_poisoned", pending_keys)
         try:
-            parsed = RolloutReceipt.model_validate(receipt)
-        except ValueError as error:
-            return rejected(f"invalid_receipt:{error}", [])
-        staging_keys = [record.staging_key for record in parsed.manifest]
+            if pending_manifest:
+                parsed, snapshots, staging_keys = self._materialize_minf_receipt(
+                    receipt
+                )
+            else:
+                parsed = RolloutReceipt.model_validate(receipt)
+                snapshots = None
+                staging_keys = [record.staging_key for record in parsed.manifest]
+        except KeyError as error:
+            return rejected(f"missing_staging_row:{error}", pending_keys)
+        except (TypeError, ValueError) as error:
+            return rejected(f"invalid_receipt:{error}", pending_keys)
         if parsed.rollout_id != rollout_id:
             return rejected(f"identity_mismatch:{parsed.rollout_id}", staging_keys)
         if parsed.failure_reason is not None:
@@ -296,21 +453,23 @@ class BlackboxFinalizer:
         if len(records_by_call) != len(parsed.manifest):
             return rejected("duplicate_manifest_call_id", staging_keys)
 
-        try:
-            fetched = (
-                self._source.fetch_for_finalization(staging_keys)
-                if self._defer_routed_experts_to_policy
-                else None
-            )
-            snapshots = (
-                [item.snapshot for item in fetched]
-                if fetched is not None
-                else self._source.fetch(staging_keys)
-            )
-        except KeyError as error:
-            return rejected(f"missing_staging_row:{error}", staging_keys)
-        except (TypeError, ValueError) as error:
-            return rejected(f"invalid_staging_row:{error}", staging_keys)
+        fetched = None
+        if snapshots is None:
+            try:
+                fetched = (
+                    self._source.fetch_for_finalization(staging_keys)
+                    if self._defer_routed_experts_to_policy
+                    else None
+                )
+                snapshots = (
+                    [item.snapshot for item in fetched]
+                    if fetched is not None
+                    else self._source.fetch(staging_keys)
+                )
+            except KeyError as error:
+                return rejected(f"missing_staging_row:{error}", staging_keys)
+            except (TypeError, ValueError) as error:
+                return rejected(f"invalid_staging_row:{error}", staging_keys)
         fetched_by_call = {}
         if fetched is not None:
             for record, item in zip(parsed.manifest, fetched):
@@ -548,7 +707,10 @@ class BlackboxFinalizer:
             record
             for receipt in receipts
             if isinstance(receipt, dict)
-            for record in (receipt.get("manifest") or [])
+            for record in (
+                (receipt.get("manifest") or [])
+                or (receipt.get("pending_manifest") or [])
+            )
             if isinstance(record, dict)
         ]
         if manifest_rows:

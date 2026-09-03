@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -36,8 +37,10 @@ import torch
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
 from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
+    compute_chain_hash,
     compute_extras_digest,
     compute_staging_digest,
+    hash_token_ids,
 )
 from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     StagedCallRecord,
@@ -48,7 +51,11 @@ from nemo_rl.data_plane.schema import (  # noqa: E402
     ROUTE_PLAN_TAG,
 )
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    MINF_OPTIONAL_PAYLOAD_FIELDS,
+    MINF_PAYLOAD_FIELDS,
     STAGING_FIELDS,
+    TQRequestPayloadStager,
+    TQStagingStore,
     TQTokenSink,
     TQTokenSource,
 )
@@ -71,7 +78,9 @@ PAD = 0
 def partitions(tq_client):
     tq_client.register_partition(
         partition_id=STAGING_PARTITION,
-        fields=list(STAGING_FIELDS),
+        fields=list(STAGING_FIELDS)
+        + list(MINF_PAYLOAD_FIELDS)
+        + list(MINF_OPTIONAL_PAYLOAD_FIELDS),
         num_samples=64,
         consumer_tasks=["finalize"],
     )
@@ -127,6 +136,81 @@ def test_finalize_rollout_reproduces_the_golden_row(tq_client, partitions):
     assert row.prompt_len == expected.prompt_len
     # The worked example spans a single weight version (wv 4 throughout).
     assert (row.min_wv, row.max_wv) == (4, 4)
+
+
+def test_finalize_rollout_rebuilds_uid_keyed_minf_payloads(tq_client, partitions):
+    root_tokens = [10, 11, 12]
+    child_delta = [13, 14]
+    root_chain_hash = compute_chain_hash(None, root_tokens)
+    child_chain_hash = compute_chain_hash(root_chain_hash, child_delta)
+    receipt = {
+        "rollout_id": "minf-r0",
+        "reward": 1.0,
+        "terminal_model_call_id": "c2",
+        "manifest": [],
+        "pending_manifest": [
+            {
+                "model_call_id": "c1",
+                "parent_call_id": None,
+                "mode": "text",
+                "prev_len": 0,
+                "delta_len": len(root_tokens),
+                "cum_len": len(root_tokens),
+                "ledger_request_uid": "minf-1",
+                "chain_hash": root_chain_hash,
+                "cumulative_hash": hash_token_ids(root_tokens),
+                "response_id": "minf-1",
+            },
+            {
+                "model_call_id": "c2",
+                "parent_call_id": "c1",
+                "mode": "token_in",
+                "prev_len": len(root_tokens),
+                "delta_len": len(child_delta),
+                "cum_len": len(root_tokens) + len(child_delta),
+                "ledger_request_uid": "minf-2",
+                "chain_hash": child_chain_hash,
+                "cumulative_hash": hash_token_ids(root_tokens + child_delta),
+                "response_id": "minf-2",
+            },
+        ],
+        "capture_poisoned": False,
+        "failure_reason": None,
+        "terminal_selection": "declared",
+    }
+    stager = TQRequestPayloadStager(
+        TQStagingStore(tq_client, staging_partition=STAGING_PARTITION),
+        weight_version=7,
+    )
+    stager.stage(
+        "minf-1",
+        SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            generated_token_ids=[12],
+            generated_log_probs=[-0.25],
+            prompt_log_probs=None,
+            routing_indices=None,
+        ),
+    )
+    stager.stage(
+        "minf-2",
+        SimpleNamespace(
+            prompt_token_ids=root_tokens + [13],
+            generated_token_ids=[14],
+            generated_log_probs=[-0.5],
+            prompt_log_probs=None,
+            routing_indices=None,
+        ),
+    )
+
+    row = _finalizer(tq_client).finalize_rollout("minf-r0", receipt, reward=1.0)
+
+    assert row.valid, row.rejection_reason
+    assert row.staging_keys == ["minf-1", "minf-2"]
+    assert row.token_ids == root_tokens + child_delta
+    assert row.token_mask == [0.0, 0.0, 1.0, 0.0, 1.0]
+    assert row.logprobs == [0.0, 0.0, -0.25, 0.0, -0.5]
+    assert (row.min_wv, row.max_wv) == (7, 7)
 
 
 def test_finalize_rollout_rejections(tq_client, partitions):

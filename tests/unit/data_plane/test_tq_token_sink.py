@@ -22,7 +22,10 @@ protocol edges the kit does not cover (missing keys, stage failure shape).
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
+import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
@@ -34,7 +37,12 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 )
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    MINF_OPTIONAL_PAYLOAD_FIELDS,
+    MINF_PAYLOAD_FIELDS,
     STAGING_FIELDS,
+    TQMInfPayloadSource,
+    TQRequestPayloadStager,
+    TQStagingStore,
     TQTokenSink,
     TQTokenSource,
 )
@@ -190,3 +198,54 @@ def test_fetch_prefix_token_ids_rejects_duplicates(tq_client, staging_partition)
     source = TQTokenSource(tq_client, staging_partition=staging_partition)
     with pytest.raises(KeyError, match="duplicates"):
         source.fetch_prefix_token_ids(["r/c", "r/c"])
+
+
+def test_minf_payload_stager_round_trips_through_shared_store(tq_client):
+    partition = f"{STAGING_PARTITION}_minf"
+    tq_client.register_partition(
+        partition_id=partition,
+        fields=list(MINF_PAYLOAD_FIELDS) + list(MINF_OPTIONAL_PAYLOAD_FIELDS),
+        num_samples=8,
+        consumer_tasks=["finalize"],
+    )
+    store = TQStagingStore(tq_client, staging_partition=partition)
+    stager = TQRequestPayloadStager(store, weight_version=3)
+    payload = SimpleNamespace(
+        prompt_token_ids=[10, 11],
+        generated_token_ids=[12, 13],
+        generated_log_probs=[-0.25, -0.5],
+        prompt_log_probs=None,
+        routing_indices=torch.tensor([[[1, 2]], [[3, 4]]]),
+    )
+    try:
+        stager.stage("minf-1", payload)
+        stager.set_weight_version(4)
+        stager.stage("minf-2", payload)
+
+        fetched = TQMInfPayloadSource(store).fetch(["minf-1", "minf-2"])
+        assert [item.request_uid for item in fetched] == ["minf-1", "minf-2"]
+        assert [item.weight_version for item in fetched] == [3, 4]
+        assert fetched[0].prompt_token_ids == [10, 11]
+        assert fetched[0].generated_token_ids == [12, 13]
+        assert fetched[0].generated_log_probs == [-0.25, -0.5]
+    finally:
+        tq_client.clear_samples(sample_ids=None, partition_id=partition)
+
+
+def test_minf_payload_stager_propagates_tq_failures() -> None:
+    class ExplodingClient:
+        def put_samples(self, **kwargs):
+            raise RuntimeError("controller down")
+
+    stager = TQRequestPayloadStager(
+        TQStagingStore(ExplodingClient(), staging_partition="staging")
+    )
+    payload = SimpleNamespace(
+        prompt_token_ids=[1],
+        generated_token_ids=[2],
+        generated_log_probs=[-0.1],
+        prompt_log_probs=None,
+        routing_indices=None,
+    )
+    with pytest.raises(RuntimeError, match="controller down"):
+        stager.stage("uid", payload)

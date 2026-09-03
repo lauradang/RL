@@ -246,6 +246,25 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
     manifest = receipt.get("manifest")
     if not isinstance(manifest, list):
         raise ValueError("sealed rollout receipt must contain a manifest list")
+    pending_manifest = receipt.get("pending_manifest", [])
+    if not isinstance(pending_manifest, list):
+        raise ValueError("sealed rollout receipt pending_manifest must be a list")
+    if manifest and pending_manifest:
+        raise ValueError(
+            "sealed rollout receipt cannot mix manifest and pending_manifest rows"
+        )
+    if pending_manifest:
+        request_uids: list[str] = []
+        for entry in pending_manifest:
+            if not isinstance(entry, dict) or not isinstance(
+                entry.get("ledger_request_uid"), str
+            ):
+                raise ValueError(
+                    "sealed pending manifest entries must contain string "
+                    "ledger_request_uid values"
+                )
+            request_uids.append(entry["ledger_request_uid"])
+        return request_uids
     staging_keys: list[str] = []
     for entry in manifest:
         if not isinstance(entry, dict) or not isinstance(entry.get("staging_key"), str):

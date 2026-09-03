@@ -359,6 +359,42 @@ def test_reserved_group_can_be_admitted_exactly_once() -> None:
         )
 
 
+def test_sealed_minf_receipt_owns_uid_keyed_payload_rows() -> None:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="minf",
+        admission_id="batch-minf",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        agent_name=None,
+        recovery_granularity=RecoveryGranularity.SIBLING,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, group.group_id))
+    gate_id = group.gate_rollout_ids[0]
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            group.group_id,
+            generation_index=0,
+            gate_rollout_id=gate_id,
+            receipt={
+                "rollout_id": gate_id,
+                "manifest": [],
+                "pending_manifest": [{"ledger_request_uid": "minf-uid-1"}],
+            },
+            reward=0.0,
+        )
+    )
+
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    assert restored.expected_staging_keys() == {"minf-uid-1"}
+
+
 def test_canonical_groups_are_discarded_without_touching_unfinished_groups() -> None:
     ledger = RolloutRecoveryLedger()
     for idx, group_id in enumerate(("canonical", "unfinished"), start=7):

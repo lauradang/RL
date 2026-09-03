@@ -1932,21 +1932,6 @@ class RolloutManager:
                     f"expected={gate_rollout_id!r}"
                 )
 
-            async def _flush_receipt(candidate: Optional[dict[str, Any]]) -> None:
-                if candidate is None or not candidate.get("pending_manifest"):
-                    return
-                if self._policy_generation is None:
-                    raise RuntimeError(
-                        "deferred token capture requires a generation backend"
-                    )
-                finalized = await asyncio.to_thread(
-                    self._policy_generation.flush_token_capture, candidate
-                )
-                # The completion and recovery ledger retain this mapping. Mutate
-                # it only after the whole ledger batch is durable.
-                candidate.clear()
-                candidate.update(finalized)
-
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
                     gate_rollout_id=gate_rollout_id,
@@ -1965,8 +1950,6 @@ class RolloutManager:
                 if len(pending_group_results) < recovery_group.expected_generations:
                     return
                 async with self._recovery_mutation("sibling_seals") as cut:
-                    for sibling_result in pending_group_results.values():
-                        await _flush_receipt(sibling_result.receipt)
                     self._recovery_ledger.mark_group_sealed(
                         cut,
                         group_id,
@@ -1975,7 +1958,6 @@ class RolloutManager:
                 return
 
             async with self._recovery_mutation("sibling_seals") as cut:
-                await _flush_receipt(receipt)
                 self._recovery_ledger.mark_sibling_sealed(
                     cut,
                     group_id,
