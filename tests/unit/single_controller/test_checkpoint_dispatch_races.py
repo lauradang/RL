@@ -37,6 +37,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, TypeVar, cast
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -84,6 +85,14 @@ def _with_mutation_cut(callback: Callable[[DataPlaneMutationCut], _T]) -> _T:
             return callback(cut)
 
     return asyncio.run(apply())
+
+
+def _init_recovery_telemetry(controller: Any, *, train_steps: int = 0) -> None:
+    """Initialize constructor-owned telemetry state for hand-built controllers."""
+    controller._train_steps = train_steps
+    controller._telemetry_sample_index = 0
+    controller._telemetry_started_at = 0.0
+    controller._logger = MagicMock()
 
 
 async def _wait_for_event_or_pump(
@@ -364,7 +373,7 @@ class _LedgerFacade:
             expected_generations=2,
             target_step=target_step,
             start_weight_version=7,
-            agent_name=None,
+            task_source=None,
             recovery_granularity=RecoveryGranularity.SIBLING,
             admitted=admitted,
             admission_id=admission_id,
@@ -691,6 +700,7 @@ def test_commit_contending_with_checkpoint_has_exactly_one_saved_owner(
             dp_client,
             partition_id="rollout_data",
             pad_value_dict={"input_ids": 0},
+            include_message_violation_fields=False,
             require_routed_experts=False,
         )
         group_id = buffer.reserve(
@@ -794,6 +804,7 @@ def test_canonical_replay_wins_over_stale_ledger_entry(
             dp_client,
             partition_id="rollout_data",
             pad_value_dict={"input_ids": 0},
+            include_message_violation_fields=False,
             require_routed_experts=False,
         )
         group_id = buffer.reserve(
@@ -914,6 +925,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(tmp_path) -> None
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller, train_steps=7)
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
@@ -976,6 +988,7 @@ def test_recovery_rejects_an_unhandled_phase_before_redispatch() -> None:
         )
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller)
         controller._rollout_manager = SimpleNamespace(recovery_ledger=recovery_ledger)
         launched = False
 
@@ -1024,6 +1037,7 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         rollout_manager = _RecoveryRolloutManager(RolloutRecoveryLedger())
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller, train_steps=7)
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._master_config = SimpleNamespace(
@@ -1115,6 +1129,7 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = object.__new__(controller_cls)
+        _init_recovery_telemetry(controller, train_steps=6)
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._trainer_version = 6

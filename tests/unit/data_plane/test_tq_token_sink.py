@@ -16,7 +16,9 @@
 
 Runs NeMo-Gym's installable conformance kit (golden call sequences →
 byte-exact digests, manifests, and linearized rows) over the TransferQueue
-implementations — the framework-CI half of the § 3.0 contract — plus the
+implementations — the framework-CI half of Gym's published conformance
+contract (the other half runs inside Gym itself, verifying its digest
+implementation against the same golden_vectors.json) — plus the
 protocol edges the kit does not cover (missing keys, stage failure shape).
 """
 
@@ -46,6 +48,24 @@ from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
 STAGING_PARTITION = "rollout_staging_test"
 
 pytestmark = pytest.mark.nemo_gym
+
+
+@pytest.mark.nemo_gym
+def test_gym_staging_package_is_importable_in_the_nemo_gym_lane():
+    """The --nemo-gym-only lane installs the extra; a missing staging package
+    means the Gym pin moved off the capture branch and every capture test
+    below has silently degraded to a skip."""
+    import nemo_gym.token_id_capture.staging  # noqa: F401
+
+
+def test_tq_sink_source_passes_gym_golden_vectors():
+    """Gym publishes a fixed wire contract independent of this repo's own
+    fixtures; this catches drift in Gym's digest scheme that
+    token_capture_test_fixtures.py cannot, since it computes its expected
+    digests by calling Gym's own digest functions."""
+    from nemo_gym.token_id_capture.staging.conformance import assert_golden_vectors
+
+    assert_golden_vectors()
 
 
 @pytest.fixture()
@@ -78,8 +98,10 @@ def test_tq_sink_source_passes_conformance(tq_client, staging_partition, fixture
     for record in records:
         assert sink.stage(record).ok
     snapshots = source.fetch([record.staging_key for record in records])
+    # The source returns extras-free base snapshots; every base field (all
+    # digest inputs) must round-trip byte-exactly.
     assert [snapshot.model_dump() for snapshot in snapshots] == [
-        record.model_dump() for record in records
+        record.model_dump(exclude={"extras"}) for record in records
     ]
 
 
@@ -115,6 +137,12 @@ def test_fetch_for_finalization_is_small_typed_and_identity_preserving(
     assert fetched[0].staging_key == records[0].staging_key
     assert fetched[0].snapshot.model_call_id == records[0].model_call_id
     assert fetched[0].routed_len == 0
+    assert fetched[0].fragment is None
+    # The snapshot is a normally validated base model, never model_construct'd.
+    from nemo_gym.token_id_capture.staging.records import StagedCallBaseSnapshot
+
+    assert type(fetched[0].snapshot) is StagedCallBaseSnapshot
+    assert not hasattr(fetched[0].snapshot, "extras")
 
 
 def test_fetch_for_finalization_rejects_duplicate_request_keys(

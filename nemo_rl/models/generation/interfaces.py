@@ -14,12 +14,15 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import cache
-from typing import Any, NotRequired, Optional, TypedDict, Union
+from typing import TYPE_CHECKING, Any, NotRequired, Optional, TypedDict, Union
 
 import ray
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
 
 # Routed-expert index tensors ([seq, layers, topk]) are carried in the narrowest
 # signed dtype that fits ids 0..num_experts-1 plus the -1 missing-route sentinel:
@@ -229,6 +232,8 @@ class GenerationConfig(TypedDict):
     use_async_rollouts: NotRequired[bool]
     # This isn't meant to be passed by the user, but is populated by nemo_rl.models.generation.__init__.configure_generation_config
     _pad_token_id: NotRequired[int]
+    # Eagle draft weights arrive via refit when policy.draft.enabled=true.
+    _draft_weights_from_refit: NotRequired[bool]
     # MTP draft weights arrive via refit if the trainer trains the MTP layer.
     _mtp_weights_from_refit: NotRequired[bool]
     # Internal debug-only measurement of exact Ray generation arguments.
@@ -425,6 +430,14 @@ def reject_unenforceable_refit_deadline(
 class GenerationInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Backend-specific pure-config validation, run before any build.
+
+        Args:
+            master_config: The single-controller MasterConfig.
+        """
+
     @abstractmethod
     def init_collective(
         self, ip: str, port: int, world_size: int, *, train_world_size: int
@@ -585,14 +598,6 @@ class GenerationInterface(ABC):
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
-    def flush_token_capture(self, receipt: dict[str, Any]) -> dict[str, Any]:
-        """Make a deferred capture receipt durable before it is sealed."""
-        if receipt.get("pending_manifest"):
-            raise NotImplementedError(
-                f"{type(self).__name__} does not implement deferred token capture"
-            )
-        return receipt
-
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.
 
@@ -632,11 +637,30 @@ class GenerationInterface(ABC):
         """
         return {}
 
+    def snapshot_step_metrics(self) -> None:
+        """Begin a per-training-step generation metric window.
+
+        Backends without per-step generation metrics may use this default no-op.
+        """
+
+    def get_step_metrics(self) -> dict[str, float]:
+        """Finish the current metric window and return generation metrics.
+
+        Returns:
+            Metrics accumulated since the matching ``snapshot_step_metrics``
+            call, not running totals. Backends without per-step generation
+            metrics return an empty dictionary.
+        """
+        return {}
+
     def drain_latest_logger_metrics(self) -> dict[str, Any]:
         """Consume a bounded latest-value snapshot for frequent telemetry polls.
 
         Implementations may clear or compact their accumulated metric histories.
         Callers must not assume that a later ``get_logger_metrics`` includes values
-        observed before this drain.
+        observed before this drain. Backends supporting raw rollout throughput
+        should return cumulative sampled-token counters under ``generation_tokens``
+        as ``data_parallel_worker_id -> list[counter]``. The controller computes
+        per-worker deltas before summing them, so counter resets are detectable.
         """
         return self.get_logger_metrics()

@@ -71,15 +71,14 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
     BOOTSTRAP_DIRNAME,
-    ROLLOUT_SNAPSHOTS_DIRNAME,
-    bootstrap_fingerprint,
-    ensure_bootstrap_anchor,
-    reset_bootstrap_anchor,
+    BootstrapCompatibilityIdentity,
+    bootstrap_compatibility_identity,
     resolve_latest_snapshot,
     validate_bootstrap_anchor,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
+from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data.utils import load_dataloader_state, setup_response_data
 from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
@@ -105,7 +104,12 @@ from nemo_rl.experience.rollout_manager import (
     RolloutTimeouts,
 )
 from nemo_rl.experience.rollout_recovery import ROLLOUT_RECOVERY_STATE_FILENAME
-from nemo_rl.experience.rollouts import should_mask_flagged_samples
+from nemo_rl.experience.rollouts import (
+    get_nemo_gym_thinking_tags,
+    resolve_reward_penalty_config,
+    should_mask_flagged_samples,
+)
+from nemo_rl.models.generation import resolve_generation_class
 from nemo_rl.models.generation.fleet_health import (
     FleetHealthPolicy,
     GenerationFleetHealth,
@@ -115,10 +119,6 @@ from nemo_rl.models.generation.generation_router import (
     GenerationRouterActor,
     GenerationRouterImpl,
 )
-from nemo_rl.models.generation.interfaces import (
-    resolve_routed_experts_dtype_name_for_model,
-)
-from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
@@ -134,6 +134,7 @@ from nemo_rl.utils.checkpoint import (
     CheckpointManager,
     validate_warm_start_checkpoint,
 )
+from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
 from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
 
 
@@ -161,10 +162,12 @@ class SingleControllerActorArgs:
     save_state: GRPOSaveState
     last_checkpoint_path: Optional[str]
     finalizer_actors: list[Any]
+    # Defaulted fields must follow the required ones above, so these stay last.
     data_plane_checkpoint_metadata: Optional[DataPlaneCheckpointMetadata] = None
+    bootstrap_identity: Optional[BootstrapCompatibilityIdentity] = None
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
-    bootstrap_fingerprint: Optional[str] = None
-    # None when async_rl.generation_fleet_health is disabled.
+    # None when async_rl.generation_fleet_health is disabled; the SingleController
+    # drives the probe loop when it is present.
     fleet_monitor: Optional[GenerationFleetHealth] = None
     # None unless async_rl.generation_router is enabled.
     generation_router: Optional[ray.actor.ActorHandle[GenerationRouterImpl]] = None
@@ -422,10 +425,14 @@ def _build_clusters(
                 gpus_per_instance = generation_config_dict["sglang_cfg"].get(
                     "gpus_per_server", 1
                 )
+            elif backend == "megatron":
+                gpus_per_instance = MegatronGeneration.nvlink_domain_span(
+                    master_config.policy
+                )
             else:
                 raise ValueError(
-                    "single_controller_utils.setup only supports vllm or sglang "
-                    f"generation; got {backend!r}"
+                    "single_controller_utils.setup only supports vllm, sglang, "
+                    f"or megatron generation; got {backend!r}"
                 )
             nodes_per_instance = (
                 gpus_per_instance + inference_gpus_per_node - 1
@@ -484,17 +491,23 @@ def _build_generation(
     master_config: MasterConfig,
     *,
     defer_model_load: bool = False,
+    reserved_http_server_port: Optional[int] = None,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None,
+    processor: Optional[AutoProcessor] = None,
 ) -> tuple[Any, float]:
-    """Spin up the generation backend (vLLM or SGLang).
+    """Spin up the generation backend (vLLM, SGLang, or Megatron).
 
     Args:
         inference_cluster: Ray virtual cluster the generation workers run on.
         master_config: SC MasterConfig.
-        defer_model_load: If True (for the NeMo-Gym flow), reserve OpenAI server URLs without loading weights; caller runs gen.load_and_start() later.
+        defer_model_load: If True (for the NeMo-Gym flow), reserve OpenAI server URLs without loading weights; caller runs gen.load_and_start() later (vLLM only).
+        reserved_http_server_port: OpenAI server port pre-published to NeMo-Gym (Megatron only).
+        tokenizer: Tokenizer for the dedicated Megatron inference policy (Megatron only).
+        processor: Optional AutoProcessor for VLM paths (Megatron only).
 
     Returns:
         A tuple of (generation object, wall time spent in this call). The
-        generation object is a VllmGeneration or SGLangGeneration.
+        generation object is a VllmGeneration, SGLangGeneration, or MegatronGeneration.
     """
     t0 = time.perf_counter()
     generation_config = master_config.policy["generation"]
@@ -526,9 +539,27 @@ def _build_generation(
             sglang_cfg=sglang_config,
         )
 
+    elif backend == "megatron":
+        assert not defer_model_load, (
+            "defer_model_load is only supported for the vllm backend"
+        )
+        assert tokenizer is not None, "Megatron generation requires a tokenizer"
+        # Non-colocated only (colocated is rejected at config validation).
+        # The inference and trainer policies build in parallel;
+        # the inference engine only becomes live at the initial refit, which delivers weights.
+        gen = MegatronGeneration(
+            config=master_config.policy,
+            tokenizer=tokenizer,
+            cluster=inference_cluster,
+            reserved_http_server_port=reserved_http_server_port,
+            processor=processor,
+            skip_weight_load=True,
+        )
+
     else:
         raise ValueError(
-            f"single_controller_utils.setup only supports vllm or sglang generation; got {backend!r}"
+            "single_controller_utils.setup only supports vllm, sglang, or megatron "
+            f"generation; got {backend!r}"
         )
 
     if not defer_model_load:
@@ -560,7 +591,6 @@ def _build_trainer(
     *,
     weights_path: Optional[Path],
     optimizer_path: Optional[Path],
-    reserved_http_server_port: Optional[int] = None,
 ) -> tuple[Any, float]:
     """Build the TQ-mediated trainer (driver-side TQPolicy).
 
@@ -571,8 +601,6 @@ def _build_trainer(
         processor: Optional AutoProcessor for VLM paths.
         weights_path: Checkpointed policy weights to resume from, or None.
         optimizer_path: Checkpointed optimizer state to resume from, or None.
-        reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym;
-            set only when colocated Megatron generation serves from the trainer's rank 0.
 
     Returns:
         A tuple of (TQPolicy trainer, wall time spent in this call).
@@ -590,7 +618,6 @@ def _build_trainer(
         init_optimizer=True,
         init_reference_model=init_reference_model,
         dp_cfg=master_config.data_plane,
-        reserved_http_server_port=reserved_http_server_port,
     )
     return trainer, time.perf_counter() - t0
 
@@ -629,76 +656,6 @@ def _build_value(
     return value, time.perf_counter() - t0
 
 
-def _build_trainer_then_megatron_generation(
-    train_cluster: RayVirtualCluster,
-    master_config: MasterConfig,
-    tokenizer,
-    processor,
-    *,
-    inference_cluster: Optional[RayVirtualCluster],
-    weights_path: Optional[Path],
-    optimizer_path: Optional[Path],
-    reserved_http_server_port: Optional[int] = None,
-) -> tuple[Any, Any, dict[str, float]]:
-    """Build the trainer, then Megatron generation, serially in that order.
-
-    Colocated (`inference_cluster` None) wraps the trainer's policy (shared worker group).
-    Non-colocated builds a dedicated inference policy on `inference_cluster` with the weight
-    load skipped; the first weight sync transfers the real weights over the refit collective.
-
-    Args:
-        train_cluster: Ray virtual cluster the trainer workers run on.
-        master_config: SC MasterConfig.
-        tokenizer: Tokenizer used by the policy.
-        processor: Optional AutoProcessor for VLM paths.
-        inference_cluster: Dedicated generation cluster for non-colocated, or None when colocated.
-        weights_path: Checkpointed policy weights to resume from, or None.
-        optimizer_path: Checkpointed optimizer state to resume from, or None.
-        reserved_http_server_port: Pre-published OpenAI server port for NeMo Gym.
-            colocated: routed to the trainer's policy (rank 0 lives with the trainer);
-            non-colocated: routed to the dedicated generation.
-
-    Returns:
-        A tuple of (MegatronGeneration, TQPolicy trainer, per-phase wall
-        times keyed as "gen_time" and "trainer_time").
-    """
-    time_metrics = {}
-
-    colocated = inference_cluster is None
-    # Rank 0 lives with the trainer when colocated, so the reserved port routes
-    # to whichever side serves: the trainer's policy or the dedicated engine.
-    trainer_port, gen_port = (
-        (reserved_http_server_port, None)
-        if colocated
-        else (None, reserved_http_server_port)
-    )
-
-    trainer, time_metrics["trainer_time"] = _build_trainer(
-        train_cluster,
-        master_config,
-        tokenizer,
-        processor,
-        weights_path=weights_path,
-        optimizer_path=optimizer_path,
-        reserved_http_server_port=trainer_port,
-    )
-
-    t0 = time.perf_counter()
-    generation = MegatronGeneration(
-        config=master_config.policy,
-        tokenizer=tokenizer,
-        cluster=inference_cluster,
-        policy=trainer if colocated else None,
-        processor=processor,
-        weights_path=weights_path,
-        skip_weight_load=not colocated,
-        reserved_http_server_port=gen_port,
-    )
-    time_metrics["gen_time"] = time.perf_counter() - t0
-
-    return generation, trainer, time_metrics
-
-
 def _spinup_gym(
     master_config: MasterConfig,
     base_urls: list[str],
@@ -719,20 +676,14 @@ def _spinup_gym(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
-    routed_experts_dtype = (
-        resolve_routed_experts_dtype_name_for_model(generation_config["model_name"])
-        if enable_router_replay
-        else "int16"
-    )
     actor = spinup_nemo_gym_actor(
         env_configs=master_config.env,
         base_urls=base_urls,
         model_name=generation_config["model_name"],
         tokenizer=tokenizer,
         enable_router_replay=enable_router_replay,
-        routed_experts_dtype=routed_experts_dtype,
         use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
-        # Ledger config rides into Gym's policy model server (§ 9.1).
+        # Ledger config rides into Gym's policy model server.
         token_capture=(
             master_config.token_capture.model_dump()
             if master_config.token_capture.enabled
@@ -746,8 +697,7 @@ def _generation_max_seq_len(generation_config) -> int:
     """Return the per-backend max sequence length.
 
     vllm uses vllm_cfg.max_model_len; sglang uses sglang_cfg.context_length;
-    megatron generation has no dedicated field and routes max_new_tokens
-    through as max_sequence_length on the inference worker.
+    megatron uses mcore_generation_config.max_model_len.
     """
     backend = generation_config["backend"]
     if backend == "vllm":
@@ -755,7 +705,7 @@ def _generation_max_seq_len(generation_config) -> int:
     if backend == "sglang":
         return generation_config["sglang_cfg"]["context_length"]
     if backend == "megatron":
-        return generation_config["max_new_tokens"]
+        return generation_config["mcore_generation_config"]["max_model_len"]
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
@@ -776,23 +726,33 @@ def _clamp_max_num_steps(
 def _maybe_inject_megatron_train_iters(master_config: MasterConfig) -> None:
     """Set train_iters from max_num_steps after its dataloader clamp."""
     algo_cfg = algo_config(master_config)
-    is_ppo = is_ppo_run(master_config)
-    # train_iters is a scheduler-tick budget, and each PPO epoch steps both
-    # optimizers once, so the configured warmup/decay horizon has to be scaled.
-    ppo_epochs = algo_cfg.ppo_epochs if is_ppo else 1
-    train_iters = algo_cfg.max_num_steps * ppo_epochs
+    ppo_config = master_config.ppo if is_ppo_run(master_config) else None
+    # train_iters is a scheduler-tick budget. Policy and value need separate
+    # budgets when their epoch counts or training start steps differ.
+    policy_epochs = ppo_config.ppo_epochs if ppo_config is not None else 1
+    policy_training_steps = algo_cfg.max_num_steps
+    if ppo_config is not None:
+        policy_training_steps = max(
+            policy_training_steps - ppo_config.policy_training_start_step,
+            0,
+        )
+    # Megatron-Bridge requires a positive scheduler horizon at setup. A PPO
+    # policy scheduler is never advanced when critic warmup spans the whole run.
+    policy_train_iters = max(policy_training_steps * policy_epochs, 1)
 
     # policy
     policy_config = master_config.policy
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
-        policy_config["megatron_cfg"]["train_iters"] = train_iters
+        policy_config["megatron_cfg"]["train_iters"] = policy_train_iters
 
     # value
-    if not is_ppo:
+    if ppo_config is None:
         return
     value_config = master_config.value
     if value_config.get("megatron_cfg", {}).get("enabled", False):
-        value_config["megatron_cfg"]["train_iters"] = train_iters  # type: ignore[index]
+        value_config["megatron_cfg"]["train_iters"] = (  # type: ignore[index]
+            algo_cfg.max_num_steps * ppo_config.critic_ppo_epochs
+        )
 
 
 def _maybe_attach_fleet_health(
@@ -836,8 +796,14 @@ def _shard_base_urls(generation: Any) -> Optional[list[Optional[str]]]:
     return urls
 
 
-def _maybe_start_generation_router(generation: Any, master_config: MasterConfig) -> Any:
+def _maybe_start_generation_router(
+    base_urls: list[Optional[str]], master_config: MasterConfig
+) -> Any:
     """Start the NeMo-Gym-facing router, if enabled.
+
+    Args:
+        base_urls: OpenAI server URLs for the router.
+        master_config: SingleController MasterConfig.
 
     Returns:
         The router actor handle, or None when the router is disabled.
@@ -858,7 +824,7 @@ def _maybe_start_generation_router(generation: Any, master_config: MasterConfig)
             flush=True,
         )
 
-    backend_urls = [url for url in (generation.dp_openai_server_base_urls or []) if url]
+    backend_urls = [url for url in (base_urls or []) if url]
     if not backend_urls:
         raise ValueError(
             "async_rl.generation_router.enabled=true requires generation backends that "
@@ -909,60 +875,6 @@ def _build_advantage_estimator(master_config: MasterConfig) -> Any:
         return _create_advantage_estimator(cast(GRPOMasterConfig, master_config))
 
 
-def _maybe_apply_megatron_generation_overrides(
-    master_config: MasterConfig, *, use_nemo_gym: bool
-) -> None:
-    """Validate and adapt the config for the Megatron generation backend."""
-    policy_config = master_config.policy
-    generation_config = policy_config["generation"]
-    if generation_config["backend"] != "megatron":
-        return
-
-    if not (
-        "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
-    ):
-        raise ValueError(
-            "policy.generation.backend='megatron' requires the Megatron trainer "
-            "(policy.megatron_cfg.enabled=true): refit transfers weights via Megatron's reshard; "
-            "colocated generation shares the training policy's worker group."
-        )
-
-    mcore_cfg = cast(MCoreGenerationConfig, generation_config)[
-        "mcore_generation_config"
-    ]
-    if use_nemo_gym and not mcore_cfg["expose_http_server"]:
-        raise ValueError(
-            "NeMo Gym usage requires "
-            "policy.generation.mcore_generation_config.expose_http_server=true"
-        )
-
-    async_config = master_config.async_rl
-    if async_config.recompute_kv_cache_after_weight_updates:
-        # As in grpo.py, recompute-after-refit is expressed engine-side for Megatron.
-        # Unlike grpo.py, SC also clears the flag so the actor skips its loop-level
-        # invalidate_kv_cache (a base-class no-op for MegatronGeneration).
-        prior_mode = mcore_cfg.get("kv_cache_management_mode")
-        if prior_mode != "recompute":
-            print(
-                f"kv_cache_management_mode overridden '{prior_mode}' -> 'recompute' by "
-                f"async_rl.recompute_kv_cache_after_weight_updates=True."
-            )
-        # pyrefly: ignore[typed-dict-key-error]
-        mcore_cfg["kv_cache_management_mode"] = "recompute"
-        async_config.recompute_kv_cache_after_weight_updates = False
-
-    if generation_config["colocated"]["enabled"]:
-        num_prompts_per_step = master_config.grpo.num_prompts_per_step
-        if async_config.max_buffered_rollouts < num_prompts_per_step:
-            raise ValueError(
-                f"async_rl.max_buffered_rollouts "
-                f"({async_config.max_buffered_rollouts}) must be >= "
-                f"grpo.num_prompts_per_step ({num_prompts_per_step}) for "
-                "colocated megatron generation: the buffer must be able to "
-                "hold a full step before the trainer takes the GPUs."
-            )
-
-
 def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
     """Translate ``async_rl.rollout_failure`` into the rollout layer's policy object."""
     failure_config = master_config.async_rl.rollout_failure
@@ -975,25 +887,6 @@ def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
         max_consecutive_dropped_prompts=failure_config.max_consecutive_dropped_prompts,
         max_gym_row_attempts=failure_config.nemo_gym.max_row_attempts,
     )
-
-
-def _raise_missing_nemo_gym_error(error: Exception, backend: str) -> None:
-    """Raise backend-specific remediation for a missing Gym capture extra."""
-    if backend == "megatron":
-        raise RuntimeError(
-            "Megatron token capture requires nemo_gym in the driver environment. "
-            "Launch the driver with `uv run --extra nemo_gym ...` or run "
-            "`uv sync --extra nemo_gym` before rerunning."
-        ) from error
-    # Worker venvs are cached by actor class name (nemo_rl/utils/venvs.py), so a
-    # venv prebuilt before token capture predates the nemo_gym extra and is reused.
-    raise RuntimeError(
-        "vLLM token capture requires nemo_gym in the "
-        "VllmAsyncGenerationWorker environment, but the cached worker venv "
-        "predates it. Rebuild worker venvs (NRL_FORCE_REBUILD_VENVS=true) or "
-        "delete $NEMO_RL_VENV_DIR/nemo_rl.models.generation.vllm."
-        "vllm_worker_async.VllmAsyncGenerationWorker and rerun."
-    ) from error
 
 
 def setup_single_controller(
@@ -1016,6 +909,11 @@ def setup_single_controller(
         logged by the SC actor).
     """
     validate_single_controller_config(master_config)
+    resolved_reward_penalty_config = resolve_reward_penalty_config(
+        master_config.reward_penalties,
+        tokenizer,
+        thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
+    )
 
     # short names for config sections
     algo_cfg = algo_config(master_config)
@@ -1057,7 +955,7 @@ def setup_single_controller(
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
     if (
         master_config.checkpointing.get("save_data_plane")
-        or rollout_checkpoint_cfg.interval_s is not None
+        or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
     ) and not data_plane_checkpointing_supported:
         raise NotImplementedError(
             "SingleController data-plane checkpointing is not supported for "
@@ -1108,7 +1006,7 @@ def setup_single_controller(
                 stacklevel=2,
             )
         else:
-            vllm_cfg = generation_config["vllm_cfg"]
+            vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
             if not vllm_cfg.get("enable_vllm_metrics_logger"):
                 warnings.warn(
                     "rollout_checkpointing.telemetry_interval_s is enabled, but "
@@ -1143,11 +1041,13 @@ def setup_single_controller(
     if checkpointing_pretrained is not None:
         policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
-    # Token capture: validate the MVP matrix loudly at setup (§ 6, § 10) and
-    # give capture-enabled vLLM workers a venv that carries nemo_gym (the
-    # worker hosts Gym's capture core + adapter in-process).
+    # Token capture: validate the supported combination loudly at setup
+    # (NeMo-Gym rollout path, vLLM backend, async_engine=true). The vLLM
+    # worker venv always carries nemo_gym (see VLLM_EXECUTABLE in
+    # ray_actor_environment_registry.py), so nothing here needs to change the
+    # worker's environment.
     token_capture_cfg = master_config.token_capture
-    if rollout_checkpoint_cfg.interval_s is not None:
+    if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
                 "rollout checkpointing requires checkpointing.enabled=true"
@@ -1170,6 +1070,16 @@ def setup_single_controller(
                 "rollout checkpointing requires a sampler that explicitly "
                 "supports training-claim ownership"
             )
+        if master_config.checkpointing["save_period"] != 1:
+            warnings.warn(
+                "rollout checkpointing is enabled with "
+                f"checkpointing.save_period={master_config.checkpointing['save_period']}; "
+                "periodic rollout snapshots can only be saved while a matching "
+                "trainer checkpoint exists. Set checkpointing.save_period=1 for "
+                "continuous post-step coverage.",
+                UserWarning,
+                stacklevel=2,
+            )
     if token_capture_cfg.enabled:
         if not should_use_nemo_gym(master_config):
             raise ValueError(
@@ -1177,45 +1087,22 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] not in ("vllm", "megatron"):
+        if generation_config["backend"] != "vllm":
             raise NotImplementedError(
-                "token_capture.enabled supports vllm or megatron; got "
+                "token_capture.enabled supports the vllm backend only; got "
                 f"{generation_config['backend']!r}"
             )
-        if (
-            generation_config["backend"] == "vllm"
-            and not generation_config["vllm_cfg"]["async_engine"]
-        ):
+        vllm_cfg = cast(dict[str, Any], generation_config)["vllm_cfg"]
+        if not vllm_cfg["async_engine"]:
             raise ValueError(
                 "token_capture.enabled requires "
                 "policy.generation.vllm_cfg.async_engine=true (the capture "
                 "host is the worker's in-process HTTP server)"
             )
-        if generation_config["backend"] == "megatron":
-            if not generation_config["mcore_generation_config"]["expose_http_server"]:
-                raise ValueError(
-                    "Megatron token capture requires policy.generation."
-                    "mcore_generation_config.expose_http_server=true"
-                )
-            if router_replay_enabled(master_config.policy):
-                raise NotImplementedError(
-                    "Megatron token capture does not yet support router replay: "
-                    "MInf ledger routes are not delta-token aligned"
-                )
-        else:
-            from nemo_rl.distributed.ray_actor_environment_registry import (
-                ACTOR_ENVIRONMENT_REGISTRY,
-            )
-            from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
-
-            ACTOR_ENVIRONMENT_REGISTRY[
-                "nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker"
-            ] = PY_EXECUTABLES.VLLM_GYM
 
         # Fill the derived ledger-hosting fields (see TokenCaptureConfig): a
-        # per-run control-plane bearer token, the process-shared capture
-        # directory used by every Gym worker, and the capture-host backend.
-        token_capture_cfg.generation_backend = generation_config["backend"]
+        # per-run control-plane bearer token and the process-shared capture
+        # directory used by every Gym worker.
         if token_capture_cfg.control_auth_token is None:
             # Deferred import: only needed on the capture path.
             import secrets
@@ -1259,12 +1146,17 @@ def setup_single_controller(
     restore_mode = rollout_checkpoint_cfg.restore_mode
     recovery_checkpoint_path = trainer_checkpoint_path
     bootstrap_anchor = checkpointer.checkpoint_dir / BOOTSTRAP_DIRNAME
-    needs_bootstrap_identity = trainer_checkpoint_path is None and (
-        rollout_checkpoint_cfg.interval_s is not None
-        or (restore_mode == "latest" and bootstrap_anchor.is_dir())
+    needs_bootstrap_identity = (
+        trainer_checkpoint_path is None
+        and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+    )
+    bootstrap_identity = (
+        bootstrap_compatibility_identity(master_config)
+        if needs_bootstrap_identity
+        else None
     )
     bootstrap_digest = (
-        bootstrap_fingerprint(master_config) if needs_bootstrap_identity else None
+        bootstrap_identity.fingerprint() if bootstrap_identity is not None else None
     )
     resolved_snapshot = None
     restored_trainer_version = (
@@ -1272,7 +1164,12 @@ def setup_single_controller(
         if save_state.trainer_version is not None
         else save_state.current_step
     )
-    if trainer_checkpoint_path is not None and restore_mode == "latest":
+    snapshot_resolution_started = time.monotonic()
+    if (
+        trainer_checkpoint_path is not None
+        and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+        and restore_mode == "latest"
+    ):
         resolved_snapshot = resolve_latest_snapshot(
             Path(trainer_checkpoint_path),
             expected_train_step=save_state.current_step,
@@ -1280,41 +1177,34 @@ def setup_single_controller(
             expected_bootstrap_fingerprint=None,
         )
     elif trainer_checkpoint_path is None:
-        if rollout_checkpoint_cfg.interval_s is not None:
+        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
             assert bootstrap_digest is not None
-            if restore_mode == "latest":
-                bootstrap_anchor = ensure_bootstrap_anchor(
-                    checkpointer.checkpoint_dir,
-                    fingerprint=bootstrap_digest,
+            assert bootstrap_identity is not None
+            if bootstrap_anchor.is_dir():
+                validate_bootstrap_anchor(
+                    bootstrap_anchor,
+                    identity=bootstrap_identity,
                 )
-            else:
-                had_bootstrap_snapshots = (
-                    bootstrap_anchor / ROLLOUT_SNAPSHOTS_DIRNAME
-                ).is_dir()
-                bootstrap_anchor = reset_bootstrap_anchor(
-                    checkpointer.checkpoint_dir,
-                    fingerprint=bootstrap_digest,
-                )
-                if had_bootstrap_snapshots:
-                    print(
-                        "📦 Ignored existing bootstrap rollout snapshots and "
-                        "started a new bootstrap lineage because "
-                        f"rollout_checkpointing.restore_mode={restore_mode!r}.",
-                        flush=True,
+                if restore_mode == "trainer_checkpoint":
+                    raise ValueError(
+                        "rollout_checkpointing.restore_mode='trainer_checkpoint' "
+                        "cannot start a fresh bootstrap lineage because checkpoint "
+                        f"state already exists at {bootstrap_anchor}. Use "
+                        "restore_mode='latest' to recover it or choose a new "
+                        "checkpoint_dir. Existing checkpoint state was not modified."
                     )
-        elif restore_mode == "latest" and bootstrap_anchor.is_dir():
-            assert bootstrap_digest is not None
-            validate_bootstrap_anchor(
-                bootstrap_anchor,
-                fingerprint=bootstrap_digest,
-            )
-        if restore_mode == "latest" and bootstrap_anchor.is_dir():
+        if (
+            rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+            and restore_mode == "latest"
+            and bootstrap_anchor.is_dir()
+        ):
             resolved_snapshot = resolve_latest_snapshot(
                 bootstrap_anchor,
                 expected_train_step=0,
                 expected_trainer_version=0,
                 expected_bootstrap_fingerprint=bootstrap_digest,
             )
+    snapshot_resolution_seconds = time.monotonic() - snapshot_resolution_started
     if resolved_snapshot is not None:
         recovery_checkpoint_path = str(resolved_snapshot.path)
         save_state.current_epoch = resolved_snapshot.manifest.current_epoch
@@ -1339,7 +1229,9 @@ def setup_single_controller(
         or (recovery_path / ROLLOUT_RECOVERY_STATE_FILENAME).is_file()
     )
     rollout_checkpoint_load_metrics: Optional[dict[str, float]] = (
-        {} if has_rollout_checkpoint_payload else None
+        {"snapshot_resolution_seconds": snapshot_resolution_seconds}
+        if has_rollout_checkpoint_payload
+        else None
     )
 
     # ==========================
@@ -1347,23 +1239,30 @@ def setup_single_controller(
     # ==========================
     # TODO: add validate dataset wiring.
     use_nemo_gym = should_use_nemo_gym(master_config)
+    data_tokenizer = processor if processor is not None else tokenizer
+    is_vlm = processor is not None
     if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):
         raise NotImplementedError(
             "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
             f"{generation_config['backend']!r}"
         )
-    # Megatron-generation checks are pure config: run them before the dataset download.
-    _maybe_apply_megatron_generation_overrides(master_config, use_nemo_gym=use_nemo_gym)
+    # Backend settings checks are pure config: run them before anything builds.
+    resolve_generation_class(generation_config).validate_settings(master_config)
     if use_nemo_gym:
         # NeMo-Gym creates the env actor outside setup_response_data; we wire
         # it in after generation is up (it needs the OpenAI server URLs).
-        response_data = setup_response_data(tokenizer, data_config, env_configs=None)
+        response_data = setup_response_data(
+            data_tokenizer, data_config, env_configs=None, is_vlm=is_vlm
+        )
         assert len(response_data) == 2
         dataset, _val_dataset = response_data
         env_handles: dict[str, EnvironmentInterface] = {}
     else:
         response_data = setup_response_data(
-            tokenizer, data_config, env_configs=master_config.env
+            data_tokenizer,
+            data_config,
+            env_configs=master_config.env,
+            is_vlm=is_vlm,
         )
         assert len(response_data) == 4
         dataset, _val_dataset, env_handles, _val_env_handles = response_data
@@ -1430,10 +1329,15 @@ def setup_single_controller(
     # live generation to front. None is also the correct value whenever the router
     # is disabled or NeMo-Gym is not in play -- it is Gym that needs one stable URL.
     generation_router = None
+    megatron_backend = generation_config["backend"] == "megatron"
+    megatron_reserved_url = None
+    megatron_port_holder = None
+    reserved_http_server_port = None
+    weight_synchronizer: Optional[WeightSynchronizer] = None
+    if megatron_backend:
+        generation_config["model_name"] = master_config.policy["model_name"]
 
-    def _build_trainer_and_value(
-        *, trainer_http_server_port: Optional[int] = None
-    ) -> tuple[Any, Optional[TQValue], dict[str, float]]:
+    def _build_trainer_and_value() -> tuple[Any, Optional[TQValue], dict[str, float]]:
         """Build the trainer, then the critic when this is a PPO run.
 
         Serial, and with the trainer offloaded in between, because both worker
@@ -1446,18 +1350,13 @@ def setup_single_controller(
             times keyed as "trainer_time" and "value_time").
         """
         time_metrics: dict[str, float] = {}
-        trainer_kwargs: dict[str, Any] = {
-            "weights_path": weights_path,
-            "optimizer_path": optimizer_path,
-        }
-        if trainer_http_server_port is not None:
-            trainer_kwargs["reserved_http_server_port"] = trainer_http_server_port
         trainer, time_metrics["trainer_time"] = _build_trainer(
             train_cluster,
             master_config,
             tokenizer,
             processor,
-            **trainer_kwargs,
+            weights_path=weights_path,
+            optimizer_path=optimizer_path,
         )
         if not is_ppo_run(master_config):
             return trainer, None, time_metrics
@@ -1474,40 +1373,6 @@ def setup_single_controller(
         value.finish_training()
         trainer.prepare_for_training()
         return trainer, value, time_metrics
-
-    megatron_backend = generation_config["backend"] == "megatron"
-    megatron_reserved_url = None
-    megatron_port_holder = None
-    reserved_http_server_port = None
-    if megatron_backend:
-        # Normally set inside _build_generation, which megatron skips.
-        generation_config["model_name"] = master_config.policy["model_name"]
-
-    def _build_megatron_generation_and_train_side() -> tuple[
-        Any, Any, Optional[TQValue], dict[str, float]
-    ]:
-        """Build trainer/critic, then wrap or create Megatron generation."""
-        trainer_port, generation_port = (
-            (reserved_http_server_port, None)
-            if colocated
-            else (None, reserved_http_server_port)
-        )
-        trainer, value, time_metrics = _build_trainer_and_value(
-            trainer_http_server_port=trainer_port
-        )
-        t0 = time.perf_counter()
-        generation = MegatronGeneration(
-            config=master_config.policy,
-            tokenizer=tokenizer,
-            cluster=None if colocated else inference_cluster,
-            policy=trainer if colocated else None,
-            processor=processor,
-            weights_path=weights_path,
-            skip_weight_load=not colocated,
-            reserved_http_server_port=generation_port,
-        )
-        time_metrics["gen_time"] = time.perf_counter() - t0
-        return generation, trainer, value, time_metrics
 
     def _build_generation_then_trainer(
         defer_generation_model_load: bool, generation=None
@@ -1561,7 +1426,7 @@ def setup_single_controller(
                 reserved_http_server_port,
                 megatron_port_holder,
             ) = MegatronGeneration.reserve_http_server_address(
-                train_cluster if colocated else inference_cluster,
+                inference_cluster,
                 master_config.policy,
             )
             gen_reserve_time = time.perf_counter() - t0
@@ -1578,29 +1443,31 @@ def setup_single_controller(
                 defer_model_load=True,
             )
             defer_generation_model_load = True
-            # Before the Gym task is built, so Gym can be handed the router's single URL.
+            gym_base_urls = generation.dp_openai_server_base_urls
+        # Before the Gym task is built, so Gym can be handed the router's single URL.
+        # These two statements are the only failable ones related to the port holder's creation.
+        try:
             generation_router = _maybe_start_generation_router(
-                generation, master_config
+                gym_base_urls, master_config
             )
-            gym_base_urls = (
+            gym_spinup_base_urls = (
                 [ray.get(generation_router.base_url.remote())]
                 if generation_router is not None
-                else generation.dp_openai_server_base_urls
+                else gym_base_urls
             )
+        except BaseException:
+            if megatron_port_holder is not None:
+                ray.kill(megatron_port_holder)
+            raise
         # add nemo_gym spinup task
         build_tasks["nemo_gym"] = partial(
             _spinup_gym,
             master_config=master_config,
-            base_urls=gym_base_urls,
+            base_urls=cast(list[str], gym_spinup_base_urls),
             tokenizer=tokenizer,
         )
 
-    if megatron_backend:
-        # Serial trainer-first in both modes:
-        # colocated generation is constructed from the trainer's policy;
-        # non-colocated waits for the trainer's checkpoint conversion.
-        build_tasks["generation_trainer"] = _build_megatron_generation_and_train_side
-    elif colocated:
+    if colocated:
         # Colocated: vLLM prefers a clean GPU at load time, so generation comes up before the trainer.
         build_tasks["generation_trainer"] = partial(
             _build_generation_then_trainer,
@@ -1619,6 +1486,9 @@ def setup_single_controller(
                 _build_generation,
                 inference_cluster=inference_cluster,
                 master_config=master_config,
+                reserved_http_server_port=reserved_http_server_port,
+                tokenizer=tokenizer,
+                processor=processor,
             )
         build_tasks["trainer"] = _build_trainer_and_value
 
@@ -1626,18 +1496,45 @@ def setup_single_controller(
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
             submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
-            results = {k: f.result() for k, f in submitted.items()}
+            if "generation_trainer" in submitted:
+                generation, trainer, value, time_metrics = submitted[
+                    "generation_trainer"
+                ].result()
+                gen_load_time = time_metrics["gen_time"]
+            else:
+                generation, gen_load_time = submitted["generation"].result()
+                trainer, value, time_metrics = submitted["trainer"].result()
+            if megatron_reserved_url is not None:
+                # Gym initialization needs a live URL that will respond to health checks.
+                # Megatron generation can only respond to health checks once initialized.
+                # The Megatron engine cannot be initialized with dummy weights.
+                # Thus, we must do an initial refit during initialization,
+                # before Gym can spin up.
+                t0 = time.perf_counter()
+                weight_synchronizer = create_weight_synchronizer(
+                    policy=trainer,
+                    generation=generation,
+                    generation_backend=generation_config["backend"],
+                    colocated=colocated,
+                    train_cluster=train_cluster,
+                    inference_cluster=inference_cluster,
+                    refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+                    refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
+                )
+                generation.weight_synchronizer = weight_synchronizer
+                weight_synchronizer.init_communicator()
+                setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                weight_synchronizer.sync_weights()
+                setup_timing_metrics.weight_sync_time_s = time.perf_counter() - t0
+            if use_nemo_gym:
+                env_handles["nemo_gym"], gym_time = submitted["nemo_gym"].result()
+                setup_timing_metrics.nemo_gym_init_time_s = gym_time
     finally:
         if megatron_port_holder is not None:
             # Rank 0 adopted (or will never adopt) the held socket; drop the holder.
             ray.kill(megatron_port_holder)
 
-    if "generation_trainer" in results:
-        generation, trainer, value, time_metrics = results["generation_trainer"]
-        gen_load_time = time_metrics["gen_time"]
-    else:
-        generation, gen_load_time = results["generation"]
-        trainer, value, time_metrics = results["trainer"]
     setup_timing_metrics.generation_init_time_s = gen_reserve_time + gen_load_time
 
     setup_timing_metrics.policy_init_time_s = time_metrics["trainer_time"]
@@ -1661,11 +1558,14 @@ def setup_single_controller(
         )
 
     if use_nemo_gym:
-        env_handles["nemo_gym"], gym_time = results["nemo_gym"]
-        setup_timing_metrics.nemo_gym_init_time_s = gym_time
         # the two fields are only meaningful when use_nemo_gym enabled
         setup_timing_metrics.generation_init_reserve_time_s = gen_reserve_time
         setup_timing_metrics.generation_init_load_time_s = gen_load_time
+
+    if megatron_reserved_url is not None:
+        MegatronGeneration.verify_served_address(
+            generation.dp_openai_server_base_urls, megatron_reserved_url
+        )
 
     # Loading a teacher with the same checkpoint as the student must happen only
     # after student initialization finishes: both use the same HF-to-Megatron
@@ -1689,11 +1589,6 @@ def setup_single_controller(
             setup_timing_metrics.teacher_reservation_time_s or 0.0
         ) + setup_timing_metrics.teacher_model_init_time_s
 
-    if megatron_reserved_url is not None:
-        MegatronGeneration.verify_served_address(
-            generation.dp_openai_server_base_urls, megatron_reserved_url
-        )
-
     worker_setup_time = time.perf_counter() - setup_start_time
     setup_timing_metrics.worker_setup_time_s = worker_setup_time
 
@@ -1706,22 +1601,6 @@ def setup_single_controller(
     # ==========================
     # Connect-only DP client; TQPolicy already bootstrapped the controller.
     dp_client = build_data_plane_client(dp_config, bootstrap=False)
-    # SingleController reuses one partition for the run. Warm every known
-    # tensor field before rollout, policy, and teacher writers become
-    # concurrent; TransferQueue otherwise registers field names lazily.
-    dp_client.register_partition(
-        partition_id=partition_id,
-        fields=fields_with_optional_routed_experts(
-            SC_ROLLOUT_SCHEMA_FIELDS,
-            enabled=router_replay_enabled(policy_config),
-        ),
-        num_samples=(
-            master_config.async_rl.max_buffered_rollouts
-            * algo_cfg.num_generations_per_prompt
-        ),
-        consumer_tasks=["prev_lp", "ref_lp", "train"],
-        grpo_group_size=algo_cfg.num_generations_per_prompt,
-    )
 
     # Token-capture mode: pre-register both rollout partitions from this
     # single driver thread before any producer is live. TQ's controller
@@ -1730,7 +1609,34 @@ def setup_single_controller(
     # partition can race kv_retrieve_meta and kill the controller thread
     # (see TQDataPlaneClient.register_partition).
     token_capture_cfg = master_config.token_capture
-    if token_capture_cfg.enabled:
+    if not token_capture_cfg.enabled:
+        # SingleController reuses one partition for the run. Warm every known
+        # tensor field before rollout, policy, and teacher writers become
+        # concurrent; TransferQueue otherwise registers field names lazily.
+        partition_fields = fields_with_optional_routed_experts(
+            SC_ROLLOUT_SCHEMA_FIELDS,
+            enabled=router_replay_enabled(policy_config),
+        )
+        if processor is not None:
+            partition_fields.extend(
+                field
+                for field in sorted(WIRE_MULTIMODAL_FIELDS)
+                if field not in partition_fields
+            )
+        dp_client.register_partition(
+            partition_id=partition_id,
+            fields=partition_fields,
+            num_samples=(
+                master_config.async_rl.max_buffered_rollouts
+                * algo_cfg.num_generations_per_prompt
+            ),
+            consumer_tasks=["prev_lp", "ref_lp", "train"],
+            grpo_group_size=algo_cfg.num_generations_per_prompt,
+        )
+    else:
+        from nemo_rl.data_plane.schema import (
+            DP_TRAIN_FIELDS,
+        )
         from nemo_rl.data_plane.schema import (
             ROUTED_EXPERTS_FIELD as STAGING_ROUTED_EXPERTS_FIELD,
         )
@@ -1744,6 +1650,23 @@ def setup_single_controller(
             )
         group_size = algo_cfg.num_generations_per_prompt
         num_rollout_samples = master_config.async_rl.max_buffered_rollouts * group_size
+        partition_fields = fields_with_optional_routed_experts(
+            DP_TRAIN_FIELDS,
+            enabled=r3_enabled and not token_capture_cfg.defer_routed_experts_to_policy,
+        )
+        if processor is not None:
+            partition_fields.extend(
+                field
+                for field in sorted(WIRE_MULTIMODAL_FIELDS)
+                if field not in partition_fields
+            )
+        dp_client.register_partition(
+            partition_id=partition_id,
+            fields=partition_fields,
+            num_samples=num_rollout_samples,
+            consumer_tasks=["prev_lp", "ref_lp", "train"],
+            grpo_group_size=group_size,
+        )
         dp_client.register_partition(
             partition_id=token_capture_cfg.staging_partition,
             fields=list(STAGING_FIELDS)
@@ -1751,32 +1674,27 @@ def setup_single_controller(
             num_samples=num_rollout_samples,
             consumer_tasks=["finalize", "prev_lp", "train"],
         )
-        # vLLM stages in its serving workers. MInf enables its local ledgers
-        # and installs one driver-side ledger-to-TQ converter.
-        try:
-            generation.setup_token_capture(
-                dp_config, token_capture_cfg.staging_partition
-            )
-        except Exception as error:
-            if "No module named 'nemo_gym'" in str(error):
-                _raise_missing_nemo_gym_error(error, generation_config["backend"])
-            raise
+        # Host Gym's capture core in every vLLM DP leader (in-worker DP
+        # client + TQTokenSink + the single install_capture call), and give
+        # workers the initial weight version to stamp on captured calls.
+        generation.setup_token_capture(dp_config, token_capture_cfg.staging_partition)
         generation.set_rollout_weight_version(0)
 
-    t0 = time.perf_counter()
-    weight_synchronizer = create_weight_synchronizer(
-        policy=trainer,
-        generation=generation,
-        generation_backend=generation_config["backend"],
-        colocated=colocated,
-        train_cluster=train_cluster,
-        inference_cluster=inference_cluster,
-        refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
-        # Only armed when configured; None leaves the refit path unchanged.
-        refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
-    )
-    weight_synchronizer.init_communicator()
-    setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
+    if weight_synchronizer is None:
+        t0 = time.perf_counter()
+        weight_synchronizer = create_weight_synchronizer(
+            policy=trainer,
+            generation=generation,
+            generation_backend=generation_config["backend"],
+            colocated=colocated,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+            refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+            refit_timeout_s=master_config.async_rl.generation_fleet_health.refit_timeout_s,
+        )
+        generation.weight_synchronizer = weight_synchronizer
+        weight_synchronizer.init_communicator()
+        setup_timing_metrics.collective_init_time_s = time.perf_counter() - t0
 
     # ==========================
     # Setup Algorithm + Rollout Wiring
@@ -1794,33 +1712,33 @@ def setup_single_controller(
         dp_client,
         partition_id=partition_id,
         pad_value_dict={"token_ids": pad_id, "input_ids": pad_id},
-        require_routed_experts=(
-            router_replay_enabled(policy_config)
-            and not token_capture_cfg.defer_routed_experts_to_policy
+        include_message_violation_fields=(
+            algo_cfg.invalid_tool_call_advantage is not None
+            or algo_cfg.malformed_thinking_advantage is not None
         ),
+        require_routed_experts=router_replay_enabled(policy_config),
         staging_partition_id=(
             token_capture_cfg.staging_partition if token_capture_cfg.enabled else None
         ),
     )
     finalizer_actors: list[Any] = []
     if token_capture_cfg.enabled:
-        from nemo_rl.experience.finalizer_actor import (
-            FinalizerActorConfig,
-            create_finalizer_actors,
+        from nemo_rl.experience.rollout_reassembler_actor import (
+            RolloutReassemblerActorConfig,
+            create_rollout_reassembler_actors,
         )
 
-        finalizer_actors = create_finalizer_actors(
+        finalizer_actors = create_rollout_reassembler_actors(
             dp_config,
-            FinalizerActorConfig(
+            RolloutReassemblerActorConfig(
                 partition_id=partition_id,
                 staging_partition=token_capture_cfg.staging_partition,
                 pad_token_id=pad_id,
-                mixed_weight_version_policy=token_capture_cfg.mixed_weight_version_policy,
-                min_valid_fraction_per_group=token_capture_cfg.min_valid_fraction_per_group,
                 router_replay_enabled=router_replay_enabled(policy_config),
                 defer_routed_experts_to_policy=token_capture_cfg.defer_routed_experts_to_policy,
+                max_seq_len=_generation_max_seq_len(generation_config),
             ),
-            num_workers=token_capture_cfg.num_finalizer_workers,
+            num_workers=token_capture_cfg.num_reassembler_workers,
         )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
@@ -1833,6 +1751,11 @@ def setup_single_controller(
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
+        log_full_result_tables=should_log_nemo_gym_full_result_tables(
+            wandb_enabled=master_config.logger["wandb_enabled"],
+            wandb_config=master_config.logger["wandb"],
+        ),
+        reward_penalty_config=resolved_reward_penalty_config,
         tq_buffer=tq_buffer,
         timeouts=RolloutTimeouts(
             rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,
@@ -1867,8 +1790,8 @@ def setup_single_controller(
         save_state=save_state,
         last_checkpoint_path=recovery_checkpoint_path,
         data_plane_checkpoint_metadata=data_plane_checkpoint_metadata,
+        bootstrap_identity=bootstrap_identity,
         rollout_checkpoint_load_metrics=rollout_checkpoint_load_metrics,
-        bootstrap_fingerprint=bootstrap_digest,
         finalizer_actors=finalizer_actors,
         fleet_monitor=fleet_monitor,
         generation_router=generation_router,

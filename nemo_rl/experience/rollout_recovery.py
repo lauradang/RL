@@ -15,15 +15,17 @@
 """Controller-owned lineage for recoverable token-capture prompt groups.
 
 The ledger deliberately contains control-plane metadata only. Token tensors and
-router-replay payloads remain in TQ. Persistence is added by a later change; the
-versioned ``state_dict`` boundary lives here so that change does not have to
-invent a second lifecycle model.
+router-replay payloads remain in TQ. The versioned ``state_dict`` boundary here is
+what the controller writes into ``rollout_recovery.pt`` at each checkpoint and
+reads back on restore.
 """
 
 from __future__ import annotations
 
 import copy
+import dataclasses
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Optional, Self, TypeAlias
@@ -32,13 +34,61 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.data.interfaces import DatumSpec
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 4
-_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
-    3,
-    ROLLOUT_RECOVERY_SCHEMA_VERSION,
-}
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 2
+_SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {ROLLOUT_RECOVERY_SCHEMA_VERSION}
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
 RolloutRecoveryState: TypeAlias = dict[str, Any]
+
+_LEDGER_STATE_FIELDS = frozenset({"schema_version", "groups"})
+_SIDECAR_STATE_FIELDS = frozenset(
+    {
+        *_LEDGER_STATE_FIELDS,
+        "batch_shortfall",
+        "sampler_stamps_target_steps",
+    }
+)
+_GROUP_STATE_FIELDS = frozenset(
+    {
+        "group_id",
+        "admission_id",
+        "prompt_id",
+        "prompt_ref",
+        "task_source",
+        "recovery_granularity",
+        "expected_generations",
+        "target_step",
+        "start_weight_version",
+        "status",
+        "phase",
+        "siblings",
+    }
+)
+_PROMPT_REF_STATE_FIELDS = frozenset({"sample_id", "task_name"})
+_SIBLING_STATE_FIELDS = frozenset({"generation_index", "attempts"})
+_ATTEMPT_STATE_FIELDS = frozenset(
+    {
+        "attempt_uuid",
+        "status",
+        "receipt",
+        "reward",
+        "mask_sample",
+        "staging_keys",
+    }
+)
+
+
+def _reject_unknown_fields(
+    mapping: Mapping[Any, Any],
+    *,
+    expected: frozenset[str],
+    context: str,
+) -> None:
+    """Reject fields that are not part of the current versioned schema."""
+    unknown = set(mapping) - expected
+    if unknown:
+        raise ValueError(
+            f"{context} contains unknown fields: {sorted(unknown, key=repr)!r}"
+        )
 
 
 class PromptGroupPhase(StrEnum):
@@ -126,6 +176,7 @@ class RolloutAttemptRecord:
     status: RolloutAttemptStatus
     receipt: Optional[dict[str, Any]] = None
     reward: Optional[float] = None
+    mask_sample: Optional[bool] = None
     staging_keys: list[str] = field(default_factory=list)
 
     @property
@@ -158,7 +209,7 @@ class PromptGroupRecoveryRecord:
     admission_id: str
     prompt_id: str
     prompt_ref: PromptRef
-    agent_name: Optional[str]
+    task_source: Optional[str]
     recovery_granularity: RecoveryGranularity
     runtime_prompt_payload: Optional[DatumSpec]
     expected_generations: int
@@ -230,6 +281,7 @@ class SiblingSealResult:
     # into a masked placeholder, matching the base token-capture contract.
     receipt: Optional[dict[str, Any]]
     reward: float
+    mask_sample: bool
 
 
 def _new_attempt() -> RolloutAttemptRecord:
@@ -279,7 +331,7 @@ class RolloutRecoveryLedger:
         expected_generations: int,
         target_step: Optional[int],
         start_weight_version: int,
-        agent_name: Optional[str] = None,
+        task_source: Optional[str] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
         admitted: bool = True,
         group_id: Optional[str] = None,
@@ -322,7 +374,7 @@ class RolloutRecoveryLedger:
             admission_id=admission_id,
             prompt_id=prompt_id,
             prompt_ref=prompt_ref,
-            agent_name=agent_name,
+            task_source=task_source,
             recovery_granularity=recovery_granularity,
             # Retain the immutable dataloader sample by reference instead of copying
             # a potentially 131k-token payload. This cache is never serialized and
@@ -385,8 +437,7 @@ class RolloutRecoveryLedger:
                 else:
                     self.abandon_unsealed(cut, record.group_id)
 
-    @staticmethod
-    def _abandon_entire_group(record: PromptGroupRecoveryRecord) -> None:
+    def _abandon_entire_group(self, record: PromptGroupRecoveryRecord) -> None:
         """Discard every current sibling when an incomplete group is atomic.
 
         Sealed staging rows become unreferenced here. The controller's restore
@@ -526,18 +577,19 @@ class RolloutRecoveryLedger:
         gate_rollout_id: str,
         receipt: Optional[dict[str, Any]],
         reward: float,
+        mask_sample: bool,
     ) -> None:
         """Record one streamed sibling receipt as soon as the row arrives."""
         cut.require_live()
         record = self._require_group(group_id)
         if record.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
-            raise ValueError(
-                "prompt-group recovery must seal every sibling atomically"
-            )
+            raise ValueError("prompt-group recovery must seal every sibling atomically")
         sibling = self._require_sibling(record, generation_index)
         attempt = sibling.current_attempt
         expected_gate_rollout_id = record.gate_rollout_id(generation_index)
         staging_keys = _receipt_staging_keys(receipt)
+        if not isinstance(mask_sample, bool):
+            raise TypeError("mask_sample must be a bool")
         if gate_rollout_id != expected_gate_rollout_id:
             raise ValueError(
                 "streamed rollout identity mismatch: "
@@ -552,6 +604,7 @@ class RolloutRecoveryLedger:
             if (
                 attempt.receipt == receipt
                 and attempt.reward == float(reward)
+                and attempt.mask_sample is mask_sample
                 and attempt.staging_keys == staging_keys
             ):
                 return
@@ -568,6 +621,7 @@ class RolloutRecoveryLedger:
 
         attempt.receipt = copy.deepcopy(receipt)
         attempt.reward = float(reward)
+        attempt.mask_sample = mask_sample
         attempt.staging_keys = staging_keys
         attempt.status = RolloutAttemptStatus.SEALED
         if all(
@@ -600,9 +654,7 @@ class RolloutRecoveryLedger:
                 f"expected={sorted(expected_indices)}, actual={sorted(results)}"
             )
 
-        validated: list[
-            tuple[RolloutAttemptRecord, SiblingSealResult, list[str]]
-        ] = []
+        validated: list[tuple[RolloutAttemptRecord, SiblingSealResult, list[str]]] = []
         for generation_index in range(record.expected_generations):
             result = results[generation_index]
             sibling = self._require_sibling(record, generation_index)
@@ -629,15 +681,16 @@ class RolloutRecoveryLedger:
                     f"receipt={result.receipt.get('rollout_id')!r}, "
                     f"expected={expected_gate_rollout_id!r}"
                 )
-            validated.append(
-                (attempt, result, _receipt_staging_keys(result.receipt))
-            )
+            if not isinstance(result.mask_sample, bool):
+                raise TypeError("mask_sample must be a bool")
+            validated.append((attempt, result, _receipt_staging_keys(result.receipt)))
 
         # Validate the complete cohort before changing any sibling. A checkpoint
         # therefore observes either no committed siblings or the complete group.
         for attempt, result, staging_keys in validated:
             attempt.receipt = copy.deepcopy(result.receipt)
             attempt.reward = float(result.reward)
+            attempt.mask_sample = result.mask_sample
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
         record.status = PromptGroupStatus.READY_TO_FINALIZE
@@ -676,9 +729,13 @@ class RolloutRecoveryLedger:
     def finalization_inputs(
         self, group_id: str
     ) -> tuple[
-        list[str], list[str], list[Optional[dict[str, Any]]], list[float]
+        list[str],
+        list[str],
+        list[Optional[dict[str, Any]]],
+        list[float],
+        list[bool],
     ]:
-        """Return physical IDs, canonical IDs, receipts and rewards in sibling order."""
+        """Return sealed finalization inputs in stable sibling order."""
         record = self._require_group(group_id)
         if record.status != PromptGroupStatus.READY_TO_FINALIZE:
             raise ValueError(
@@ -686,11 +743,13 @@ class RolloutRecoveryLedger:
             )
         receipts: list[Optional[dict[str, Any]]] = []
         rewards: list[float] = []
+        mask_sample: list[bool] = []
         for sibling in record.siblings:
             attempt = sibling.current_attempt
             if (
                 attempt.status != RolloutAttemptStatus.SEALED
                 or attempt.reward is None
+                or attempt.mask_sample is None
             ):
                 raise ValueError(
                     "logical rollout "
@@ -699,11 +758,13 @@ class RolloutRecoveryLedger:
                 )
             receipts.append(copy.deepcopy(attempt.receipt))
             rewards.append(attempt.reward)
+            mask_sample.append(attempt.mask_sample)
         return (
             record.gate_rollout_ids,
             record.logical_rollout_ids,
             receipts,
             rewards,
+            mask_sample,
         )
 
     def mark_finalization_started(
@@ -764,7 +825,7 @@ class RolloutRecoveryLedger:
         return isinstance(group_id, str) and group_id in self._groups
 
     def state_dict(self) -> dict[str, Any]:
-        """Return the versioned metadata envelope used by later persistence."""
+        """Return the versioned metadata persisted in ``rollout_recovery.pt``."""
         self.assert_checkpoint_safe()
         groups = []
         for record in self._groups.values():
@@ -788,7 +849,7 @@ class RolloutRecoveryLedger:
                         "sample_id": record.prompt_ref.sample_id,
                         "task_name": record.prompt_ref.task_name,
                     },
-                    "agent_name": record.agent_name,
+                    "task_source": record.task_source,
                     "recovery_granularity": record.recovery_granularity.value,
                     "expected_generations": record.expected_generations,
                     "target_step": record.target_step,
@@ -804,6 +865,7 @@ class RolloutRecoveryLedger:
                                     "status": attempt.status.value,
                                     "receipt": copy.deepcopy(attempt.receipt),
                                     "reward": attempt.reward,
+                                    "mask_sample": attempt.mask_sample,
                                     "staging_keys": list(attempt.staging_keys),
                                 }
                                 for attempt in sibling.attempts
@@ -826,6 +888,11 @@ class RolloutRecoveryLedger:
                 "rollout recovery state must be a dictionary, got "
                 f"{type(state).__name__}"
             )
+        _reject_unknown_fields(
+            state,
+            expected=_LEDGER_STATE_FIELDS,
+            context="rollout recovery state",
+        )
         schema_version = state.get("schema_version")
         if (
             isinstance(schema_version, bool)
@@ -833,8 +900,7 @@ class RolloutRecoveryLedger:
             or schema_version not in _SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS
         ):
             raise ValueError(
-                "Unsupported rollout-recovery schema version: "
-                f"{schema_version!r}"
+                f"Unsupported rollout-recovery schema version: {schema_version!r}"
             )
         raw_groups = state.get("groups")
         if not isinstance(raw_groups, list):
@@ -846,7 +912,6 @@ class RolloutRecoveryLedger:
             record = cls._group_from_state(
                 raw_group,
                 seen_attempt_uuids=seen_attempt_uuids,
-                schema_version=schema_version,
             )
             if record.group_id in ledger._groups:
                 raise ValueError(f"duplicate recovery group_id={record.group_id!r}")
@@ -883,14 +948,18 @@ class RolloutRecoveryLedger:
         raw_group: Any,
         *,
         seen_attempt_uuids: set[uuid.UUID],
-        schema_version: int,
     ) -> PromptGroupRecoveryRecord:
         if not isinstance(raw_group, dict):
             raise ValueError("rollout-recovery group must be a mapping")
+        _reject_unknown_fields(
+            raw_group,
+            expected=_GROUP_STATE_FIELDS,
+            context="rollout-recovery group",
+        )
         group_id = raw_group.get("group_id")
         admission_id = raw_group.get("admission_id")
         prompt_id = raw_group.get("prompt_id")
-        agent_name = raw_group.get("agent_name")
+        task_source = raw_group.get("task_source")
         raw_recovery_granularity = raw_group.get("recovery_granularity")
         expected_generations = raw_group.get("expected_generations")
         siblings_state = raw_group.get("siblings")
@@ -900,8 +969,8 @@ class RolloutRecoveryLedger:
             raise ValueError("admission_id must be a non-empty string")
         if not isinstance(prompt_id, str) or not prompt_id:
             raise ValueError("prompt_id must be a non-empty string")
-        if agent_name is not None and not isinstance(agent_name, str):
-            raise ValueError("agent_name must be a string or None")
+        if task_source is not None and not isinstance(task_source, str):
+            raise ValueError("task_source must be a string or None")
         if not isinstance(raw_recovery_granularity, str):
             raise ValueError("recovery_granularity must be a string")
         try:
@@ -939,6 +1008,11 @@ class RolloutRecoveryLedger:
         for generation_index, sibling_state in enumerate(siblings_state):
             if not isinstance(sibling_state, dict):
                 raise ValueError("rollout-recovery sibling must be a mapping")
+            _reject_unknown_fields(
+                sibling_state,
+                expected=_SIBLING_STATE_FIELDS,
+                context="rollout-recovery sibling",
+            )
             if sibling_state.get("generation_index") != generation_index:
                 raise ValueError("generation indices must be contiguous")
             logical_id = f"{group_id}_g{generation_index}"
@@ -949,6 +1023,11 @@ class RolloutRecoveryLedger:
             for attempt_state in attempts_state:
                 if not isinstance(attempt_state, dict):
                     raise ValueError("rollout-recovery attempt must be a mapping")
+                _reject_unknown_fields(
+                    attempt_state,
+                    expected=_ATTEMPT_STATE_FIELDS,
+                    context="rollout-recovery attempt",
+                )
                 raw_attempt_uuid = attempt_state.get("attempt_uuid")
                 if (
                     not isinstance(raw_attempt_uuid, bytes)
@@ -973,6 +1052,7 @@ class RolloutRecoveryLedger:
                     ) from error
                 receipt = attempt_state.get("receipt")
                 reward = attempt_state.get("reward")
+                mask_sample = attempt_state.get("mask_sample")
                 staging_keys = attempt_state.get("staging_keys")
                 if not isinstance(staging_keys, list) or not all(
                     isinstance(key, str) for key in staging_keys
@@ -981,11 +1061,11 @@ class RolloutRecoveryLedger:
                 if attempt_status == RolloutAttemptStatus.SEALED:
                     if not isinstance(reward, (int, float)):
                         raise ValueError("sealed attempts require a reward")
+                    if not isinstance(mask_sample, bool):
+                        raise ValueError(
+                            "sealed attempts require a boolean mask_sample"
+                        )
                     if receipt is None:
-                        if schema_version < 4:
-                            raise ValueError(
-                                "sealed attempts require a receipt before schema v4"
-                            )
                         if staging_keys:
                             raise ValueError(
                                 "sealed missing-receipt attempt cannot own staging keys"
@@ -994,14 +1074,17 @@ class RolloutRecoveryLedger:
                         if receipt.get("rollout_id") != gate_id:
                             raise ValueError("sealed receipt identity mismatch")
                         if _receipt_staging_keys(receipt) != staging_keys:
-                            raise ValueError(
-                                "sealed receipt staging manifest mismatch"
-                            )
+                            raise ValueError("sealed receipt staging manifest mismatch")
                     else:
                         raise ValueError(
                             "sealed attempt receipt must be a mapping or None"
                         )
-                elif receipt is not None or reward is not None or staging_keys:
+                elif (
+                    receipt is not None
+                    or reward is not None
+                    or mask_sample is not None
+                    or staging_keys
+                ):
                     raise ValueError("only sealed attempts may retain receipt data")
                 attempts.append(
                     RolloutAttemptRecord(
@@ -1009,6 +1092,7 @@ class RolloutRecoveryLedger:
                         status=attempt_status,
                         receipt=copy.deepcopy(receipt),
                         reward=float(reward) if reward is not None else None,
+                        mask_sample=mask_sample,
                         staging_keys=list(staging_keys),
                     )
                 )
@@ -1022,6 +1106,11 @@ class RolloutRecoveryLedger:
         raw_prompt_ref = raw_group.get("prompt_ref")
         if not isinstance(raw_prompt_ref, dict):
             raise ValueError("prompt_ref must be a mapping")
+        _reject_unknown_fields(
+            raw_prompt_ref,
+            expected=_PROMPT_REF_STATE_FIELDS,
+            context="rollout-recovery prompt_ref",
+        )
         sample_id = raw_prompt_ref.get("sample_id")
         task_name = raw_prompt_ref.get("task_name")
         if not isinstance(sample_id, str) or not sample_id:
@@ -1057,7 +1146,7 @@ class RolloutRecoveryLedger:
             admission_id=admission_id,
             prompt_id=prompt_id,
             prompt_ref=PromptRef(sample_id=sample_id, task_name=task_name),
-            agent_name=agent_name,
+            task_source=task_source,
             recovery_granularity=recovery_granularity,
             runtime_prompt_payload=None,
             expected_generations=expected_generations,
@@ -1077,20 +1166,9 @@ class RolloutRecoveryLedger:
     @staticmethod
     def _copy_group(record: PromptGroupRecoveryRecord) -> PromptGroupRecoveryRecord:
         """Copy mutable lineage metadata without duplicating the prompt payload."""
-        return PromptGroupRecoveryRecord(
-            group_id=record.group_id,
-            admission_id=record.admission_id,
-            prompt_id=record.prompt_id,
-            prompt_ref=record.prompt_ref,
-            agent_name=record.agent_name,
-            recovery_granularity=record.recovery_granularity,
-            runtime_prompt_payload=record.runtime_prompt_payload,
-            expected_generations=record.expected_generations,
-            target_step=record.target_step,
-            start_weight_version=record.start_weight_version,
+        return dataclasses.replace(
+            record,
             siblings=copy.deepcopy(record.siblings),
-            phase=record.phase,
-            status=record.status,
         )
 
     @staticmethod
@@ -1116,6 +1194,7 @@ class RolloutRecoveryLedger:
                 f"cannot {transition} group {record.group_id!r} from "
                 f"{record.status.value!r}"
             )
+
 
 def _validate_batch_shortfall(value: object) -> dict[int, int]:
     """Return a defensive copy of per-step permanent rollout losses."""
@@ -1163,6 +1242,11 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
             "rollout recovery sidecar must contain a dictionary, got "
             f"{type(state).__name__}"
         )
+    _reject_unknown_fields(
+        state,
+        expected=_SIDECAR_STATE_FIELDS,
+        context="rollout recovery sidecar",
+    )
     schema_version = state.get("schema_version")
     if (
         isinstance(schema_version, bool)

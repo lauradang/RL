@@ -28,18 +28,18 @@ TP=CP=PP=1) and inherit ``train`` / ``get_logprobs`` /
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections import Counter
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
+import numpy as np
 import torch
 
 FetchPolicy = Literal["auto", "independent", "leader_broadcast"]
 
 from nemo_rl.data.llm_message_utils import attach_message_log_view
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
     GLOBAL_FORWARD_PAD_SEQLEN,
@@ -53,19 +53,16 @@ from nemo_rl.data_plane.schema import (
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
+from nemo_rl.experience.route_assembly import RouteFragment, execute_route_plan
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
 
 if TYPE_CHECKING:
-    from nemo_rl.data_plane import DataPlaneConfig, KVBatchMeta
-    from nemo_rl.data_plane.interfaces import DataPlaneClient
-
-
-@dataclass(frozen=True)
-class _DeferredRouteFragment:
-    routes: torch.Tensor
-    encoding: int
-    extras_metadata_json: torch.Tensor
+    from nemo_rl.data_plane import KVBatchMeta
+    from nemo_rl.data_plane.interfaces import (
+        DataPlaneClient,
+        DataPlaneRuntimeConfig,
+    )
 
 
 def _broadcast_batched_data_dict(
@@ -89,23 +86,91 @@ def _broadcast_batched_data_dict(
     backend = torch.distributed.get_backend(group)
     bcast_device: Any = torch.cuda.current_device() if backend == "nccl" else "cpu"
 
+    # Leader-only: the flat payload of each packed field, kept from the
+    # descriptor pass so ``to_wire``'s ``torch.cat`` of the whole column runs
+    # once, not once per pass (multimodal_utils.py:203 warns about exactly this).
+    leader_flat: dict[str, torch.Tensor] = {}
+    leader_error: Exception | None = None
+
     if is_leader:
-        assert data is not None, "leader must provide non-None data"
-        descriptor: list[Any] = []
-        for k, v in data.items():
-            if isinstance(v, torch.Tensor):
-                descriptor.append(
-                    (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
-                )
-            else:
-                descriptor.append((k, "raw", v))
-        payload: list[Any] = [descriptor]
+        try:
+            assert data is not None, "leader must provide non-None data"
+            descriptor: list[Any] = []
+            for k, v in data.items():
+                if isinstance(v, torch.Tensor):
+                    descriptor.append(
+                        (k, "tensor", str(v.dtype), tuple(v.shape), str(v.device))
+                    )
+                elif isinstance(v, PackedTensor):
+                    nested, shapes = v.to_wire()
+                    if nested is None:
+                        # Every row empty -- a shard holding only media-free
+                        # samples. The key still has to cross: consumers branch on
+                        # the key set (``len(get_multimodal_dict(...)) > 0`` decides
+                        # whether the caller's position_ids are used), and the
+                        # independent-fetch path keeps it. Ship geometry alone.
+                        descriptor.append(
+                            (
+                                k,
+                                "empty_packed",
+                                len(v),
+                                v.dim_to_pack,
+                                v.pad_to_max_shape,
+                            )
+                        )
+                        continue
+                    values = nested.values()
+                    leader_flat[k] = values
+                    descriptor.append(
+                        (
+                            k,
+                            "packed_wire",
+                            str(values.dtype),
+                            str(values.device),
+                            nested.offsets().tolist(),
+                            shapes,
+                            v.pad_to_max_shape,
+                        )
+                    )
+                elif (
+                    v is None
+                    or isinstance(v, (str, int, float, bool))
+                    or (isinstance(v, np.ndarray) and v.dtype == object)
+                ):
+                    # Scalars and object arrays are what the raw branch is for:
+                    # small, and cheap to pickle into the object list.
+                    descriptor.append((k, "raw", v))
+                else:
+                    raise TypeError(
+                        f"Field {k!r}: unexpected broadcast type "
+                        f"{type(v).__name__}. "
+                        "The replica-group broadcast carries torch.Tensor, "
+                        "PackedTensor, np.ndarray[object] and scalars; a bulk "
+                        "wrapper must get its own branch rather than being pickled."
+                    )
+        except Exception as error:
+            # Every rank must enter the first collective, even when the source
+            # cannot describe its batch. Otherwise the peers wait indefinitely.
+            leader_error = error
+            payload: list[Any] = [("error", type(error).__name__, str(error))]
+        else:
+            payload = [("ok", descriptor)]
     else:
         payload = [None]
 
     torch.distributed.broadcast_object_list(payload, src=src, group=group)
-    descriptor = payload[0]
-    assert descriptor is not None
+    status, *contents = payload[0]
+    if status == "error":
+        if leader_error is not None:
+            raise leader_error
+        error_type, error_message = contents
+        raise RuntimeError(
+            f"Broadcast source rank {src} failed while describing its batch "
+            f"({error_type}): {error_message}"
+        )
+
+    assert status == "ok"
+    descriptor = contents[0]
 
     # pyrefly: ignore  # bad-assignment
     out: BatchedDataDict[Any] = data if is_leader else BatchedDataDict()
@@ -139,10 +204,93 @@ def _broadcast_batched_data_dict(
                 and torch.device(src_device).type != torch.device(bcast_device).type
             ):
                 out[key] = tensor.to(src_device)
+        elif kind == "packed_wire":
+            dtype_str, src_device, offsets, shapes, pad_to_max_shape = entry[2:]
+            if is_leader:
+                flat = leader_flat[key].to(bcast_device)
+            else:
+                dtype = getattr(torch, dtype_str.split(".")[-1])
+                flat = torch.empty(offsets[-1], dtype=dtype, device=bcast_device)
+            torch.distributed.broadcast(flat, src=src, group=group)
+            # Drop the cached CPU concat now it has shipped: holding it to
+            # the end of the loop keeps three copies of the largest column
+            # live at once (segments, concat, device copy).
+            leader_flat.pop(key, None)
+            if not is_leader:
+                nested = torch.nested.nested_tensor_from_jagged(
+                    flat, torch.tensor(offsets, dtype=torch.int64, device=flat.device)
+                )
+                if torch.device(src_device).type != torch.device(bcast_device).type:
+                    nested = nested.to(src_device)
+                out[key] = PackedTensor.from_wire(
+                    nested, shapes, pad_to_max_shape=pad_to_max_shape
+                )
+        elif kind == "empty_packed":
+            # Structural only: no payload, so followers rebuild from the
+            # geometry and land on the leader's key set.
+            n_rows, dim_to_pack, pad_to_max_shape = entry[2:]
+            if not is_leader:
+                out[key] = PackedTensor(
+                    [None] * n_rows,
+                    dim_to_pack,
+                    pad_to_max_shape=pad_to_max_shape,
+                )
         else:
             if not is_leader:
                 out[key] = entry[2]
     return out
+
+
+def _materialize_fetched(
+    td: Any,
+    *,
+    local_batch: bool,
+    layout: Layout,
+    pad_value_dict: dict[str, int | float] | None,
+    pad_to_seqlen: int,
+    tags: list[dict[str, Any]] | None = None,
+) -> BatchedDataDict[Any]:
+    """Materialize a fetched TensorDict with the reader that matches the writer.
+
+    ``materialize`` and ``materialize_local`` are not interchangeable. The
+    local adapter stores each non-tensor column as one ``NonTensorData`` with
+    ``batch_size=(N,)``, and ``materialize`` reads a ``NonTensorData`` as a
+    single row, so calling it on a local batch collapses N rows into 1 without
+    raising. Both readers are picked from the same ``local_batch`` flag, so
+    this only guards against a future edit that changes one of the two
+    branches; it costs the TQ path one ``isinstance`` per column.
+    """
+    from tensordict import NonTensorData
+
+    from nemo_rl.data_plane import materialize
+    from nemo_rl.data_plane.adapters.local import materialize_local
+
+    if not local_batch:
+        batched = [
+            str(key)
+            for key in td.keys(include_nested=False)
+            if isinstance(td.get(key), NonTensorData)
+        ]
+        if batched:
+            raise TypeError(
+                f"materialize() cannot read process-local columns {sorted(batched)}: "
+                "each holds a whole column in one NonTensorData and would collapse "
+                "to a single row. This batch needs materialize_local()."
+            )
+    if local_batch:
+        return materialize_local(
+            td,
+            layout=layout,
+            pad_value_dict=pad_value_dict,
+            pad_to_seqlen=pad_to_seqlen,
+        )
+    return materialize(
+        td,
+        layout=layout,
+        pad_value_dict=pad_value_dict,
+        pad_to_seqlen=pad_to_seqlen,
+        tags=tags,
+    )
 
 
 class TQWorkerMixin:
@@ -156,17 +304,24 @@ class TQWorkerMixin:
     _dp_client: Optional[DataPlaneClient] = None
     _route_fallback_counts: Counter[str] = Counter()
 
-    def setup_data_plane(self, cfg: DataPlaneConfig) -> None:
-        """Connect this worker process's client to the existing TQ controller.
+    def setup_data_plane(self, cfg: DataPlaneRuntimeConfig) -> None:
+        """Create this worker process's configured data-plane client.
 
         Called once by the driver after worker construction. Idempotent.
         """
-        if getattr(self, "model_slices_context_parallel_inputs", False):
-            raise NotImplementedError(
-                "TransferQueue/SingleController does not yet support models that "
-                "insert media before context-parallel input selection. Use the "
-                "synchronous NeMo-RL policy path for Nemotron Omni."
-            )
+        # Models that insert media before CP input selection
+        # (``model_slices_context_parallel_inputs``) need the caller to hand
+        # them full, unsliced THD rows. That is what they get: ``_fetch``
+        # leader-fetches one DP slice and NCCL-broadcasts it across the
+        # replica group, which is TP x CP x PP siblings of a single DP rank,
+        # so every CP sibling sees identical full rows and the model applies
+        # its own post-embedding slice. ``train_presharded`` and both logprob
+        # entrypoints then delegate to the same ``train`` / ``get_logprobs``
+        # that carry the flag into ``models/megatron/data.py``.
+        #
+        # ``train_microbatch_presharded`` lands in ``_train_microbatch_body``,
+        # which applies the same media-token validity mask and model packing/CP
+        # capability flags as the regular training path.
         if self._dp_client is not None:
             return
         self._route_fallback_counts = Counter()
@@ -250,7 +405,7 @@ class TQWorkerMixin:
         if fetch_policy not in {"auto", "independent", "leader_broadcast"}:
             raise ValueError(f"unknown fetch_policy: {fetch_policy!r}")
 
-        from nemo_rl.data_plane import materialize
+        from nemo_rl.data_plane.adapters.local import is_local_batch_meta
 
         pad_value_dict = self._pad_value_dict()
         replica_group = (
@@ -265,21 +420,31 @@ class TQWorkerMixin:
             )
 
         pad_to_seqlen = self._forward_pad_seqlen(meta) if dp_aligned_seq_len else 0
+        local_batch = is_local_batch_meta(meta)
 
         if replica_group is not None and replica_group.size() > 1:
             is_leader = self._is_replica_leader()
             leader = torch.distributed.get_global_rank(replica_group, 0)
             if is_leader:
-                td = self._require_dp_client().get_samples(
-                    sample_ids=meta.sample_ids,
-                    partition_id=meta.partition_id,
-                    select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-                )
-                data = materialize(
+                dp_client = self._require_dp_client()
+                if local_batch:
+                    td = dp_client.get_data(
+                        meta,
+                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                    )
+                else:
+                    td = dp_client.get_samples(
+                        sample_ids=meta.sample_ids,
+                        partition_id=meta.partition_id,
+                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+                    )
+                data = _materialize_fetched(
                     td,
+                    local_batch=local_batch,
                     layout=layout,
                     pad_value_dict=pad_value_dict,
                     pad_to_seqlen=pad_to_seqlen,
+                    tags=meta.tags,
                 )
                 data = self._maybe_assemble_routed_experts(meta, data)
             else:
@@ -302,16 +467,25 @@ class TQWorkerMixin:
                 data = preprocess(self, data)
             return data
 
-        td = self._require_dp_client().get_samples(
-            sample_ids=meta.sample_ids,
-            partition_id=meta.partition_id,
-            select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-        )
-        data = materialize(
+        dp_client = self._require_dp_client()
+        if local_batch:
+            td = dp_client.get_data(
+                meta,
+                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+            )
+        else:
+            td = dp_client.get_samples(
+                sample_ids=meta.sample_ids,
+                partition_id=meta.partition_id,
+                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
+            )
+        data = _materialize_fetched(
             td,
+            local_batch=local_batch,
             layout=layout,
             pad_value_dict=pad_value_dict,
             pad_to_seqlen=pad_to_seqlen,
+            tags=meta.tags,
         )
         data = self._maybe_assemble_routed_experts(meta, data)
         attach_message_log_view(data)
@@ -329,7 +503,7 @@ class TQWorkerMixin:
         *,
         keys: list[str],
         partition_id: str,
-    ) -> dict[str, _DeferredRouteFragment]:
+    ) -> dict[str, RouteFragment]:
         """Fetch a unique key set in one request and preserve request identity."""
         if not keys:
             return {}
@@ -351,56 +525,20 @@ class TQWorkerMixin:
         if route_column is None or encoding_column is None or metadata_column is None:
             raise KeyError("deferred route row is missing integrity metadata")
         return {
-            key: _DeferredRouteFragment(
+            key: RouteFragment(
                 routes=route_column[index],
                 encoding=int(encoding_column[index].reshape(-1)[0].item()),
-                extras_metadata_json=metadata_column[index].reshape(-1),
+                extras_metadata_json=bytes(
+                    int(value) for value in metadata_column[index].reshape(-1).tolist()
+                ),
             )
             for index, key in enumerate(keys)
         }
 
-    @staticmethod
-    def _verify_route_fragment_integrity(
-        fragment: _DeferredRouteFragment,
-        *,
-        extras_digest_version: int,
-        expected_extras_digest: str,
-    ) -> bool:
-        """Rebuild deferred extras and verify the receipt-bound Gym digest."""
-        from nemo_gym.token_id_capture.staging.digest import (
-            EXTRAS_DIGEST_VERSION,
-            compute_extras_digest,
-        )
-
-        from nemo_rl.utils.routed_experts_codec import encode_routed_experts
-
-        if extras_digest_version != EXTRAS_DIGEST_VERSION:
-            return False
-        try:
-            raw_metadata = bytes(
-                int(value) for value in fragment.extras_metadata_json.tolist()
-            )
-            decoded = json.loads(raw_metadata.decode("utf-8"))
-            if decoded is None:
-                extras: dict[str, Any] = {}
-            elif isinstance(decoded, dict):
-                extras = decoded
-            else:
-                return False
-            if fragment.encoding == 1:
-                extras[ROUTED_EXPERTS_FIELD] = encode_routed_experts(fragment.routes)
-            elif fragment.encoding == 2:
-                extras[ROUTED_EXPERTS_FIELD] = fragment.routes.tolist()
-            else:
-                return False
-            return compute_extras_digest(extras) == expected_extras_digest
-        except (TypeError, ValueError):
-            return False
-
     def _route_fragments_by_row(
         self,
         plans: list[Any],
-    ) -> tuple[list[dict[str, _DeferredRouteFragment]], int, float]:
+    ) -> tuple[list[dict[str, RouteFragment]], int, float]:
         """Use one normal-path batch read; isolate error retries per rollout."""
         from nemo_rl.experience.route_plan import decode_route_plan
 
@@ -430,7 +568,7 @@ class TQWorkerMixin:
                 "deferred route batch fetch failed; isolating by rollout: %s",
                 batch_error,
             )
-            per_row: list[dict[str, _DeferredRouteFragment]] = []
+            per_row: list[dict[str, RouteFragment]] = []
             for plan in decoded:
                 row_keys = list(
                     dict.fromkeys(
@@ -468,10 +606,7 @@ class TQWorkerMixin:
         if not (meta.extra_info or {}).get(ROUTE_PASSTHROUGH_FLAG):
             return data
 
-        from nemo_rl.experience.route_plan import (
-            classify_route_span,
-            decode_route_plan,
-        )
+        from nemo_rl.experience.route_plan import decode_route_plan
         from nemo_rl.models.generation.interfaces import (
             ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
         )
@@ -492,6 +627,7 @@ class TQWorkerMixin:
         plans = [decode_route_plan(plan) for plan in encoded_plans]
         fragments_by_row, _, _ = self._route_fragments_by_row(encoded_plans)
 
+        # The worker supplies real model dims — the authoritative shape check.
         num_moe_layers, top_k = self._routed_experts_dimensions()
         input_ids = data["input_ids"]
         input_lengths = data["input_lengths"].reshape(-1)
@@ -507,52 +643,19 @@ class TQWorkerMixin:
         )
         request_fallbacks: Counter[str] = Counter()
         for row_index, (plan, fragments) in enumerate(zip(plans, fragments_by_row)):
-            reason: Optional[str] = None
             canonical_len = int(input_lengths[row_index].item())
-            if canonical_len != plan.expected_token_length:
-                reason = "canonical_length_mismatch"
-            position = 0
-            if reason is None:
-                for span in plan.spans:
-                    contribution = span.carry_len + span.generation_len
-                    mode = classify_route_span(span)
-                    if mode != "sentinel":
-                        fragment = fragments.get(span.staging_key)
-                        if fragment is None:
-                            reason = "missing_fragment"
-                            break
-                        if not self._verify_route_fragment_integrity(
-                            fragment,
-                            extras_digest_version=span.extras_digest_version,
-                            expected_extras_digest=span.extras_digest,
-                        ):
-                            reason = "fragment_integrity"
-                            break
-                        routes = fragment.routes
-                        if routes.dim() != 3:
-                            reason = "fragment_rank"
-                            break
-                        if int(routes.shape[0]) != span.staged_route_len:
-                            reason = "fragment_length"
-                            break
-                        if tuple(routes.shape[1:]) != (num_moe_layers, top_k):
-                            reason = "fragment_model_shape"
-                            break
-                        if mode == "full":
-                            routed[row_index, position : position + contribution] = (
-                                routes.to(torch.int16)
-                            )
-                        else:
-                            tail_start = position + span.carry_len
-                            routed[row_index, tail_start : position + contribution] = (
-                                routes[-span.generation_len :].to(torch.int16)
-                            )
-                    position += contribution
-            if reason is None and plan.spans and position != canonical_len:
-                reason = "assembled_length_mismatch"
-            if reason is not None:
-                routed[row_index].fill_(ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL)
-                request_fallbacks[reason] += 1
+            tensor, reason = execute_route_plan(
+                plan,
+                fragments,
+                dims=(num_moe_layers, top_k),
+                canonical_len=canonical_len,
+            )
+            if tensor is None:
+                # The row stays all-sentinel: the model falls back to its own
+                # router for exactly these positions (counted, not fatal).
+                request_fallbacks[reason or "unknown"] += 1
+            else:
+                routed[row_index, :canonical_len] = tensor
 
         self._route_fallback_counts.update(request_fallbacks)
         if request_fallbacks:
@@ -928,9 +1031,16 @@ class TQWorkerMixin:
         GPU and the metric list ends up TP×CP×PP times too long, which
         inflates every per-token aggregate (gen_kl_error, probs_ratio,
         etc.) by that same factor.
+
+        Also pops this step's deferred-route fallback counts (only the
+        replica leader ever populates them, same as the metrics above) so
+        they report a per-step rate instead of accumulating silently for
+        the worker's lifetime.
         """
         result = self.finish_train_step()  # type: ignore[attr-defined]
         result["is_replica_leader"] = bool(self._is_replica_leader())
+        result["route_fallback_counts"] = dict(self._route_fallback_counts)
+        self._route_fallback_counts = Counter()
         return result
 
     @wrap_with_nvtx_name("policy_worker/abort_train_step_presharded")

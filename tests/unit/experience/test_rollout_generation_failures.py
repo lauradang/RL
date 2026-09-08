@@ -89,6 +89,8 @@ class _TokenizedText:
 
 
 class _FakeTokenizer:
+    pad_token_id = 0
+
     def decode(self, ids, skip_special_tokens=True):
         del skip_special_tokens
         return f"<{len(ids)} tokens>"
@@ -177,6 +179,10 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
         else RolloutRetryPolicy.single_attempt()
     )
     manager._stats = RolloutStats()
+    manager._canonical_groups_finalized = 0
+    manager._canonical_output_tokens = 0
+    manager._recovery_siblings_reused = 0
+    manager._recovery_siblings_redispatched = 0
     manager._skipped_prompts = 0
     manager._consecutive_infra_drops = 0
     return manager
@@ -441,8 +447,8 @@ class TestDeadlineHelper:
 
 
 def _gym_rows(count: int) -> list[dict]:
-    """Rows shaped the way _build_inputs stamps them: each carries its own index."""
-    return [{"_rowidx": i, "agent_ref": {"name": "agent"}} for i in range(count)]
+    """Gym 0.15 rows carry task_source until the remote actor resolves an agent."""
+    return [{"_rowidx": i, "task_source": "workplace_assistant"} for i in range(count)]
 
 
 class _PartialGymMethod:
@@ -481,6 +487,7 @@ async def _row_result(rowidx: int):
     """A minimally complete NeMo-Gym result, enough to build a Completion."""
     return (
         rowidx,
+        {"name": "agent"},
         {
             "input_message_log": [{"role": "user", "token_ids": [1]}],
             "message_log": [{"role": "assistant", "token_ids": [2]}],
@@ -508,7 +515,12 @@ class _FakeGymMethod:
 
     async def _stream(self, num_inputs):
         async def _result(rowidx):
-            return rowidx, {"input_message_log": [], "message_log": []}, None
+            return (
+                rowidx,
+                {"name": "agent"},
+                {"input_message_log": [], "message_log": []},
+                None,
+            )
 
         for rowidx in range(min(self._rows_to_yield, num_inputs)):
             yield _result(rowidx)
@@ -538,6 +550,10 @@ def _make_gym_impl(
     impl._stats = stats if stats is not None else RolloutStats()
     # Upstream default; this fixture is about re-dispatch, not sample masking.
     impl._mask_env_flagged_samples = True
+    # Full-result tables are likewise opt-in in the real constructor.
+    impl._log_full_result_tables = False
+    # Reward penalties are off; direct construction must still satisfy the impl contract.
+    impl._reward_penalty_config = None
     # Effort-level reward shaping is off unless env.nemo_gym.effort_levels is set.
     impl._effort_config = None
     return impl
@@ -741,12 +757,30 @@ class TestPartialGymRedispatch:
         method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
         impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
 
-        with pytest.raises(ValueError, match="must be stamped with their own position"):
+        with pytest.raises(ValueError, match="carries invalid _rowidx"):
             asyncio.run(
                 impl._run_rollouts(
                     [{"agent_ref": {"name": "a"}}], Timer(), "timing/rollout"
                 )
             )
+
+    def test_row_indices_must_fit_within_the_prompt_group(self):
+        method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
+        rows = _gym_rows(2)
+        rows[1]["_rowidx"] = 2
+
+        with pytest.raises(ValueError, match="carries invalid _rowidx=2"):
+            asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
+
+    def test_row_indices_must_be_unique(self):
+        method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
+        rows = _gym_rows(2)
+        rows[1]["_rowidx"] = 0
+
+        with pytest.raises(ValueError, match="duplicate _rowidx values"):
+            asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
 
     def test_the_group_deadline_spans_re_dispatches(self):
         """The budget belongs to the prompt group, not to each attempt.

@@ -28,6 +28,7 @@ import ray
 import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    CheckpointMutationKind,
     DataPlaneCheckpointBarrier,
     DataPlaneMutationCut,
     TQReplayBuffer,
@@ -108,6 +109,8 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._rollout_slot_waiters = 0
     ctrl._rollout_permitted_waiters = 0
     ctrl._buffer_capacity_waiters = 0
+    ctrl._rollout_completion_durations_s = deque(maxlen=10_000)
+    ctrl._rollout_queue_wait_durations_s = deque(maxlen=10_000)
 
 
 class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
@@ -119,8 +122,10 @@ class _PausingMutationBarrier(DataPlaneCheckpointBarrier):
         self.release_mutation = asyncio.Event()
 
     @asynccontextmanager
-    async def mutation(self) -> AsyncIterator[DataPlaneMutationCut]:
-        async with super().mutation() as cut:
+    async def mutation(
+        self, kind: CheckpointMutationKind = "other"
+    ) -> AsyncIterator[DataPlaneMutationCut]:
+        async with super().mutation(kind) as cut:
             yield cut
             self.mutation_applied.set()
             await self.release_mutation.wait()
@@ -1146,6 +1151,7 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         def __init__(self) -> None:
             self.generated = 0
             self.two_generated = asyncio.Event()
+            self.stats = SimpleNamespace(committed=0)
 
         async def generate_for_finalization(
             self,
@@ -1184,8 +1190,10 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             rollout_failure=_failure_cfg(),
         )
         ctrl._master_config = SimpleNamespace(
-            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(min_valid_fraction_per_group=None),
         )
+        ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._rollout_manager = manager
         _init_pump_ledgers(ctrl)
         ctrl._finalizer_actors = [object()]
@@ -1233,6 +1241,7 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
     class _RecoveryCaptureManager:
         def __init__(self) -> None:
             self.recovery_ledger = RolloutRecoveryLedger()
+            self.stats = SimpleNamespace(committed=0)
 
         def reserve_prompt_group(
             self,
@@ -1297,7 +1306,8 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
             rollout_failure=_failure_cfg(),
         )
         ctrl._master_config = SimpleNamespace(
-            grpo=GRPOConfig.model_construct(max_num_epochs=1)
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(min_valid_fraction_per_group=None),
         )
         ctrl._algo_cfg = ctrl._master_config.grpo
         ctrl._buffer = _RecordingBuffer()
@@ -1328,19 +1338,19 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
 
         async def _finalize(
             request: Any,
-            *,
-            target_step: int | None = None,
-        ) -> bool:
-            del target_step
+        ) -> Any:
             async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
                 manager.recovery_ledger.discard_group(cut, request.group_id)
-            return committed
+            if not committed:
+                return None
+            return SimpleNamespace(valid_row_count=1, total_row_count=1)
 
         ctrl._finalize_with_actor = _finalize
 
         await ctrl._rollout_pump()
 
         assert manager.recovery_ledger.groups() == []
+        assert manager.stats.committed == int(committed)
         # A committed group transfers its permit to the train pump; a dropped
         # group returns it immediately because no canonical replay row owns it.
         assert ctrl._buffer_capacity._value == (0 if committed else 1)
@@ -1421,6 +1431,7 @@ def test_rollout_pump_writes_expected_tq_data(
         dp_adapter,
         partition_id=_PARTITION_ID,
         pad_value_dict={"token_ids": int(tokenizer.pad_token_id or 0)},
+        include_message_violation_fields=False,
     )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
@@ -1490,6 +1501,8 @@ def test_rollout_pump_writes_expected_tq_data(
         bulk["sample_mask"].float(),
         torch.ones(expected_samples, dtype=torch.float32),
     )
+    assert not bulk["mask_sample"].bool().any()
+    assert not bulk["truncated"].bool().any()
 
     # Same deterministic prompt as test_async_rollout_manager: the model
     # solves the calculator task every time -> reward == 1.0 and decoded
@@ -1520,4 +1533,12 @@ def test_rollout_pump_writes_expected_tq_data(
     for tag in tags:
         assert tag["weight_version"] == 0
         assert tag["prompt_idx"] == input_sample["idx"]
-        assert set(tag) == {"weight_version", "prompt_idx"}
+        # Tag schema: recovery identity plus per-row violation counts.
+        assert set(tag) == {
+            "weight_version",
+            "prompt_idx",
+            "num_invalid_tool_calls",
+            "num_malformed_thinking",
+            "num_assistant_messages",
+            "num_routed_experts_backfilled",
+        }

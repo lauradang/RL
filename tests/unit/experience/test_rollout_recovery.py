@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 from collections.abc import Callable
 from typing import Any, TypeVar
 
@@ -29,11 +30,19 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.experience.rollout_recovery import (
+    _ATTEMPT_STATE_FIELDS,
+    _GROUP_STATE_FIELDS,
+    _PROMPT_REF_STATE_FIELDS,
+    _SIBLING_STATE_FIELDS,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     PromptGroupPhase,
+    PromptGroupRecoveryRecord,
+    PromptRef,
     RecoveryGranularity,
+    RolloutAttemptRecord,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
+    RolloutSiblingRecord,
     SiblingSealResult,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -92,29 +101,6 @@ def _shuffled_prompt_loader(seed: int = 123) -> StatefulDataLoader:
     )
 
 
-def _group_state(
-    idx: int = 7,
-    *,
-    target_step: int | None = 7,
-    phase: str = "admitted",
-) -> dict:
-    return {
-        "group_id": f"g{idx}",
-        "admission_id": "batch-7",
-        "prompt_id": str(idx),
-        "prompt_ref": {
-            "sample_id": str(idx),
-            "task_name": None,
-        },
-        "agent_name": None,
-        "recovery_granularity": "sibling",
-        "expected_generations": 2,
-        "target_step": target_step,
-        "start_weight_version": 7,
-        "phase": phase,
-    }
-
-
 def test_ledger_round_trip_preserves_group_ownership() -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
@@ -126,7 +112,7 @@ def test_ledger_round_trip_preserves_group_ownership() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -148,6 +134,178 @@ def test_ledger_round_trip_preserves_group_ownership() -> None:
 
     assert restored.state_dict() == state
     assert restored.get_group("g7").phase is PromptGroupPhase.ADMITTED
+
+
+def test_serialized_state_fields_match_recovery_dataclasses() -> None:
+    """Require every durable dataclass field to be classified explicitly."""
+    assert _PROMPT_REF_STATE_FIELDS == {
+        field.name for field in dataclasses.fields(PromptRef)
+    }
+    assert _SIBLING_STATE_FIELDS == {
+        field.name for field in dataclasses.fields(RolloutSiblingRecord)
+    }
+    assert _ATTEMPT_STATE_FIELDS == {
+        field.name for field in dataclasses.fields(RolloutAttemptRecord)
+    }
+    assert _GROUP_STATE_FIELDS == {
+        field.name for field in dataclasses.fields(PromptGroupRecoveryRecord)
+    } - {"runtime_prompt_payload"}
+
+
+@pytest.mark.parametrize(
+    ("path", "context"),
+    [
+        ((), "rollout recovery state"),
+        (("groups", 0), "rollout-recovery group"),
+        (("groups", 0, "prompt_ref"), "rollout-recovery prompt_ref"),
+        (("groups", 0, "siblings", 0), "rollout-recovery sibling"),
+        (("groups", 0, "siblings", 0, "attempts", 0), "rollout-recovery attempt"),
+    ],
+)
+def test_ledger_restore_rejects_unknown_fields(
+    path: tuple[object, ...], context: str
+) -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    state = ledger.state_dict()
+    target: Any = state
+    for component in path:
+        target = target[component]
+    assert isinstance(target, dict)
+    target["unexpected"] = True
+
+    with pytest.raises(ValueError, match=rf"{context} contains unknown fields"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+def _sealed_attempt_state() -> dict[str, Any]:
+    ledger = RolloutRecoveryLedger()
+    group = _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+    gate_id = group.gate_rollout_id(0)
+    _mutate(
+        lambda cut: ledger.mark_sibling_sealed(
+            cut,
+            "g7",
+            generation_index=0,
+            gate_rollout_id=gate_id,
+            receipt={
+                "rollout_id": gate_id,
+                "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
+            },
+            reward=1.0,
+            mask_sample=True,
+        )
+    )
+    return ledger.state_dict()
+
+
+@pytest.mark.parametrize(
+    ("case", "error_fragment"),
+    [
+        ("attempt_uuid", "attempt_uuid must contain exactly 16 bytes"),
+        ("status_type", "invalid rollout attempt status"),
+        ("status_value", "invalid rollout attempt status"),
+        ("staging_keys", "staging_keys must be a list of strings"),
+        ("reward", "sealed attempts require a reward"),
+        ("mask_sample", "sealed attempts require a boolean mask_sample"),
+        (
+            "missing_receipt_staging",
+            "sealed missing-receipt attempt cannot own staging keys",
+        ),
+        ("receipt_type", "sealed attempt receipt must be a mapping or None"),
+        ("receipt_manifest_type", "receipt must contain a manifest list"),
+        ("receipt_identity", "sealed receipt identity mismatch"),
+        ("receipt_manifest", "sealed receipt staging manifest mismatch"),
+        ("unsealed_payload", "only sealed attempts may retain receipt data"),
+    ],
+)
+def test_restore_rejects_malformed_attempt_fields(
+    case: str, error_fragment: str
+) -> None:
+    state = _sealed_attempt_state()
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+
+    if case == "attempt_uuid":
+        attempt["attempt_uuid"] = b"short"
+    elif case == "status_type":
+        attempt["status"] = None
+    elif case == "status_value":
+        attempt["status"] = "unknown"
+    elif case == "staging_keys":
+        attempt["staging_keys"] = ["valid", 7]
+    elif case == "reward":
+        attempt["reward"] = None
+    elif case == "mask_sample":
+        attempt["mask_sample"] = "yes"
+    elif case == "missing_receipt_staging":
+        attempt["receipt"] = None
+    elif case == "receipt_type":
+        attempt["receipt"] = []
+    elif case == "receipt_manifest_type":
+        attempt["receipt"]["manifest"] = None
+    elif case == "receipt_identity":
+        attempt["receipt"]["rollout_id"] = "wrong"
+    elif case == "receipt_manifest":
+        attempt["receipt"]["manifest"] = [{"staging_key": "wrong"}]
+    elif case == "unsealed_payload":
+        attempt["status"] = RolloutAttemptStatus.DISPATCHED.value
+    else:  # pragma: no cover - the parameter table above owns the cases.
+        raise AssertionError(f"unknown malformed-attempt case={case!r}")
+
+    with pytest.raises(ValueError, match=error_fragment):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+def test_restore_rejects_non_mapping_attempt() -> None:
+    state = _sealed_attempt_state()
+    state["groups"][0]["siblings"][0]["attempts"][0] = None
+
+    with pytest.raises(ValueError, match="rollout-recovery attempt must be a mapping"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+def test_restore_rejects_duplicate_attempt_identity() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    state = ledger.state_dict()
+    siblings = state["groups"][0]["siblings"]
+    siblings[1]["attempts"][0]["attempt_uuid"] = siblings[0]["attempts"][0][
+        "attempt_uuid"
+    ]
+
+    with pytest.raises(ValueError, match="duplicate rollout attempt identity"):
+        RolloutRecoveryLedger.from_state_dict(state)
 
 
 def test_checkpoint_state_round_trip_preserves_controller_and_ledger_state() -> None:
@@ -176,6 +334,20 @@ def test_checkpoint_state_round_trip_preserves_controller_and_ledger_state() -> 
     assert [group.group_id for group in restored.groups()] == ["g7"]
     assert parsed.batch_shortfall == {7: 1}
     assert parsed.sampler_stamps_target_steps is True
+
+
+def test_checkpoint_parser_rejects_unknown_sidecar_fields() -> None:
+    state = build_rollout_recovery_state(
+        RolloutRecoveryLedger(),
+        batch_shortfall={},
+        sampler_stamps_target_steps=True,
+    )
+    state["unexpected"] = True
+
+    with pytest.raises(
+        ValueError, match="rollout recovery sidecar contains unknown fields"
+    ):
+        parse_rollout_recovery_state(state)
 
 
 def test_checkpoint_parser_defaults_fields_absent_from_older_state() -> None:
@@ -250,49 +422,71 @@ def test_checkpoint_cut_can_guard_a_ledger_mutation() -> None:
     asyncio.run(exercise())
 
 
-def test_recovery_config_resolves_agent_then_task_then_default() -> None:
+def test_recovery_config_resolves_agent_then_task_source_then_default() -> None:
     config = RolloutRecoveryConfig(
         default_granularity=RecoveryGranularity.SIBLING,
-        agent_granularity_overrides={"genrm_agent": RecoveryGranularity.PROMPT_GROUP},
-        task_granularity_overrides={
-            "math": RecoveryGranularity.PROMPT_GROUP,
-            "agent_wins": RecoveryGranularity.SIBLING,
+        task_source_granularity_overrides={
+            "genrm_compare": RecoveryGranularity.PROMPT_GROUP,
+        },
+        agent_granularity_overrides={
+            "legacy_genrm_agent": RecoveryGranularity.PROMPT_GROUP,
+            "sibling_agent": RecoveryGranularity.SIBLING,
         },
     )
 
-    agent_policy = config.resolve_for_prompt(
+    source_policy = config.resolve_for_prompt(
         {
-            "task_name": "agent_wins",
-            "extra_env_info": {"agent_ref": {"name": "genrm_agent"}},
+            "extra_env_info": {
+                "task_source": "genrm_compare",
+                "agent_ref": {"name": "unmapped_agent"},
+            }
         }
     )
-    task_policy = config.resolve_for_prompt(
-        {"task_name": "math", "extra_env_info": None}
+    agent_policy = config.resolve_for_prompt(
+        {
+            "extra_env_info": {
+                "task_source": "genrm_compare",
+                "agent_ref": {"name": "sibling_agent"},
+            }
+        }
     )
     default_policy = config.resolve_for_prompt(
-        {"task_name": "other", "extra_env_info": None}
+        {
+            "extra_env_info": {
+                "task_source": "other",
+                "agent_ref": {"name": "unmapped_agent"},
+            }
+        }
     )
+    with pytest.warns(FutureWarning, match="legacy agent_ref"):
+        legacy_policy = config.resolve_for_prompt(
+            {"extra_env_info": {"agent_ref": {"name": "legacy_genrm_agent"}}}
+        )
 
-    assert agent_policy.agent_name == "genrm_agent"
-    assert agent_policy.granularity is RecoveryGranularity.PROMPT_GROUP
-    assert task_policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert source_policy.task_source == "genrm_compare"
+    assert source_policy.granularity is RecoveryGranularity.PROMPT_GROUP
+    assert agent_policy.task_source == "genrm_compare"
+    assert agent_policy.granularity is RecoveryGranularity.SIBLING
+    assert default_policy.task_source == "other"
     assert default_policy.granularity is RecoveryGranularity.SIBLING
+    assert legacy_policy.task_source is None
+    assert legacy_policy.granularity is RecoveryGranularity.PROMPT_GROUP
 
 
 @pytest.mark.parametrize(
     ("prompt", "error_fragment"),
     [
         (
-            {"extra_env_info": {"agent_ref": "genrm_agent"}},
+            {"extra_env_info": {"task_source": 7}},
+            "task_source must be a string or None",
+        ),
+        (
+            {"extra_env_info": {"agent_ref": "legacy_agent"}},
             "agent_ref must be a mapping or None",
         ),
         (
             {"extra_env_info": {"agent_ref": {"name": 7}}},
             "agent_ref.name must be a string or None",
-        ),
-        (
-            {"task_name": 7},
-            "task_name must be a string or None",
         ),
     ],
 )
@@ -301,6 +495,17 @@ def test_recovery_config_rejects_malformed_prompt_identity(
 ) -> None:
     with pytest.raises(TypeError, match=error_fragment):
         RolloutRecoveryConfig().resolve_for_prompt(prompt)
+
+
+def test_recovery_config_rejects_removed_task_name_override() -> None:
+    with pytest.raises(ValueError, match="task_source_granularity_overrides"):
+        RolloutRecoveryConfig(
+            **{
+                "task_granularity_overrides": {
+                    "legacy": RecoveryGranularity.PROMPT_GROUP
+                }
+            }
+        )
 
 
 def test_target_step_none_does_not_mean_unadmitted() -> None:
@@ -314,7 +519,7 @@ def test_target_step_none_does_not_mean_unadmitted() -> None:
         expected_generations=2,
         target_step=None,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -334,7 +539,7 @@ def test_reserved_group_can_be_admitted_exactly_once() -> None:
         expected_generations=2,
         target_step=None,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=False,
     )
@@ -371,7 +576,7 @@ def test_canonical_groups_are_discarded_without_touching_unfinished_groups() -> 
             expected_generations=2,
             target_step=7,
             start_weight_version=7,
-            agent_name=None,
+            task_source=None,
             recovery_granularity=RecoveryGranularity.SIBLING,
             admitted=True,
         )
@@ -392,7 +597,7 @@ def test_state_dict_stores_a_prompt_ref_without_the_full_payload() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=7,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -421,7 +626,7 @@ def test_bind_runtime_prompt_accepts_changed_content_with_the_same_identity() ->
         expected_generations=2,
         target_step=7,
         start_weight_version=7,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -446,7 +651,7 @@ def test_bind_runtime_prompt_rejects_the_wrong_dataset_sample() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=7,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -475,7 +680,7 @@ def test_prompt_ref_rehydrates_through_a_restored_shuffled_dataloader() -> None:
         expected_generations=2,
         target_step=1,
         start_weight_version=0,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -509,7 +714,7 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -527,6 +732,7 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
+            mask_sample=True,
         )
     )
 
@@ -567,7 +773,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=recovery_granularity,
         admitted=True,
     )
@@ -592,6 +798,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
                         gate_rollout_id=gate_ids[generation_index],
                         receipt=receipt,
                         reward=float(generation_index),
+                        mask_sample=generation_index == 0,
                     )
                 )
             )
@@ -605,6 +812,7 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
                         gate_rollout_id=gate_ids[generation_index],
                         receipt=receipt,
                         reward=float(generation_index),
+                        mask_sample=generation_index == 0,
                     )
                     for generation_index, receipt in enumerate(receipts)
                 },
@@ -613,15 +821,18 @@ def test_missing_receipt_is_a_restart_safe_sealed_placeholder(
 
     state = ledger.state_dict()
     restored = RolloutRecoveryLedger.from_state_dict(state)
-    physical_ids, _, restored_receipts, rewards = restored.finalization_inputs("g7")
+    physical_ids, _, restored_receipts, rewards, mask_sample = (
+        restored.finalization_inputs("g7")
+    )
 
     assert physical_ids == gate_ids
     assert restored_receipts[0] is None
     assert restored_receipts[1] == receipts[1]
     assert rewards == [0.0, 1.0]
+    assert mask_sample == [True, False]
 
     state["schema_version"] = 3
-    with pytest.raises(ValueError, match="before schema v4"):
+    with pytest.raises(ValueError, match="Unsupported rollout-recovery schema version"):
         RolloutRecoveryLedger.from_state_dict(state)
 
 
@@ -636,20 +847,22 @@ def test_prompt_group_restart_retries_every_sibling_when_one_is_unfinished() -> 
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name="genrm_agent",
+        task_source="genrm_compare",
         recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
         admitted=True,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
 
     state = ledger.state_dict()
-    assert state["groups"][0]["agent_name"] == "genrm_agent"
+    assert state["groups"][0]["task_source"] == "genrm_compare"
     assert state["groups"][0]["recovery_granularity"] == "prompt_group"
 
     restored = RolloutRecoveryLedger.from_state_dict(state)
     _mutate(lambda cut: restored.prepare_for_restart(cut))
     recovered = restored.get_group("g7")
 
+    assert recovered.task_source == "genrm_compare"
+    assert recovered.recovery_granularity is RecoveryGranularity.PROMPT_GROUP
     assert [sibling.current_attempt.status for sibling in recovered.siblings] == [
         RolloutAttemptStatus.ABANDONED,
         RolloutAttemptStatus.ABANDONED,
@@ -674,7 +887,7 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name="genrm_agent",
+        task_source="genrm_compare",
         recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
         admitted=True,
     )
@@ -686,15 +899,19 @@ def test_prompt_group_restart_keeps_a_fully_sealed_group() -> None:
             gate_rollout_id=gate_id,
             receipt={
                 "rollout_id": gate_id,
-                "manifest": [
-                    {"staging_key": f"g7/sibling-{generation_index}/call-0"}
-                ],
+                "manifest": [{"staging_key": f"g7/sibling-{generation_index}/call-0"}],
             },
             reward=1.0,
+            mask_sample=False,
         )
     _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", results))
 
-    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    state = ledger.state_dict()
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    _bind(restored, "g7", _prompt())
+
+    assert restored.state_dict() == state
+
     _mutate(lambda cut: restored.prepare_for_restart(cut))
 
     assert restored.get_group("g7").sealed_generation_indices == [0, 1]
@@ -715,7 +932,7 @@ def test_prompt_group_seal_is_atomic() -> None:
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        agent_name="genrm_agent",
+        task_source="genrm_compare",
         recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
         admitted=True,
     )
@@ -729,6 +946,7 @@ def test_prompt_group_seal_is_atomic() -> None:
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
+            mask_sample=False,
         )
     }
 
@@ -755,7 +973,7 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
         expected_generations=1,
         target_step=7,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -772,6 +990,7 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
                 "manifest": [{"staging_key": "g7/sibling-0/call-0"}],
             },
             reward=1.0,
+            mask_sample=False,
         )
     )
     _mutate(lambda cut: ledger.mark_finalization_started(cut, "g7"))
@@ -787,7 +1006,7 @@ def test_checkpoint_rejects_ambiguous_finalization_state(
     [
         ("recovery_granularity", "banana", "invalid recovery_granularity"),
         ("recovery_granularity", None, "recovery_granularity must be a string"),
-        ("agent_name", 123, "agent_name must be a string or None"),
+        ("task_source", 123, "task_source must be a string or None"),
     ],
 )
 def test_restore_rejects_malformed_recovery_policy_fields(
@@ -803,7 +1022,7 @@ def test_restore_rejects_malformed_recovery_policy_fields(
         expected_generations=1,
         target_step=7,
         start_weight_version=6,
-        agent_name=None,
+        task_source=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
         admitted=True,
     )
@@ -818,27 +1037,63 @@ def test_restore_rejects_malformed_recovery_policy_fields(
         _load(RolloutRecoveryLedger(), state)
 
 
-@pytest.mark.parametrize(
-    "state",
-    [
-        {"schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION + 1, "groups": []},
-        {"schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION, "groups": {}},
-        {
-            "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-            "groups": [_group_state(phase="unknown")],
-        },
-        {
-            "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
-            "groups": [
-                _group_state(idx, target_step=target_step, phase=phase)
-                for idx, target_step, phase in (
-                    (7, None, "reserved"),
-                    (8, 7, "admitted"),
-                )
-            ],
-        },
-    ],
-)
-def test_restore_rejects_incompatible_or_malformed_state(state: dict) -> None:
-    with pytest.raises((TypeError, ValueError)):
+def test_restore_rejects_unsupported_schema_version() -> None:
+    state = {
+        "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION + 1,
+        "groups": [],
+    }
+
+    with pytest.raises(ValueError, match="Unsupported rollout-recovery schema"):
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
+
+
+def test_restore_rejects_non_list_groups() -> None:
+    state = {
+        "schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
+        "groups": {},
+    }
+
+    with pytest.raises(ValueError, match="must contain a groups list"):
+        _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
+
+
+def test_restore_rejects_invalid_prompt_group_phase() -> None:
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=1,
+        target_step=7,
+        start_weight_version=6,
+        admitted=True,
+    )
+    state = ledger.state_dict()
+    state["groups"][0]["phase"] = "unknown"
+
+    with pytest.raises(ValueError, match="invalid prompt group phase"):
+        _load(RolloutRecoveryLedger(), state)
+
+
+def test_restore_rejects_inconsistent_shared_admission_state() -> None:
+    ledger = RolloutRecoveryLedger()
+    for idx in (7, 8):
+        _reserve(
+            ledger,
+            group_id=f"g{idx}",
+            admission_id="batch-7",
+            prompt_id=str(idx),
+            prompt_payload=_prompt(idx),
+            expected_generations=1,
+            target_step=7,
+            start_weight_version=6,
+            admitted=True,
+        )
+    state = ledger.state_dict()
+    state["groups"][0]["target_step"] = None
+    state["groups"][0]["phase"] = "reserved"
+
+    with pytest.raises(ValueError, match="disagree on phase or target_step"):
+        _load(RolloutRecoveryLedger(), state)

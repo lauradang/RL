@@ -17,18 +17,21 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
-from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+)
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROUTE_PLAN_TAG
-from nemo_rl.experience.blackbox_finalizer import FinalizedGroup
-from nemo_rl.experience.finalizer_actor import FinalizationRequest
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 from nemo_rl.experience.route_plan import (
     ROUTE_PLAN_SCHEMA_VERSION,
     RouteAssemblyPlan,
@@ -46,9 +49,9 @@ class _RemoteFinalize:
     ) -> None:
         self._result = result
         self._error = error
-        self.calls: list[FinalizationRequest] = []
+        self.calls: list[ReassemblyRequest] = []
 
-    def remote(self, request: FinalizationRequest) -> Any:
+    def remote(self, request: ReassemblyRequest) -> Any:
         self.calls.append(request)
 
         async def _result():
@@ -70,8 +73,8 @@ class _DataPlaneClient:
         )
 
 
-def _request() -> FinalizationRequest:
-    return FinalizationRequest(
+def _request() -> ReassemblyRequest:
+    return ReassemblyRequest(
         group_id="group",
         prompt_idx=17,
         rollout_ids=("group_g0",),
@@ -85,6 +88,7 @@ def _request() -> FinalizationRequest:
             },
         ),
         rewards=(1.0,),
+        mask_sample=(False,),
         fallback_weight_version=3,
     )
 
@@ -105,6 +109,7 @@ def _controller(actor: object) -> Any:
     ctrl._buffer = MagicMock()
     ctrl._buffer.commit_finalized = AsyncMock()
     ctrl._dp_client = _DataPlaneClient()
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._partition_id = "canonical"
     ctrl._master_config = SimpleNamespace(
         token_capture=SimpleNamespace(staging_partition="staging"),
@@ -138,12 +143,13 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
 
     committed = asyncio.run(ctrl._finalize_with_actor(request))
 
-    assert committed is True
+    assert committed is result
     assert finalize.calls == [request]
     assert ctrl._available_finalizers.get_nowait() is actor
     assert ctrl._active_finalizers == 0
     assert ctrl._finalizer_unknown_outcomes == 0
     ctrl._buffer.commit_finalized.assert_awaited_once_with(
+        ANY,
         "group",
         meta,
         3,
@@ -194,6 +200,10 @@ def test_missing_actor_metadata_cleans_known_canonical_and_staging_ownership() -
 
 
 def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
+    # A finalizer-side structural drop (e.g. router replay with no routed
+    # data yet) -- not a low valid-row fraction, which the controller now
+    # decides, not the finalizer (see min_valid_fraction_per_group's removal
+    # from RolloutReassembler).
     result = FinalizedGroup(
         meta=None,
         group_min_wv=3,
@@ -201,14 +211,17 @@ def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
         staging_keys=["group_g0/call"],
         metrics={},
         dropped=True,
-        drop_reason="min_valid_fraction_per_group: 0.000 < 0.5",
+        drop_reason=(
+            "router replay on, no rollout carried routed_experts, "
+            "and (L, K) is unknown yet"
+        ),
     )
     actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
     ctrl = _controller(actor)
 
     committed = asyncio.run(ctrl._finalize_with_actor(_request()))
 
-    assert committed is False
+    assert committed is None
     assert ctrl._dp_client.clear_calls == [
         {"sample_ids": ["group_g0"], "partition_id": "canonical"},
         {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
@@ -248,7 +261,11 @@ def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() 
     )
     ctrl = _controller(SimpleNamespace())
 
-    asyncio.run(ctrl._cleanup_consumed_metas([meta]))
+    async def _cleanup() -> None:
+        async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+            await ctrl._cleanup_consumed_metas_unlocked(cut, [meta])
+
+    asyncio.run(_cleanup())
 
     assert ctrl._dp_client.clear_calls == [
         {
@@ -260,3 +277,36 @@ def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() 
             "partition_id": "staging",
         },
     ]
+
+
+class _SyncDataPlaneClient:
+    """Synchronous client like the production TQ adapter; records caller threads."""
+
+    def __init__(self) -> None:
+        self.clear_calls: list[dict[str, Any]] = []
+        self.clear_thread_ids: list[int] = []
+
+    def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
+        self.clear_thread_ids.append(threading.get_ident())
+        self.clear_calls.append(
+            {"sample_ids": list(sample_ids), "partition_id": partition_id}
+        )
+
+
+def test_known_outcome_cleanup_runs_sync_clears_off_the_event_loop() -> None:
+    ctrl = _controller(SimpleNamespace())
+    ctrl._dp_client = _SyncDataPlaneClient()
+
+    async def _main() -> int:
+        await ctrl._cleanup_known_finalization_request(_request())
+        return threading.get_ident()
+
+    loop_thread_id = asyncio.run(_main())
+
+    assert ctrl._dp_client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+    assert ctrl._dp_client.clear_thread_ids
+    assert all(tid != loop_thread_id for tid in ctrl._dp_client.clear_thread_ids)
+    ctrl._buffer.abort.assert_called_once_with("group")

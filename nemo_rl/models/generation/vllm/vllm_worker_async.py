@@ -16,11 +16,11 @@ import asyncio
 import copy
 import gc
 import logging
-import os
 import threading
 import time
 import uuid
 import warnings
+from collections.abc import Awaitable, Callable
 from typing import Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -55,11 +55,95 @@ from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.openai_server_utils import (
     replace_prefix_tokens,
 )
+from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
+
+
+class _AsyncLLMHTTPClient:
+    """Keep HTTP generation on the loop that owns AsyncLLM request state.
+
+    The engine-client surface is explicit. Do not add a ``__getattr__`` fallback.
+    Add each new member here and decide whether it must run on the engine loop.
+    """
+
+    def __init__(self, engine_client: Any, engine_loop: asyncio.AbstractEventLoop):
+        self._engine_client = engine_client
+        self._engine_loop = engine_loop
+        self.model_config = engine_client.model_config
+        self.renderer = engine_client.renderer
+        self.input_processor = engine_client.input_processor
+        self.vllm_config = engine_client.vllm_config
+
+    async def _run_on_engine_loop(self, operation: Callable[[], Awaitable[Any]]) -> Any:
+        if asyncio.get_running_loop() is self._engine_loop:
+            return await operation()
+
+        future = asyncio.run_coroutine_threadsafe(operation(), self._engine_loop)
+        try:
+            return await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            raise
+
+    def generate(
+        self,
+        prompt: Any,
+        sampling_params: Any,
+        request_id: str,
+        **kwargs: Any,
+    ) -> AsyncGenerator[Any, None]:
+        return self._generate(prompt, sampling_params, request_id, kwargs)
+
+    async def _generate(
+        self,
+        prompt: Any,
+        sampling_params: Any,
+        request_id: str,
+        kwargs: dict[str, Any],
+    ) -> AsyncGenerator[Any, None]:
+        iterator = None
+        completed = False
+
+        async def next_output() -> Any:
+            nonlocal iterator
+            if iterator is None:
+                iterator = self._engine_client.generate(
+                    prompt, sampling_params, request_id, **kwargs
+                )
+            return await anext(iterator)
+
+        try:
+            while True:
+                try:
+                    yield await self._run_on_engine_loop(next_output)
+                except StopAsyncIteration:
+                    completed = True
+                    return
+        finally:
+            if not completed:
+                try:
+                    await self._run_on_engine_loop(
+                        lambda: self._engine_client.abort(request_id)
+                    )
+                except Exception:
+                    LOGGER.exception("Failed to abort vLLM request %s", request_id)
+
+    # These members only read engine status or immutable configuration. Running
+    # them on the engine loop added a cross-thread wait to each HTTP request.
+    @property
+    def errored(self) -> bool:
+        return self._engine_client.errored
+
+    @property
+    def dead_error(self) -> BaseException:
+        return self._engine_client.dead_error
+
+    async def is_tracing_enabled(self) -> bool:
+        return await self._engine_client.is_tracing_enabled()
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -98,11 +182,12 @@ class VllmAsyncGenerationWorkerImpl(
         self._deferred_bundle_indices = None
         self._deferred_seed = None
 
-        # Defaults for HTTP server state; overwritten by _create_engine()
-        # when the worker is a model owner and the model is actually loaded.
+        # Defaults for HTTP server state; populated after the actor loop starts.
         self.server_thread = None
         self.base_url = None
         self.http_server = None
+        self._engine_loop = None
+        self._http_engine_client = None
 
         # Ledger-authoritative token capture (dormant until the
         # setup_token_capture fan-out runs). The weight
@@ -218,37 +303,11 @@ class VllmAsyncGenerationWorkerImpl(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
 
-        if self.cfg["vllm_cfg"].get("expose_http_server"):
-            # Must run after AsyncLLM.from_engine_args and before
-            # _setup_vllm_server spawns the uvicorn thread.
-            self._install_engine_input_socket_lock()
-            self.server_thread, self.base_url, self.http_server = (
-                self._setup_vllm_server()
-            )
-
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
         self._vllm_metrics_lock = threading.Lock()
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
-
-    def _install_engine_input_socket_lock(self) -> None:
-        """Serialise sends on AsyncMPClient.input_socket across OS threads
-        to prevent race conditions that block the vLLM engine (e.g. during
-        in flight weight updates in async grpo).
-        """
-        shadow_sock = self.llm.engine_core.input_socket._shadow_sock
-
-        lock = threading.Lock()
-        original_send_multipart = shadow_sock.send_multipart
-
-        def locked_send_multipart(*args: Any, **kwargs: Any) -> Any:
-            with lock:
-                return original_send_multipart(*args, **kwargs)
-
-        # Replace the bound method on this socket instance only; other zmq
-        # sockets in the process are unaffected.
-        shadow_sock.send_multipart = locked_send_multipart  # type: ignore[assignment]
 
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
@@ -368,6 +427,9 @@ class VllmAsyncGenerationWorkerImpl(
             self.generation_tokens = []
 
     async def post_init_async(self):
+        self._engine_loop = asyncio.get_running_loop()
+        if self._sparse_refit_receiver is not None:
+            self._sparse_refit_receiver.set_async_loop(self._engine_loop)
         if self.llm is not None:
             await self.llm.collective_rpc("bind_numa", args=tuple())
         self.vllm_device_ids = await self.report_device_id_async()
@@ -378,6 +440,11 @@ class VllmAsyncGenerationWorkerImpl(
         if self._sparse_refit_receiver is not None:
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
+        if self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
+            self._http_engine_client = _AsyncLLMHTTPClient(self.llm, self._engine_loop)
+            self.server_thread, self.base_url, self.http_server = (
+                self._setup_vllm_server()
+            )
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -430,22 +497,51 @@ class VllmAsyncGenerationWorkerImpl(
         """Rotate the weight version stamped on subsequent captured calls."""
         self._rollout_weight_version = int(version)
 
-    def _begin_request_capture(self, request: Any, prompt_token_ids: list[int]) -> None:
+    def _capture_admission(self, request: Any) -> Any | None:
+        """Parse the ledger's ``ng_capture`` context into a ``CaptureAdmission``.
+
+        Returns None unless capture is installed and the request carries the
+        context. The dict itself is never mutated: the admission is the typed,
+        read-only contract that the prefix resolution and ``begin_call`` share.
+        """
+        context = getattr(request, "ng_capture", None)
+        if self.token_capture is None or not context:
+            return None
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+        return CaptureAdmission.model_validate(context)
+
+    def _begin_request_capture(
+        self,
+        request: Any,
+        prompt_token_ids: list[int],
+        *,
+        admission: Any | None = None,
+        prefix_token_ids: list[int] | None = None,
+    ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
 
         Called from preprocess_chat once the exact engine prompt is known
         (post-splice in token-in mode, full render in text mode). No-op
         unless capture is installed and the request carries the ledger's
         ``ng_capture`` context.
+
+        ``prefix_token_ids`` is the prefix resolved by
+        :meth:`_resolve_admission_prefix`; Gym's ``begin_call`` checks it
+        against the admission (length == ``prev_len``, equal to an inline
+        prefix) and requires it for a ``staging_chain`` admission.
         """
         capture = self.token_capture
-        context = getattr(request, "ng_capture", None)
-        if capture is None or not context:
+        if capture is None:
             return
-        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
-
+        if admission is None:
+            admission = self._capture_admission(request)
+            if admission is None:
+                return
         call = capture.begin_call(
-            CaptureAdmission.model_validate(context),
+            admission,
+            prefix_token_ids=prefix_token_ids,
             stream=bool(getattr(request, "stream", False)),
         )
         self._capture_calls[id(request)] = (call, list(prompt_token_ids))
@@ -477,22 +573,31 @@ class VllmAsyncGenerationWorkerImpl(
                 del cache[next(iter(cache))]
         return result
 
-    def _patch_chain_prefix(self, ng_capture: dict[str, Any]) -> list[int] | None:
-        """Fetch a staged prefix and patch a raw capture admission in place."""
-        staging_chain = ng_capture.get("staging_chain") or []
-        if not staging_chain:
-            return None
-        prefix_token_ids = self._fetch_chain_prefix(staging_chain)
-        prev_len = ng_capture.get("prev_len")
-        if type(prev_len) is not int or prev_len <= 0:
-            raise ValueError("staging_chain admission requires prev_len > 0")
-        if len(prefix_token_ids) != prev_len:
-            raise ValueError(
-                "staging_chain prefix length mismatch: "
-                f"expected {prev_len}, fetched {len(prefix_token_ids)}"
-            )
-        ng_capture["required_prefix_token_ids"] = prefix_token_ids
-        return prefix_token_ids
+    def _resolve_admission_prefix(self, admission: Any) -> list[int]:
+        """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with.
+
+        A ``staging_chain`` is fetched through the cached TransferQueue read;
+        an inline ``required_prefix_token_ids`` is used as is; a text root has
+        no prefix. Length checks are Gym's: ``begin_call`` rejects a prefix
+        that does not match ``prev_len``.
+        """
+        if admission.mode == "text":
+            return []
+        if admission.staging_chain:
+            return self._fetch_chain_prefix(list(admission.staging_chain))
+        return list(admission.required_prefix_token_ids)
+
+    def _enter_request_prefix(self, request: Any, prefix_token_ids: list[int]) -> None:
+        """Attach the resolved prefix to the request through the capture adapter.
+
+        ``VLLMCaptureAdapter.enter_prefix`` writes the engine-native field
+        (``required_prefix_token_ids``) into a payload; the same fields are
+        applied to the pydantic request so the existing prefix-splice branch
+        of preprocess_chat handles staged and inline prefixes alike.
+        """
+        adapter = self.token_capture.adapter
+        for field_name, value in adapter.enter_prefix({}, prefix_token_ids).items():
+            setattr(request, field_name, value)
 
     @staticmethod
     def _delta_align_routed_experts(
@@ -543,12 +648,12 @@ class VllmAsyncGenerationWorkerImpl(
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
         """Stage the finished call and ride its coords on the response.
 
-        Fail-closed (§ 3.5): the sink write happens inside complete_call —
+        Fail-closed: the sink write happens inside complete_call —
         the coords exist only after the bytes are durable, and any capture
         failure degrades to capture_failed coords without breaking the
         completion. Token ids and logprobs are stripped: the staged delta is
         the only token store on this path, so the worker->gate hop carries
-        text + delta ids + coords only (§ 3.2).
+        text + delta ids + coords only.
         """
         state = self._capture_calls.pop(id(request), None)
         if state is None:
@@ -635,7 +740,9 @@ class VllmAsyncGenerationWorkerImpl(
                 maybe_reasoning_parser_plugin
             )
 
-        engine_client = self.llm
+        engine_client = self._http_engine_client
+        if engine_client is None:
+            raise RuntimeError("The HTTP engine client is not initialized.")
         model_config = self.llm_async_engine_args.create_model_config()
         base_model_paths = [
             BaseModelPath(
@@ -684,10 +791,17 @@ class VllmAsyncGenerationWorkerImpl(
                 """Clamp the request's max output tokens so that input + output <= max_model_len."""
                 remaining = self.model_config.max_model_len - len(prompt_token_ids)
                 if remaining <= 0:
-                    raise ValueError(
+                    # preserve the literal "context length" in this message to match Gym's overflow handling
+                    message = (
                         f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
-                        f"max_model_len ({self.model_config.max_model_len}). "
+                        f"this model's maximum context length ({self.model_config.max_model_len}). "
                         f"No room for output tokens."
+                    )
+                    LOGGER.warning("Prompt exceeds max_model_len: %s", message)
+                    raise VLLMValidationError(
+                        message,
+                        parameter="input_tokens",
+                        value=len(prompt_token_ids),
                     )
                 max_tokens = min(request_max_tokens, remaining)
                 self._set_max_tokens(request, max_tokens)
@@ -748,19 +862,24 @@ class VllmAsyncGenerationWorkerImpl(
                         )
                     raise
 
-                # Check staging_chain in ng_capture before required_prefix_token_ids.
-                # Off-loop: the prefix fetch is a blocking TQ read, and Gym's
-                # staging protocol requires the serving host to move blocking
-                # staging I/O off its event loop explicitly.
-                ng_capture_dict = getattr(request, "ng_capture", None) or {}
-                chain_prefix_token_ids = await asyncio.to_thread(
-                    worker_self._patch_chain_prefix, ng_capture_dict
-                )
+                # Token capture: build the admission once, before branching,
+                # and resolve its prefix from it (staging_chain -> cached TQ
+                # read, inline ids, or nothing for a text root). The
+                # ``ng_capture`` dict is never mutated. Off-loop: the chain
+                # fetch is a blocking TQ read, and Gym's staging protocol
+                # requires the serving host to move blocking staging I/O off
+                # its event loop explicitly. The adapter then attaches the
+                # prefix to the request, so the inline-prefix branch below is
+                # the single splice path for staged and inline prefixes.
+                admission = worker_self._capture_admission(request)
+                capture_prefix_token_ids: list[int] | None = None
+                if admission is not None and admission.mode == "token_in":
+                    capture_prefix_token_ids = await asyncio.to_thread(
+                        worker_self._resolve_admission_prefix, admission
+                    )
+                    worker_self._enter_request_prefix(request, capture_prefix_token_ids)
 
-                if chain_prefix_token_ids is not None:
-                    # External staging, token-in mode: fetch prefix from TQ.
-                    model_prefix_token_ids = chain_prefix_token_ids
-                elif (
+                if (
                     not hasattr(request, "required_prefix_token_ids")
                     or request.required_prefix_token_ids is None
                 ):
@@ -774,11 +893,11 @@ class VllmAsyncGenerationWorkerImpl(
                     # Token capture, text mode: the full render is the exact
                     # engine prompt.
                     worker_self._begin_request_capture(
-                        request, res[1][0]["prompt_token_ids"]
+                        request, res[1][0]["prompt_token_ids"], admission=admission
                     )
                     return res
-                else:
-                    model_prefix_token_ids = list(request.required_prefix_token_ids)
+
+                model_prefix_token_ids = list(request.required_prefix_token_ids)
 
                 # Token-in splice path — shared by staging_chain and direct prefix.
                 last_assistant_message_idx = None
@@ -836,8 +955,14 @@ class VllmAsyncGenerationWorkerImpl(
                     )
 
                 # Token capture, token-in mode: the spliced prompt is the
-                # exact engine prompt.
-                worker_self._begin_request_capture(request, final_prompt_token_ids)
+                # exact engine prompt; begin_call re-checks the prefix it
+                # was spliced from against the admission.
+                worker_self._begin_request_capture(
+                    request,
+                    final_prompt_token_ids,
+                    admission=admission,
+                    prefix_token_ids=capture_prefix_token_ids,
+                )
 
                 return res
 
@@ -1059,6 +1184,7 @@ class VllmAsyncGenerationWorkerImpl(
                         "error": {
                             "message": str(e),
                             "type": "invalid_request_error",
+                            "param": e.parameter,
                             "code": 400,
                         }
                     },
@@ -1223,13 +1349,6 @@ class VllmAsyncGenerationWorkerImpl(
         base_url = f"http://{node_ip}:{free_port}/v1"
         print(f"Starting server on {base_url}")
 
-        byte_dir = os.environ.get("NRL_HTTP_BYTES_DIR")
-        if byte_dir:
-            # Perf-measurement tooling only (see nemo_rl/utils/http_byte_counter.py).
-            from nemo_rl.utils.http_byte_counter import HttpByteCounterMiddleware
-
-            app = HttpByteCounterMiddleware(app, "vllm_worker", byte_dir)  # type: ignore[assignment]
-
         config = uvicorn.Config(
             app,
             host="0.0.0.0",
@@ -1253,9 +1372,7 @@ class VllmAsyncGenerationWorkerImpl(
         if reserved_sock is not None:
             # Hand the pre-bound listening socket directly to uvicorn's asyncio
             # server via server.serve(sockets=). No close-and-rebind needed.
-            import asyncio
-
-            def _run_with_socket():
+            def _run_with_socket() -> None:
                 loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(loop)
                 loop.run_until_complete(server.serve(sockets=[reserved_sock]))
@@ -1722,7 +1839,8 @@ class VllmAsyncGenerationWorkerImpl(
 
             # TODO: switch to update_weights_from_local_ipc_handles for better performance once collectively report_device_id is supported in asyncLLM initialization
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_via_ipc_zmq", args=tuple()
+                "update_weights_via_ipc_zmq",
+                args=tuple(),
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1761,7 +1879,8 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
             result_or_coro = await self.llm.collective_rpc(
-                "update_weights_from_collective", args=(refit_timeout_s,)
+                "update_weights_from_collective",
+                args=(refit_timeout_s, self._refit_with_reload_api_enabled()),
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -1962,6 +2081,11 @@ class VllmAsyncGenerationWorkerImpl(
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self.server_thread is not None:
+                self.http_server.should_exit = True
+                await asyncio.to_thread(self.server_thread.join)
+                self.server_thread = None
+
             if self._sparse_refit_receiver is not None:
                 await asyncio.to_thread(self._sparse_refit_receiver.shutdown)
 
@@ -1983,21 +2107,17 @@ class VllmAsyncGenerationWorkerImpl(
             gc.collect()
             torch.cuda.empty_cache()
 
-            if self.server_thread is not None:
-                from threading import Thread
-
-                from uvicorn import Server
-
-                self.http_server: Server
-                self.server_thread: Thread
-
-                self.http_server.should_exit = True
-                self.server_thread.join()
-
             return True
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+        finally:
+            # Flush buffered spans/metrics before the actor goes away. Off the
+            # event loop: the flush blocks on a network export with a 5s
+            # timeout, and this is an async actor whose other coroutines --
+            # including in-flight generate requests -- share this loop. Same
+            # reason the sparse-refit shutdown above is offloaded.
+            await asyncio.to_thread(shutdown_telemetry)
 
 
 @ray.remote(
