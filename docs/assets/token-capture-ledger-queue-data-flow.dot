@@ -125,14 +125,6 @@ digraph token_capture_flow {
     label="SHARED — replay construction\nRolloutReassembler.finalize_rollout()\nTQTokenSource.fetch_for_finalization()\nverify_and_linearize() → canonical GRPO sample"
   ];
 
-  api_gap [
-    shape=note,
-    style="filled,dashed",
-    color="#b45309",
-    fillcolor="#fef3c7",
-    label="CURRENT API GAP\nVllmAsyncGenerationWorkerImpl._begin_request_capture() passes prefix_token_ids,\nbut RolloutTokenCapture.begin_call() does not accept it"
-  ];
-
   gym_admit -> vllm_prepare [label="vLLM"];
   gym_admit -> megatron_prepare [label="Megatron"];
   vllm_prepare -> vllm_admit;
@@ -153,8 +145,6 @@ digraph token_capture_flow {
   capture_failure -> receipt [style=dashed, color="#b91c1c"];
   receipt -> finalizer;
   finalizer -> tq_staging [label="fetch by staging_key", dir=back];
-  api_gap -> vllm_admit [style=dashed, color="#b45309", arrowhead=none];
-
   { rank=same; vllm_prepare; megatron_prepare; }
   { rank=same; vllm_admit; megatron_admit; }
   { rank=same; vllm_generate; megatron_generate; }
