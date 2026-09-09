@@ -14,11 +14,9 @@
 """TransferQueue implementations of NeMo-Gym's token staging protocols.
 
 ``TQStagingStore`` is NeMo RL's single keyed-row transport for token custody.
-The vLLM-facing ``TQTokenSink`` codec writes canonical Gym call deltas, while
-the MInf-facing ``TQRequestPayloadStager`` codec writes engine-native payloads
-under response UIDs. Their matching sources read the rows back for the
-finalizer. This module is the only hot-path file that knows tokens live in TQ;
-Gym sees opaque staging keys.
+Both vLLM and MInf write canonical Gym call deltas through ``TQTokenSink``.
+This module is the only hot-path file that knows tokens live in TQ; Gym sees
+opaque staging keys.
 
 Each staged row carries three jagged columns (``token_ids_delta``,
 ``token_mask_delta``, ``generation_logprobs_delta``), the complete receipt
@@ -35,9 +33,8 @@ from __future__ import annotations
 
 import json
 import logging
-import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import ray
 import torch
@@ -97,23 +94,6 @@ STAGING_FIELDS = [
     ROUTED_LEN_FIELD,
 ]
 
-# MInf's RequestPayloadStager writes the engine-native completion payload
-# immediately, before the stripped HTTP response is released.  These columns
-# intentionally live in the same partition as the canonical vLLM rows: only
-# one backend is active in a run, and finalization selects the corresponding
-# schema explicitly.
-MINF_PAYLOAD_FIELDS = [
-    "minf_prompt_token_ids",
-    "minf_generated_token_ids",
-    "minf_generated_logprobs",
-    "minf_weight_version",
-]
-MINF_OPTIONAL_PAYLOAD_FIELDS = [
-    "minf_prompt_logprobs",
-    "minf_routing_indices",
-    "minf_routing_shape",
-]
-
 _MODE_TO_CODE = {"text": 0, "token_in": 1}
 _CODE_TO_MODE = {code: mode for mode, code in _MODE_TO_CODE.items()}
 
@@ -145,19 +125,6 @@ class FetchedStagedCall:
     snapshot: StagedCallBaseSnapshot
     routed_len: int
     fragment: RouteFragment | None = None
-
-
-@dataclass(frozen=True)
-class FetchedMInfPayload:
-    """One MInf request payload read from TQ by its response UID."""
-
-    request_uid: str
-    prompt_token_ids: list[int]
-    generated_token_ids: list[int]
-    generated_log_probs: list[float]
-    prompt_log_probs: list[float] | None
-    routing_indices: torch.Tensor | None
-    weight_version: int
 
 
 def _call_dp(dp_client: Any, method_name: str, **kwargs: Any) -> Any:
@@ -210,142 +177,6 @@ class TQStagingStore:
             sample_ids=list(keys),
             partition_id=self._staging_partition,
         )
-
-
-class TQRequestPayloadStager:
-    """MInf ``RequestPayloadStager`` backed by the shared TQ row store.
-
-    MInf's protocol has no failure return value.  Consequently ``stage``
-    deliberately propagates TQ failures: the engine must not acknowledge a
-    stripped response unless its payload is durable.
-    """
-
-    def __init__(
-        self,
-        store: TQStagingStore,
-        *,
-        weight_version: int = 0,
-        weight_version_fn: Callable[[str], int] | None = None,
-    ) -> None:
-        self._store = store
-        self._weight_version = 0
-        self._weight_version_fn = weight_version_fn
-        self._lock = threading.Lock()
-        self.set_weight_version(weight_version)
-
-    def set_weight_version(self, version: int) -> None:
-        if type(version) is not int or version < 0:
-            raise ValueError(
-                f"rollout weight version must be a non-negative int, got {version!r}"
-            )
-        with self._lock:
-            self._weight_version = version
-
-    def stage(self, uid: str, payload: Any) -> None:
-        if not isinstance(uid, str) or not uid:
-            raise ValueError("MInf request UID must be a non-empty string")
-        prompt_token_ids = getattr(payload, "prompt_token_ids", None)
-        generated_token_ids = getattr(payload, "generated_token_ids", None)
-        generated_log_probs = getattr(payload, "generated_log_probs", None)
-        if prompt_token_ids is None:
-            raise ValueError("MInf offloaded payload carries no prompt_token_ids")
-        if generated_token_ids is None:
-            raise ValueError("MInf offloaded payload carries no generated_token_ids")
-        if generated_log_probs is None:
-            raise ValueError("MInf offloaded payload carries no generated_log_probs")
-        if len(generated_token_ids) != len(generated_log_probs):
-            raise ValueError(
-                "MInf generated token and log-probability lengths differ: "
-                f"{len(generated_token_ids)} != {len(generated_log_probs)}"
-            )
-
-        prompt_log_probs = getattr(payload, "prompt_log_probs", None)
-        routing_indices = getattr(payload, "routing_indices", None)
-        routing = None
-        routing_shape = None
-        if routing_indices is not None:
-            routing = torch.as_tensor(routing_indices)
-            if routing.dim() != 3:
-                raise ValueError(
-                    "MInf routing_indices must have shape [tokens, layers, topk], "
-                    f"got {tuple(routing.shape)}"
-                )
-            routing_shape = tuple(int(size) for size in routing.shape)
-            routing = routing.to(dtype=torch.int32).reshape(-1)
-
-        with self._lock:
-            weight_version = (
-                self._weight_version_fn(uid)
-                if self._weight_version_fn is not None
-                else self._weight_version
-            )
-            if type(weight_version) is not int or weight_version < 0:
-                raise ValueError(
-                    "MInf payload weight version must be a non-negative int, "
-                    f"got {weight_version!r}"
-                )
-            fields = {
-                "minf_prompt_token_ids": torch.tensor(
-                    [list(prompt_token_ids)], dtype=torch.int64
-                ),
-                "minf_generated_token_ids": torch.tensor(
-                    [list(generated_token_ids)], dtype=torch.int64
-                ),
-                "minf_generated_logprobs": torch.tensor(
-                    [list(generated_log_probs)], dtype=torch.float32
-                ),
-                "minf_weight_version": torch.tensor(
-                    [weight_version], dtype=torch.int64
-                ),
-            }
-            if prompt_log_probs is not None:
-                fields["minf_prompt_logprobs"] = torch.tensor(
-                    [list(prompt_log_probs)], dtype=torch.float32
-                )
-            if routing is not None and routing_shape is not None:
-                fields["minf_routing_indices"] = routing.unsqueeze(0)
-                fields["minf_routing_shape"] = torch.tensor(
-                    [routing_shape], dtype=torch.int64
-                )
-            self._store.put(
-                uid,
-                fields,
-                tags={
-                    "payload_kind": "minf_request",
-                    "request_uid": uid,
-                    "weight_version": weight_version,
-                },
-            )
-
-
-class TQMInfPayloadSource:
-    """Fetch MInf request payloads from TQ by response UID."""
-
-    def __init__(self, store: TQStagingStore) -> None:
-        self._store = store
-
-    def fetch(self, request_uids: list[str]) -> list[FetchedMInfPayload]:
-        if not request_uids:
-            return []
-        if len(set(request_uids)) != len(request_uids):
-            raise KeyError("MInf payload request contains duplicate UIDs")
-        try:
-            rows = self._store.get(
-                request_uids, select_fields=list(MINF_PAYLOAD_FIELDS)
-            )
-        except Exception as error:  # noqa: BLE001 — normalize storage misses
-            raise KeyError(
-                f"MInf payload rows for {len(request_uids)} UIDs could not be fetched: {error}"
-            ) from error
-        n_rows = int(rows.batch_size[0]) if len(rows.batch_size) else 0
-        if n_rows != len(request_uids):
-            raise KeyError(
-                f"MInf payload rows missing: requested {len(request_uids)}, got {n_rows}"
-            )
-        return [
-            _row_to_minf_payload(uid, _select_row(rows, index))
-            for index, uid in enumerate(request_uids)
-        ]
 
 
 class TQTokenSink:
@@ -507,6 +338,195 @@ class TQTokenSink:
     def clear(self, staging_keys: list[str]) -> None:
         """Drop staged rows (finalizer / eviction cleanup)."""
         self._store.clear(staging_keys)
+
+
+@dataclass(frozen=True)
+class MegatronPayloadStageResult:
+    """Structural MInf staging acknowledgement returned to the engine."""
+
+    response_metadata: dict[str, Any]
+
+
+class TQMegatronPromptPreparer:
+    """Resolve a Gym-authorized staged prefix before MInf admits a request."""
+
+    def __init__(self, source: TQTokenSource) -> None:
+        self._source = source
+
+    def prepare_prompt(
+        self,
+        prompt: str | list[int] | torch.Tensor,
+        *,
+        request_metadata: dict[str, Any] | None = None,
+    ) -> tuple[str | list[int] | torch.Tensor, dict[str, Any] | None]:
+        """Fetch a chained prefix, splice it into the prompt, and update admission."""
+        if request_metadata is None:
+            return prompt, None
+        capture_payload = request_metadata.get("ng_capture")
+        if capture_payload is None:
+            return prompt, request_metadata
+
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+        admission = CaptureAdmission.model_validate(capture_payload)
+        if admission.mode == "text":
+            return prompt, request_metadata
+        if not isinstance(prompt, list):
+            raise TypeError("MInf token-in capture requires a token-id list prompt")
+
+        prefix_token_ids = list(admission.required_prefix_token_ids)
+        if admission.staging_chain:
+            prefix_token_ids = self._source.fetch_prefix_token_ids(
+                list(admission.staging_chain)
+            )
+        if len(prefix_token_ids) != admission.prev_len:
+            raise ValueError(
+                "MInf capture prefix length mismatch: "
+                f"expected {admission.prev_len}, got {len(prefix_token_ids)}"
+            )
+
+        updated_metadata = dict(request_metadata)
+        updated_admission = admission.model_copy(
+            update={"required_prefix_token_ids": prefix_token_ids}
+        )
+        updated_metadata["ng_capture"] = updated_admission.model_dump(mode="json")
+
+        suffix_token_ids = updated_metadata.get("ng_prompt_suffix_token_ids")
+        boundary_token_id = updated_metadata.get("ng_prefix_boundary_token_id")
+        if suffix_token_ids is not None or boundary_token_id is not None:
+            if not isinstance(suffix_token_ids, list) or any(
+                type(token_id) is not int for token_id in suffix_token_ids
+            ):
+                raise ValueError(
+                    "MInf capture request carries no valid prompt suffix tokens"
+                )
+            if type(boundary_token_id) is not int:
+                raise ValueError(
+                    "MInf capture request carries no valid prefix boundary token"
+                )
+            prompt_prefix = prefix_token_ids
+            if prompt_prefix and prompt_prefix[-1] == boundary_token_id:
+                prompt_prefix = prompt_prefix[:-1]
+            prompt = prompt_prefix + suffix_token_ids
+        elif admission.staging_chain:
+            raise ValueError(
+                "MInf staged-prefix request carries no prompt splice metadata"
+            )
+        elif prompt[: admission.prev_len] != prefix_token_ids:
+            raise ValueError(
+                "MInf generation prompt does not begin with the authorized token prefix"
+            )
+
+        if prompt[: admission.prev_len] != prefix_token_ids:
+            raise ValueError("MInf failed to apply the authorized token prefix")
+        return prompt, updated_metadata
+
+
+class TQMegatronTokenStager:
+    """Canonicalize one admitted MInf completion through Gym's capture core.
+
+    MInf owns the exact prompt/output material and its per-request policy epoch.
+    Gym owns the lineage admission carried opaquely as ``ng_capture``. This
+    adapter joins them before the response leaves MInf, writes the same
+    canonical TQ row as vLLM, and returns lightweight commit coordinates.
+    """
+
+    def __init__(self, sink: TQTokenSink) -> None:
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
+
+        self._capture = RolloutTokenCapture(
+            sink=sink,
+            # MInf passes the authoritative version explicitly for every call.
+            weight_version_fn=lambda: 0,
+        )
+
+    @staticmethod
+    def _weight_version(finished_metadata: Any) -> int:
+        policy_epoch = getattr(finished_metadata, "policy_epoch", None)
+        if not isinstance(policy_epoch, list) or not policy_epoch:
+            raise ValueError("MInf captured request carries no policy_epoch boundaries")
+        try:
+            versions = {int(boundary[1]) for boundary in policy_epoch}
+        except (IndexError, TypeError, ValueError) as error:
+            raise ValueError(
+                "MInf captured request carries invalid policy_epoch metadata"
+            ) from error
+        if len(versions) != 1:
+            raise ValueError(
+                f"MInf captured request spans policy epochs {sorted(versions)}"
+            )
+        (version,) = versions
+        if version < 0:
+            raise ValueError(
+                f"MInf captured request has negative policy epoch {version}"
+            )
+        return version
+
+    def stage(
+        self,
+        uid: str,
+        payload: Any,
+        *,
+        finished_metadata: Any,
+        request_metadata: dict[str, Any] | None = None,
+    ) -> MegatronPayloadStageResult | None:
+        """Stage an admitted request, or decline ordinary non-capture traffic."""
+        if not isinstance(uid, str) or not uid:
+            raise ValueError("MInf request UID must be a non-empty string")
+        capture_payload = (request_metadata or {}).get("ng_capture")
+        if capture_payload is None:
+            return None
+        try:
+            return self._stage_admitted(
+                payload,
+                capture_payload=capture_payload,
+                finished_metadata=finished_metadata,
+            )
+        except Exception:  # noqa: BLE001 — capture failure must not fail generation
+            logging.getLogger(__name__).exception(
+                "MInf canonical token capture failed for request %s", uid
+            )
+            return None
+
+    def _stage_admitted(
+        self,
+        payload: Any,
+        *,
+        capture_payload: Any,
+        finished_metadata: Any,
+    ) -> MegatronPayloadStageResult:
+        """Validate and stage traffic that carries a Gym capture admission."""
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+        admission = CaptureAdmission.model_validate(capture_payload)
+        prompt_token_ids = getattr(payload, "prompt_token_ids", None)
+        generated_token_ids = getattr(payload, "generated_token_ids", None)
+        generated_log_probs = getattr(payload, "generated_log_probs", None)
+        if prompt_token_ids is None:
+            raise ValueError("MInf offloaded payload carries no prompt_token_ids")
+        if generated_token_ids is None:
+            raise ValueError("MInf offloaded payload carries no generated_token_ids")
+        if generated_log_probs is None:
+            raise ValueError("MInf offloaded payload carries no generated_log_probs")
+
+        call = self._capture.begin_call(
+            admission,
+            weight_version=self._weight_version(finished_metadata),
+        )
+        coords = self._capture.complete_call(
+            call,
+            prompt_token_ids=[int(token_id) for token_id in prompt_token_ids],
+            generated_token_ids=[int(token_id) for token_id in generated_token_ids],
+            generated_logprobs=[float(value) for value in generated_log_probs],
+        )
+        return MegatronPayloadStageResult(
+            response_metadata={
+                "ng_commit_coords": coords.model_dump(mode="json"),
+            }
+        )
 
 
 class TQTokenSource:
@@ -671,36 +691,6 @@ def _row_leaf(row: Any, name: str) -> torch.Tensor:
 
 def _row_text(row: Any, name: str) -> str:
     return bytes(int(value) for value in _row_leaf(row, name).tolist()).decode("utf-8")
-
-
-def _row_to_minf_payload(
-    request_uid: str, row: dict[str, torch.Tensor]
-) -> FetchedMInfPayload:
-    """Decode one raw MInf row while preserving float32 wire values."""
-
-    def _values(name: str) -> torch.Tensor:
-        value = row[name]
-        tensor = value[0] if value.dim() > 1 or value.numel() > 1 else value
-        return tensor.reshape(-1)
-
-    return FetchedMInfPayload(
-        request_uid=request_uid,
-        prompt_token_ids=[
-            int(value) for value in _values("minf_prompt_token_ids").tolist()
-        ],
-        generated_token_ids=[
-            int(value) for value in _values("minf_generated_token_ids").tolist()
-        ],
-        generated_log_probs=[
-            float(value) for value in _values("minf_generated_logprobs").tolist()
-        ],
-        # Optional prompt logprobs/routes remain durable when MInf supplies
-        # them, but current Gym finalization neither selects nor consumes
-        # them (MInf router replay is rejected during setup).
-        prompt_log_probs=None,
-        routing_indices=None,
-        weight_version=_row_scalar_int(row, "minf_weight_version"),
-    )
 
 
 def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:

@@ -126,6 +126,7 @@ class MegatronGenerationMixin:
         self._inference_thread = None
         self._token_capture_enabled = False
         self._request_payload_stager = None
+        self._request_prompt_preparer = None
 
     def _get_megatron_inference_wrapper_cls(self) -> Optional[type]:
         """Resolve the configured Megatron inference wrapper, if any.
@@ -766,7 +767,7 @@ class MegatronGenerationMixin:
     def setup_token_capture(
         self, dp_cfg: "DataPlaneConfig", staging_partition: str
     ) -> bool:
-        """Install the TQ payload stager on each MInf model-parallel leader."""
+        """Install canonical TQ capture on each MInf model-parallel leader."""
         engine = self.dynamic_inference_engine
         if engine is None:
             raise RuntimeError(
@@ -774,69 +775,38 @@ class MegatronGenerationMixin:
             )
         missing = [
             name
-            for name in (
-                "payload_stager",
-                "local_metadata_ledger_enabled",
-                "local_metadata_ledger",
-            )
+            for name in ("payload_stager", "prompt_preparer")
             if not hasattr(engine, name)
         ]
         if missing:
             raise RuntimeError(
-                "Megatron token capture requires MInf RequestPayloadStager and "
-                f"per-request epoch metadata support; missing {', '.join(missing)}"
+                "Megatron token capture requires MInf RequestPayloadStager, request "
+                f"metadata, and prompt preparation support; missing {', '.join(missing)}"
             )
-        engine.local_metadata_ledger_enabled = True
         self._token_capture_enabled = True
         if not engine.is_mp_coordinator:
             return False
 
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import (
-            TQRequestPayloadStager,
-            TQStagingStore,
+            TQMegatronPromptPreparer,
+            TQMegatronTokenStager,
+            TQTokenSink,
+            TQTokenSource,
         )
 
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
-        stager = TQRequestPayloadStager(
-            TQStagingStore(dp_client, staging_partition=staging_partition),
-            weight_version_fn=self._pop_payload_weight_version,
+        prompt_preparer = TQMegatronPromptPreparer(
+            TQTokenSource(dp_client, staging_partition=staging_partition)
+        )
+        engine.prompt_preparer = prompt_preparer
+        self._request_prompt_preparer = prompt_preparer
+        stager = TQMegatronTokenStager(
+            TQTokenSink(dp_client, staging_partition=staging_partition)
         )
         engine.payload_stager = stager
         self._request_payload_stager = stager
         return True
-
-    def _pop_payload_weight_version(self, request_uid: str) -> int:
-        """Consume the exact engine epoch recorded for one completed request."""
-        engine = self.dynamic_inference_engine
-        if engine is None:
-            raise RuntimeError("Megatron inference engine is not initialized")
-        record = engine.local_metadata_ledger.pop(request_uid, None)
-        if record is None:
-            raise RuntimeError(
-                f"MInf request {request_uid!r} carries no policy epoch metadata"
-            )
-        policy_epoch = record.policy_epoch
-        if not isinstance(policy_epoch, list) or not policy_epoch:
-            raise ValueError(
-                f"MInf request {request_uid!r} carries no policy_epoch boundaries"
-            )
-        try:
-            versions = {int(boundary[1]) for boundary in policy_epoch}
-        except (IndexError, TypeError, ValueError) as error:
-            raise ValueError(
-                f"MInf request {request_uid!r} has invalid policy_epoch metadata"
-            ) from error
-        if len(versions) != 1:
-            raise ValueError(
-                f"MInf request {request_uid!r} spans policy epochs {sorted(versions)}"
-            )
-        (version,) = versions
-        if version < 0:
-            raise ValueError(
-                f"MInf request {request_uid!r} has negative policy epoch {version}"
-            )
-        return version
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Stamp subsequent MInf requests with the trainer weight version."""
@@ -846,8 +816,6 @@ class MegatronGenerationMixin:
             )
         if not self._token_capture_enabled:
             raise RuntimeError("Megatron token capture is not initialized")
-        if self._request_payload_stager is not None:
-            self._request_payload_stager.set_weight_version(version)
         if torch.distributed.get_rank() != 0:
             return
         if self.inference_client is None:

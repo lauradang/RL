@@ -246,7 +246,7 @@ def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
     if generation_backend == "vllm":
         return "vllm_worker"
     if generation_backend == "megatron":
-        return "megatron_ledger"
+        return "megatron_worker"
     raise ValueError(
         "token_capture.enabled requires setup-derived generation_backend to be "
         f"'vllm' or 'megatron'; got {generation_backend!r}"
@@ -820,24 +820,13 @@ Depending on your data shape, you may want to change these values."""
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
         from nemo_gym.token_id_capture.staging.attribution import resolve_terminal
-        from nemo_gym.token_id_capture.staging.records import (
-            CallRecord,
-            PendingCallRecord,
-        )
+        from nemo_gym.token_id_capture.staging.records import CallRecord
         from nemo_gym.token_id_capture.staging.terminal import select_terminal_call
 
         records = [dict(record) for record in manifest.get("records") or []]
-        pending_records = [
-            dict(record) for record in manifest.get("pending_records") or []
-        ]
-        if records and pending_records:
-            raise ValueError(
-                "capture manifest cannot mix staged and pending call records"
-            )
-        receipt_records = pending_records or records
         failures = list(manifest.get("failures") or [])
         deduped: dict[str, dict] = {}
-        for record in receipt_records:
+        for record in records:
             deduped.setdefault(str(record.get("model_call_id")), record)
         terminal_record = None
         selection_reason = None
@@ -845,54 +834,32 @@ Depending on your data shape, you may want to change these values."""
         terminal_selection = "heuristic"
         parsed_records = None
         try:
-            record_type = PendingCallRecord if pending_records else CallRecord
             parsed_records = [
-                record_type.model_validate(record) for record in deduped.values()
+                CallRecord.model_validate(record) for record in deduped.values()
             ]
         except ValueError:
             selection_reason = "invalid_manifest_row"
         if parsed_records is not None:
-            if pending_records:
-                # Pending MInf rows do not carry the content-fingerprint fields
-                # consumed by resolve_terminal. Prefer the explicit correlation
-                # id, then use the strict lineage heuristic when none was given.
-                if terminal_response_id is not None:
-                    terminal_selection = "declared"
-                    matches = [
-                        record
-                        for record in parsed_records
-                        if record.logical_request_id == terminal_response_id
-                        or record.response_id == terminal_response_id
-                    ]
-                    if len(matches) == 1:
-                        terminal_record = deduped[matches[0].model_call_id]
-                else:
-                    selection = select_terminal_call(parsed_records)
-                    if selection.terminal_model_call_id is not None:
-                        terminal_record = deduped[selection.terminal_model_call_id]
-                    else:
-                        selection_reason = selection.reason
+            attribution = resolve_terminal(
+                parsed_records,
+                scored_response,
+                declared_response_id=terminal_response_id,
+            )
+            attribution_reason = attribution.reason or None
+            if attribution.attributed:
+                terminal_selection = attribution.method
+                terminal_record = deduped[attribution.model_call_id]
+            elif terminal_response_id is not None:
+                # A declaration is authoritative: a declared id the ledger
+                # cannot confirm masks and never falls back to the heuristic.
+                terminal_selection = "declared"
+                selection_reason = None
             else:
-                attribution = resolve_terminal(
-                    parsed_records,
-                    scored_response,
-                    declared_response_id=terminal_response_id,
-                )
-                attribution_reason = attribution.reason or None
-                if attribution.attributed:
-                    terminal_selection = attribution.method
-                    terminal_record = deduped[attribution.model_call_id]
-                elif terminal_response_id is not None:
-                    # A declaration is authoritative: a declared id the ledger
-                    # cannot confirm masks and never falls back to the heuristic.
-                    terminal_selection = "declared"
-                    selection_reason = None
+                selection = select_terminal_call(parsed_records)
+                if selection.terminal_model_call_id is not None:
+                    terminal_record = deduped[selection.terminal_model_call_id]
                 else:
-                    selection = select_terminal_call(parsed_records)
-                    if selection.terminal_model_call_id is not None:
-                        terminal_record = deduped[selection.terminal_model_call_id]
-                    else:
-                        selection_reason = selection.reason
+                    selection_reason = selection.reason
         poisoning_failures = [
             failure
             for failure in failures
@@ -913,14 +880,12 @@ Depending on your data shape, you may want to change these values."""
                 if terminal_record is not None
                 else None
             ),
-            "manifest": [] if pending_records else list(deduped.values()),
+            "manifest": list(deduped.values()),
             "capture_poisoned": failure_reason is not None,
             "failure_reason": failure_reason,
             "terminal_selection": terminal_selection,
             "terminal_attribution_reason": attribution_reason,
         }
-        if pending_records:
-            receipt["pending_manifest"] = list(deduped.values())
         return receipt
 
     def _postprocess_nemo_gym_to_nemo_rl_result(

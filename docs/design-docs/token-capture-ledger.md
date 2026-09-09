@@ -64,7 +64,7 @@ When external staging is enabled, `resolve_parent()` builds the
 | Lineage outcome | Admission |
 | --- | --- |
 | `ROOT` — empty assistant fingerprint, or unmatched fingerprint on a rollout with no ledger rows (seeded assistant history) | `text` mode, no parent |
-| `MATCH` — unique fingerprint match with verified context digest | `token_in` mode, `required_prefix_token_ids` = parent's cumulative tokens |
+| `MATCH` — unique fingerprint match with verified context digest | `token_in` mode, the parent's ordered `staging_chain`, cumulative length, and chain hash |
 | `UNRESOLVED` — non-empty fingerprint with no match, ambiguity, or digest mismatch | no admission; `record_failure()` poisons the call |
 
 `UNRESOLVED` is never silently converted into a new root: doing so would turn
@@ -79,35 +79,28 @@ parent until its staged record is durable* — holds structurally: the worker
 stages through `StagingSink.stage()` before acknowledging, coordinates exist
 only after the bytes are durable, and the ledger row (which is what makes a
 call resolvable as a parent) is written only after the coordinates arrive.
-On `disposition == "staged"` the commit hook reconstructs
-`cumulative = parent_tokens + token_ids_delta` and appends the extended row;
-on `capture_failed`, missing coordinates, or any acknowledgement error it
-appends a failure row instead. A request that dies after admission is poisoned
-from the capture middleware's `finally` hook.
+On `disposition == "staged"` the commit hook appends the token-free coordinates
+and lineage witnesses to the ledger. On `capture_failed`, missing coordinates,
+or any acknowledgement error it appends a failure row instead. A request that
+dies after admission is poisoned from the capture middleware's `finally` hook.
 
 ### Megatron Inference payload staging
 
-MInf uses the same durability boundary through its `RequestPayloadStager`
-protocol. Each model-parallel coordinator installs NeMo RL's
-`TQRequestPayloadStager`; when a request completes, MInf synchronously writes
-the full `OffloadedRequestPayload` to the staging partition under the response
-UID before returning the token-light HTTP response. The stager and the vLLM
-Gym sink share `TQStagingStore`, so partition addressing, local-versus-Ray
-client dispatch, reads, and cleanup have one implementation.
+MInf now uses the same canonical durability boundary through two generic engine
+hooks. Gym's complete `CaptureAdmission` travels as opaque request metadata.
+Before engine admission, the model-parallel coordinator resolves an admitted
+`staging_chain` through `TQTokenSource`, splices the exact parent tokens into
+the rendered prompt, and broadcasts that prepared request to every rank. When
+generation completes, the coordinator passes that admission, the exact
+`OffloadedRequestPayload`, and the finished request's policy epoch to
+`TQMegatronTokenStager`.
 
-`OffloadedRequestPayload` does not carry the request's policy epoch. MInf's
-small local metadata ledger remains enabled for that field only: the stager
-consumes the just-completed UID's epoch record in-process and stamps it on the
-same TQ row. This preserves a request that overlaps an epoch change and does
-not reintroduce engine-side token custody or a driver-side flush.
-
-Gym records a `PendingCallRecord` containing that response UID and the HTTP
-lineage witnesses. It does not copy the offloaded payload back through the RL
-driver. At finalization, the CPU actor fetches the UID-keyed rows, validates
-their token lengths and hashes against the pending records, and uses Gym's
-capture builder to construct canonical records in memory for the existing
-`verify_and_linearize()` boundary. The physical UID keys remain the cleanup
-and recovery keys; there is no second heavy-token write.
+The stager invokes Gym's engine-neutral `RolloutTokenCapture`, which constructs
+the canonical delta and writes it through the same `TQTokenSink` used by vLLM.
+Only after that write returns does MInf attach `ng_commit_coords` to the HTTP
+response. Gym consequently commits an ordinary token-free `CallRecord` before
+the response is released to the agent. No local metadata ledger or rollout-end
+conversion is involved in the active path.
 
 ## Framework-owned receipt and cleanup
 
@@ -120,11 +113,8 @@ For vLLM:
 - `capture_poisoned` = any failure row present, or no row for the terminal
   request.
 
-For MInf, `manifest` is empty and `pending_manifest` contains the token-light
-`PendingCallRecord` rows. Those rows are already durable references because
-MInf staged each payload before exposing its response. The recovery ledger
-therefore seals the receipt immediately and owns the referenced response UIDs
-until finalization publishes or rejects the rollout.
+MInf and vLLM both produce committed `manifest` rows that point directly to
+canonical TQ records.
 
 Terminal selection has a strict precedence: **declared > heuristic > mask**. A
 harness-declared terminal is authoritative — a declared id that matches no

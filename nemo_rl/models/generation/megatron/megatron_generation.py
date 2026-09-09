@@ -398,7 +398,7 @@ class MegatronGeneration(GenerationInterface):
     def setup_token_capture(
         self, dp_cfg: "DataPlaneConfig", staging_partition: str
     ) -> None:
-        """Install MInf's per-completion TQ stager on every engine replica."""
+        """Install MInf's canonical prompt and completion capture hooks."""
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(
                 "Megatron token capture requires mcore_generation_config."

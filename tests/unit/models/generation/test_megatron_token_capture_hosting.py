@@ -49,28 +49,38 @@ def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
     ]
 
 
-def test_worker_installs_payload_stager_only_on_mp_coordinator(monkeypatch):
-    installed = []
+def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
+    monkeypatch,
+):
+    installed_sinks = []
+    installed_sources = []
 
-    class _Store:
+    class _Sink:
         def __init__(self, client, *, staging_partition):
-            installed.append((client, staging_partition))
+            installed_sinks.append((client, staging_partition))
+
+    class _Source:
+        def __init__(self, client, *, staging_partition):
+            installed_sources.append((client, staging_partition))
+
+    class _Preparer:
+        def __init__(self, source):
+            self.source = source
 
     class _Stager:
-        def __init__(self, store, *, weight_version_fn):
-            self.store = store
-            self.weight_version_fn = weight_version_fn
-            self.versions = []
-
-        def set_weight_version(self, version):
-            self.versions.append(version)
+        def __init__(self, sink):
+            self.sink = sink
 
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
     )
-    monkeypatch.setattr("nemo_rl.data_plane.tq_token_sink.TQStagingStore", _Store)
+    monkeypatch.setattr("nemo_rl.data_plane.tq_token_sink.TQTokenSink", _Sink)
+    monkeypatch.setattr("nemo_rl.data_plane.tq_token_sink.TQTokenSource", _Source)
     monkeypatch.setattr(
-        "nemo_rl.data_plane.tq_token_sink.TQRequestPayloadStager", _Stager
+        "nemo_rl.data_plane.tq_token_sink.TQMegatronPromptPreparer", _Preparer
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.tq_token_sink.TQMegatronTokenStager", _Stager
     )
     monkeypatch.setattr(
         "nemo_rl.models.generation.megatron.megatron_worker.torch.distributed.get_rank",
@@ -80,9 +90,8 @@ def test_worker_installs_payload_stager_only_on_mp_coordinator(monkeypatch):
     worker = object.__new__(MegatronGenerationMixin)
     worker.dynamic_inference_engine = SimpleNamespace(
         payload_stager=None,
+        prompt_preparer=None,
         is_mp_coordinator=True,
-        local_metadata_ledger_enabled=False,
-        local_metadata_ledger={},
     )
     epochs = []
     worker.inference_client = SimpleNamespace(
@@ -90,27 +99,36 @@ def test_worker_installs_payload_stager_only_on_mp_coordinator(monkeypatch):
     )
     worker._token_capture_enabled = False
     worker._request_payload_stager = None
+    worker._request_prompt_preparer = None
 
     assert worker.setup_token_capture({}, "rollout_staging")
     assert (
         worker.dynamic_inference_engine.payload_stager is worker._request_payload_stager
     )
-    assert installed == [("dp", "rollout_staging")]
+    assert (
+        worker.dynamic_inference_engine.prompt_preparer
+        is worker._request_prompt_preparer
+    )
+    assert installed_sinks == [("dp", "rollout_staging")]
+    assert installed_sources == [("dp", "rollout_staging")]
 
     worker.set_rollout_weight_version(7)
-    assert worker._request_payload_stager.versions == [7]
     assert epochs == [7]
 
     follower = object.__new__(MegatronGenerationMixin)
     follower.dynamic_inference_engine = SimpleNamespace(
         payload_stager=None,
+        prompt_preparer=None,
         is_mp_coordinator=False,
-        local_metadata_ledger_enabled=False,
     )
     follower._token_capture_enabled = False
     follower._request_payload_stager = None
+    follower._request_prompt_preparer = None
     assert not follower.setup_token_capture({}, "rollout_staging")
     assert follower.dynamic_inference_engine.payload_stager is None
+    assert follower.dynamic_inference_engine.prompt_preparer is None
+    assert installed_sinks == [("dp", "rollout_staging")]
+    assert installed_sources == [("dp", "rollout_staging")]
 
 
 def test_worker_requires_minf_payload_stager_protocol() -> None:
@@ -119,19 +137,3 @@ def test_worker_requires_minf_payload_stager_protocol() -> None:
 
     with pytest.raises(RuntimeError, match="RequestPayloadStager"):
         worker.setup_token_capture({}, "rollout_staging")
-
-
-def test_worker_consumes_exact_per_request_policy_epoch() -> None:
-    worker = object.__new__(MegatronGenerationMixin)
-    worker.dynamic_inference_engine = SimpleNamespace(
-        local_metadata_ledger={"uid": SimpleNamespace(policy_epoch=[(0, 4), (2, 4)])}
-    )
-
-    assert worker._pop_payload_weight_version("uid") == 4
-    assert worker.dynamic_inference_engine.local_metadata_ledger == {}
-
-    worker.dynamic_inference_engine.local_metadata_ledger["mixed"] = SimpleNamespace(
-        policy_epoch=[(0, 4), (2, 5)]
-    )
-    with pytest.raises(ValueError, match="spans policy epochs"):
-        worker._pop_payload_weight_version("mixed")
