@@ -1115,6 +1115,15 @@ def setup_single_controller(
     # ray_actor_environment_registry.py), so nothing here needs to change the
     # worker's environment.
     token_capture_cfg = master_config.token_capture
+    if (
+        generation_config["backend"] == "megatron"
+        and router_replay_enabled(master_config.policy)
+        and not token_capture_cfg.enabled
+    ):
+        raise ValueError(
+            "Megatron router replay requires token_capture.enabled=true so "
+            "MInf routing indices can be joined with Gym lineage"
+        )
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
@@ -1185,8 +1194,9 @@ def setup_single_controller(
                 )
             if router_replay_enabled(master_config.policy):
                 raise NotImplementedError(
-                    "Megatron token capture does not yet support router replay: "
-                    "the canonical MInf stager does not yet normalize routed experts"
+                    "Megatron token capture does not support "
+                    "token_capture.defer_routed_experts_to_policy yet; MInf "
+                    "routing indices are aligned in the canonical stager"
                 )
             ACTOR_ENVIRONMENT_REGISTRY[
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker"
