@@ -70,8 +70,9 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
             self.source = source
 
     class _Stager:
-        def __init__(self, sink):
+        def __init__(self, sink, *, require_routed_experts):
             self.sink = sink
+            self.require_routed_experts = require_routed_experts
 
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
@@ -100,6 +101,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         set_generation_epoch=lambda version: epochs.append(version)
     )
     worker._token_capture_enabled = False
+    worker._router_replay_enabled = True
     worker._request_payload_stager = None
     worker._request_prompt_preparer = None
 
@@ -113,6 +115,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     )
     assert installed_sinks == [("dp", "rollout_staging")]
     assert installed_sources == [("dp", "rollout_staging")]
+    assert worker._request_payload_stager.require_routed_experts
 
     worker.set_rollout_weight_version(7)
     assert epochs == [7]
@@ -124,6 +127,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         is_mp_coordinator=False,
     )
     follower._token_capture_enabled = False
+    follower._router_replay_enabled = True
     follower._request_payload_stager = None
     follower._request_prompt_preparer = None
     assert not follower.setup_token_capture({}, "rollout_staging")

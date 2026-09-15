@@ -260,6 +260,7 @@ def _apply_inference_cuda_graph_scope(
             mcore_generation_config["inference_cuda_graph_scope"]
         ]
 
+
 if TYPE_CHECKING:
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
 
@@ -1000,7 +1001,8 @@ class MegatronGenerationMixin:
         engine.prompt_preparer = prompt_preparer
         self._request_prompt_preparer = prompt_preparer
         stager = TQMegatronTokenStager(
-            TQTokenSink(dp_client, staging_partition=staging_partition)
+            TQTokenSink(dp_client, staging_partition=staging_partition),
+            require_routed_experts=self._router_replay_enabled,
         )
         engine.payload_stager = stager
         self._request_payload_stager = stager

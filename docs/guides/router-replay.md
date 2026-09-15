@@ -7,11 +7,11 @@ stages. Without replay, two valid router implementations can choose different
 experts for the same token, which introduces train-vs-rollout logprob mismatch
 that is unrelated to the policy update.
 
-Router Replay is disabled by default. It is not needed for dense models. In
-the current NeMo RL integration, Router Replay is wired and tested for
-Megatron MoE policy training with vLLM rollout generation. Other
-inference/generation backends are not wired into this path and have not been
-tested with Router Replay.
+Router Replay is disabled by default. It is not needed for dense models. The
+current NeMo RL integration supports Megatron MoE policy training with either
+vLLM rollout generation or Megatron Inference (MInf) generation through the
+SingleController token-capture path. Other inference/generation backends are
+not wired into Router Replay.
 
 ## Configuration
 
@@ -23,10 +23,37 @@ policy:
     enabled: true
 ```
 
-When Router Replay is enabled, NeMo RL configures vLLM rollout generation to
-return routed expert indices by setting `enable_return_routed_experts=True` in
-the vLLM kwargs. The generation payload is then carried through the normal
+### vLLM generation
+
+When Router Replay is enabled with vLLM, NeMo RL configures rollout generation
+to return routed expert indices by setting `enable_return_routed_experts=True`
+in the vLLM kwargs. The generation payload is then carried through the normal
 rollout and policy data path as the `routed_experts` field.
+
+### Megatron Inference generation
+
+MInf Router Replay is supported only by the SingleController NeMo-Gym path.
+Configure all of the following:
+
+```yaml
+env:
+  should_use_nemo_gym: true
+token_capture:
+  enabled: true
+  defer_routed_experts_to_policy: false
+policy:
+  generation:
+    backend: megatron
+    mcore_generation_config:
+      expose_http_server: true
+```
+
+MInf produces routes with shape `[T - 1, L, K]`. Its serving-side canonical
+stager appends the terminal fallback row, delta-aligns the routes using Gym's
+capture admission, and commits them to TransferQueue with the token IDs and
+logprobs. Deferred route materialization in the policy worker is not supported
+for MInf. See the [token-capture ledger design](../design-docs/token-capture-ledger.md#minf-router-replay)
+for the component-level data flow and multi-turn boundary behavior.
 
 For models that also train MoE-based MTP heads, Router Replay skips MTP
 routers by default. This keeps MTP routers on their native routing decisions

@@ -1203,6 +1203,16 @@ class TestSetup:
                 "min_groups_for_streaming_train",
             ),
             ("colocated_vllm", ValueError, "supported only with backend='megatron'"),
+            (
+                "megatron_routes_without_capture",
+                ValueError,
+                "router replay requires token_capture.enabled",
+            ),
+            (
+                "megatron_deferred_routes",
+                NotImplementedError,
+                "defer_routed_experts_to_policy",
+            ),
             ("gym_on_sglang", NotImplementedError, "vllm and megatron"),
             (
                 "deferred_routes_without_capture",
@@ -1233,7 +1243,7 @@ class TestSetup:
         match: str,
         patched_factories,
     ):
-        use_gym = invalid_case == "gym_on_sglang"
+        use_gym = invalid_case in ("megatron_deferred_routes", "gym_on_sglang")
         if invalid_case == "min_groups":
             mc = _make_master_config()
             mc.async_rl.min_groups_for_streaming_train = 5
@@ -1273,6 +1283,16 @@ class TestSetup:
         elif invalid_case == "colocated_vllm":
             # Colocated generation is rejected for every backend but megatron.
             mc = _make_master_config(colocated=True)
+        elif invalid_case == "megatron_routes_without_capture":
+            mc = _make_master_config(
+                colocated=False, backend="megatron", megatron_enabled=True
+            )
+            mc.policy["router_replay"] = {"enabled": True}
+        elif invalid_case == "megatron_deferred_routes":
+            mc = self._make_gym_megatron_config()
+            mc.token_capture.enabled = True
+            mc.token_capture.defer_routed_experts_to_policy = True
+            mc.policy["router_replay"] = {"enabled": True}
         elif invalid_case == "gym_on_sglang":
             mc = _make_master_config(colocated=False, backend="sglang")
         elif invalid_case == "prompt_group_recovery_without_capture":
@@ -1923,6 +1943,9 @@ class TestSetup:
         gym = scenario != "native"
         if gym:
             mc = self._make_gym_megatron_config(colocated=colocated)
+            if scenario == "gym":
+                # Direct MInf route staging is the supported Megatron R3 mode.
+                mc.policy["router_replay"] = {"enabled": True}
             patched_factories["setup_response_data"].return_value = (
                 list(range(8)),
                 None,

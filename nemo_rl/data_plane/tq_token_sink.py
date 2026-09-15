@@ -60,7 +60,8 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
 )
-from nemo_rl.experience.route_assembly import RouteFragment
+from nemo_rl.experience.route_assembly import ROUTE_MISSING_SENTINEL, RouteFragment
+from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 # These names come from nemo_gym.token_id_capture.staging.records.StagedCallRecord,
 # transformed by stage() below. Adding a field means editing both this list and
@@ -406,6 +407,49 @@ def resolve_admission_prefix(
     return list(admission.required_prefix_token_ids)
 
 
+def _delta_align_minf_routing_indices(
+    routing_indices: Any,
+    *,
+    total_tokens: int,
+    prev_len: int,
+) -> torch.Tensor:
+    """Convert MInf ``[T - 1, L, K]`` routes to Gym's delta-token layout."""
+    if not 0 <= prev_len <= total_tokens:
+        raise ValueError(
+            f"MInf route prev_len must be in [0, {total_tokens}], got {prev_len}"
+        )
+    routes = torch.as_tensor(routing_indices)
+    if routes.dim() != 3:
+        raise ValueError(
+            "MInf routing_indices must have shape [tokens, layers, topk], "
+            f"got {tuple(routes.shape)}"
+        )
+    expected_routes = total_tokens - 1
+    if routes.shape[0] != expected_routes:
+        raise ValueError(
+            "MInf routing_indices must contain one row for every non-final token: "
+            f"got {routes.shape[0]}, expected {expected_routes}"
+        )
+    if routes.shape[1] <= 0 or routes.shape[2] <= 0:
+        raise ValueError(
+            "MInf routing_indices layer and top-k dimensions must be positive"
+        )
+    if routes.dtype not in (torch.int8, torch.int16, torch.int32):
+        raise ValueError(
+            "MInf routing_indices must use int8, int16, or int32 storage, "
+            f"got {routes.dtype}"
+        )
+    aligned = torch.full(
+        (total_tokens, routes.shape[1], routes.shape[2]),
+        ROUTE_MISSING_SENTINEL,
+        dtype=routes.dtype,
+        device=routes.device,
+    )
+    if expected_routes:
+        aligned[:-1].copy_(routes)
+    return aligned[prev_len:]
+
+
 class TQMegatronPromptPreparer:
     """Resolve a Gym-authorized staged prefix before MInf admits a request.
 
@@ -493,7 +537,12 @@ class TQMegatronTokenStager:
     canonical TQ row as vLLM, and returns lightweight commit coordinates.
     """
 
-    def __init__(self, sink: TQTokenSink) -> None:
+    def __init__(
+        self,
+        sink: TQTokenSink,
+        *,
+        require_routed_experts: bool = False,
+    ) -> None:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
 
@@ -502,6 +551,7 @@ class TQMegatronTokenStager:
             # MInf passes the authoritative version explicitly for every call.
             weight_version_fn=lambda: 0,
         )
+        self._require_routed_experts = require_routed_experts
 
     @staticmethod
     def _weight_version(finished_metadata: Any) -> int:
@@ -539,49 +589,71 @@ class TQMegatronTokenStager:
         capture_payload = (request_metadata or {}).get("ng_capture")
         if capture_payload is None:
             return None
+        call = None
         try:
-            return self._stage_admitted(
-                payload,
-                capture_payload=capture_payload,
-                finished_metadata=finished_metadata,
+            # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+            from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+            admission = CaptureAdmission.model_validate(capture_payload)
+            call = self._capture.begin_call(
+                admission,
+                weight_version=self._weight_version(finished_metadata),
             )
+            return self._stage_admitted(payload, call=call)
         except Exception:  # noqa: BLE001 — capture failure must not fail generation
             logging.getLogger(__name__).exception(
                 "MInf canonical token capture failed for request %s", uid
             )
+            if call is not None and not call.completed:
+                coords = self._capture.fail_call(
+                    call, reason="megatron_payload_staging_failed"
+                )
+                return MegatronPayloadStageResult(
+                    response_metadata={
+                        "ng_commit_coords": coords.model_dump(mode="json"),
+                    }
+                )
             return None
 
     def _stage_admitted(
         self,
         payload: Any,
         *,
-        capture_payload: Any,
-        finished_metadata: Any,
+        call: Any,
     ) -> MegatronPayloadStageResult:
         """Validate and stage traffic that carries a Gym capture admission."""
-        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
-        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
-
-        admission = CaptureAdmission.model_validate(capture_payload)
+        admission = call.admission
         prompt_token_ids = getattr(payload, "prompt_token_ids", None)
         generated_token_ids = getattr(payload, "generated_token_ids", None)
         generated_log_probs = getattr(payload, "generated_log_probs", None)
+        routing_indices = getattr(payload, "routing_indices", None)
         if prompt_token_ids is None:
             raise ValueError("MInf offloaded payload carries no prompt_token_ids")
         if generated_token_ids is None:
             raise ValueError("MInf offloaded payload carries no generated_token_ids")
         if generated_log_probs is None:
             raise ValueError("MInf offloaded payload carries no generated_log_probs")
-
-        call = self._capture.begin_call(
-            admission,
-            weight_version=self._weight_version(finished_metadata),
-        )
+        if routing_indices is None and self._require_routed_experts:
+            raise ValueError(
+                "MInf offloaded payload carries no routing_indices while router "
+                "replay is enabled"
+            )
+        prompt_token_ids = [int(token_id) for token_id in prompt_token_ids]
+        generated_token_ids = [int(token_id) for token_id in generated_token_ids]
+        extras = None
+        if routing_indices is not None:
+            routed_experts = _delta_align_minf_routing_indices(
+                routing_indices,
+                total_tokens=len(prompt_token_ids) + len(generated_token_ids),
+                prev_len=admission.prev_len,
+            )
+            extras = {"routed_experts": encode_routed_experts(routed_experts)}
         coords = self._capture.complete_call(
             call,
-            prompt_token_ids=[int(token_id) for token_id in prompt_token_ids],
-            generated_token_ids=[int(token_id) for token_id in generated_token_ids],
+            prompt_token_ids=prompt_token_ids,
+            generated_token_ids=generated_token_ids,
             generated_logprobs=[float(value) for value in generated_log_probs],
+            extras=extras,
         )
         return MegatronPayloadStageResult(
             response_metadata={
