@@ -115,9 +115,14 @@ The canonical MInf stager owns both that payload and Gym's admission, including
 form `[T, L, K]`, then slices `routes[prev_len:]`. The result has exactly
 `delta_len` rows and is committed as the call's digest-bound `routed_experts`
 extra. `-1` is the replay fallback sentinel: at that position the trainer lets
-its current router select experts. All other positions reuse MInf's expert
-identities while still computing the current policy's router scores and
-probabilities for those experts.
+its current router select experts. This deliberately differs from vLLM, which
+uses an in-range placeholder for its terminal row. All other positions normally
+reuse MInf's expert identities while still computing the current policy's
+router scores and probabilities for those experts. One multi-turn exception is
+the parent call's last sampled token: MInf records its real route while
+prefilling the child request at `prev_len - 1`, but the child's
+`routes[prev_len:]` delta slice drops that row, so the already-committed parent
+position remains `-1` and falls back to the current router.
 
 ```mermaid
 flowchart LR

@@ -48,6 +48,7 @@ from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     TQMegatronTokenStager,
     TQTokenSink,
     TQTokenSource,
+    _delta_align_minf_routing_indices,
     resolve_admission_prefix,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
@@ -284,6 +285,69 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
         [[9, 10], [11, 12]],
         [[-1, -1], [-1, -1]],
     ]
+    [without_routes] = TQTokenSource(
+        tq_client, staging_partition=staging_partition
+    ).fetch_for_finalization(["minf-r0/c1"])
+    assert without_routes.routed_len == 0
+    assert without_routes.fragment is None
+
+
+@pytest.mark.parametrize(
+    ("routes", "total_tokens", "prev_len", "match"),
+    [
+        pytest.param(
+            torch.zeros((2, 2), dtype=torch.int32),
+            3,
+            0,
+            r"shape \[tokens, layers, topk\]",
+            id="rank",
+        ),
+        pytest.param(
+            torch.zeros((1, 1, 2), dtype=torch.int32),
+            3,
+            0,
+            "one row for every non-final token",
+            id="row-count",
+        ),
+        pytest.param(
+            torch.zeros((2, 0, 2), dtype=torch.int32),
+            3,
+            0,
+            "dimensions must be positive",
+            id="zero-layers",
+        ),
+        pytest.param(
+            torch.zeros((2, 1, 0), dtype=torch.int32),
+            3,
+            0,
+            "dimensions must be positive",
+            id="zero-topk",
+        ),
+        pytest.param(
+            torch.zeros((2, 1, 2), dtype=torch.int64),
+            3,
+            0,
+            "must use int8, int16, or int32 storage",
+            id="dtype",
+        ),
+        pytest.param(
+            torch.zeros((2, 1, 2), dtype=torch.int32),
+            3,
+            4,
+            "prev_len must be in",
+            id="prev-len",
+        ),
+    ],
+)
+def test_delta_align_minf_routing_indices_rejects_malformed_routes(
+    routes, total_tokens, prev_len, match
+):
+    with pytest.raises(ValueError, match=match):
+        _delta_align_minf_routing_indices(
+            routes,
+            total_tokens=total_tokens,
+            prev_len=prev_len,
+        )
 
 
 def test_megatron_stager_rejects_misaligned_routes(tq_client, staging_partition):
