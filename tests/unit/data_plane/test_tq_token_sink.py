@@ -308,7 +308,85 @@ def test_megatron_stager_rejects_misaligned_routes(tq_client, staging_partition)
         request_metadata={"ng_capture": admission.model_dump(mode="json")},
     )
 
-    assert result is None
+    assert result is not None
+    assert (
+        result.response_metadata["ng_commit_coords"]["disposition"] == "capture_failed"
+    )
+
+
+def test_megatron_stager_delta_aligns_token_in_routes(tq_client, staging_partition):
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition),
+        require_routed_experts=True,
+    )
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0",
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=3,
+        mode="token_in",
+        required_prefix_token_ids=[10, 11, 12],
+        parent_chain_hash="00" * 32,
+    )
+    routes = torch.arange(5 * 2 * 2, dtype=torch.int32).reshape(5, 2, 2)
+
+    result = stager.stage(
+        "minf-response-2",
+        SimpleNamespace(
+            prompt_token_ids=[10, 11, 12, 13],
+            generated_token_ids=[14, 15],
+            generated_log_probs=[-0.25, -0.5],
+            routing_indices=routes,
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        request_metadata={"ng_capture": admission.model_dump(mode="json")},
+    )
+
+    assert result is not None
+    coords = result.response_metadata["ng_commit_coords"]
+    assert coords["disposition"] == "staged"
+    [snapshot] = TQTokenSource(
+        tq_client, staging_partition=staging_partition
+    ).fetch_for_finalization(["minf-r0/c2"], include_route_fragments=True)
+    assert snapshot.token_ids_delta == [13, 14, 15]
+    assert snapshot.routed_len == 3
+    assert snapshot.fragment is not None
+    assert snapshot.fragment.routes.tolist() == [
+        routes[3].tolist(),
+        routes[4].tolist(),
+        [[-1, -1], [-1, -1]],
+    ]
+
+
+def test_megatron_stager_requires_routes_when_router_replay_is_enabled(
+    tq_client, staging_partition
+):
+    stager = TQMegatronTokenStager(
+        TQTokenSink(tq_client, staging_partition=staging_partition),
+        require_routed_experts=True,
+    )
+    admission = nemo_gym.CaptureAdmission(
+        rollout_id="minf-r0",
+        model_call_id="c1",
+        mode="text",
+    )
+
+    result = stager.stage(
+        "minf-response-1",
+        SimpleNamespace(
+            prompt_token_ids=[10],
+            generated_token_ids=[11],
+            generated_log_probs=[-0.1],
+            routing_indices=None,
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        request_metadata={"ng_capture": admission.model_dump(mode="json")},
+    )
+
+    assert result is not None
+    assert (
+        result.response_metadata["ng_commit_coords"]["disposition"] == "capture_failed"
+    )
 
 
 @pytest.mark.parametrize("prefix_source", ["staging_chain", "capture_admission"])

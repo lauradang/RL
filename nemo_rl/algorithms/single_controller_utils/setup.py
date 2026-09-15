@@ -1193,7 +1193,10 @@ def setup_single_controller(
                     "Megatron token capture requires policy.generation."
                     "mcore_generation_config.expose_http_server=true"
                 )
-            if router_replay_enabled(master_config.policy):
+            if (
+                router_replay_enabled(master_config.policy)
+                and token_capture_cfg.defer_routed_experts_to_policy
+            ):
                 raise NotImplementedError(
                     "Megatron token capture does not support "
                     "token_capture.defer_routed_experts_to_policy yet; MInf "

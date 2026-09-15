@@ -1928,6 +1928,9 @@ class TestSetup:
         gym = scenario != "native"
         if gym:
             mc = self._make_gym_megatron_config(colocated=colocated)
+            if scenario == "gym":
+                # Direct MInf route staging is the supported Megatron R3 mode.
+                mc.policy["router_replay"] = {"enabled": True}
             patched_factories["setup_response_data"].return_value = (
                 list(range(8)),
                 None,
