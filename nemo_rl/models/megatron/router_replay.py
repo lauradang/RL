@@ -124,29 +124,31 @@ def _unwrap_model_config(model: Any) -> Optional[Any]:
     return None
 
 
-def _global_moe_layer_numbers(model_config: Any) -> list[int]:
-    num_layers = int(getattr(model_config, "num_layers"))
-    moe_layer_freq = getattr(model_config, "moe_layer_freq", 1)
+def _global_moe_layer_numbers_from_model(model: Any) -> list[int]:
+    """Return the sorted layer numbers of this model's actual MoE layers.
 
-    if isinstance(moe_layer_freq, int):
-        if moe_layer_freq <= 0:
-            raise ValueError(f"moe_layer_freq must be positive, got {moe_layer_freq}")
-        pattern = [1 if i % moe_layer_freq == 0 else 0 for i in range(num_layers)]
-    elif isinstance(moe_layer_freq, list):
-        if len(moe_layer_freq) != num_layers:
-            raise ValueError(
-                f"moe_layer_freq has {len(moe_layer_freq)} entries but num_layers={num_layers}"
-            )
-        pattern = moe_layer_freq
-    else:
-        raise ValueError(f"Unsupported moe_layer_freq: {moe_layer_freq!r}")
+    Walks the model tree the same way _router_replay_instances_for_model does
+    (a module is MoE iff it owns a router_replay-bearing Router), rather than
+    inferring layer types from config.moe_layer_freq. moe_layer_freq encodes a
+    regular MoE/dense interleaving and defaults to 1 ("every layer is MoE")
+    when absent -- correct for a plain MoE stack, but meaningless for a hybrid
+    Mamba/dense/MoE model (config.hybrid_layer_pattern, e.g. nano-3.5's
+    'MEMEM*EMEMEM*...'), where it silently returned every layer (dense and
+    Mamba included) as MoE. That mismatch surfaced as build_router_replay_
+    assignments rejecting a correctly-shaped payload: payload=<actual MoE
+    layer count> vs the wrongly-inflated moe_layers=<total layer count>.
+    """
+    return sorted(
+        layer_number for _, layer_number in _router_replay_instances_for_model(model)
+    )
 
-    return [layer_idx + 1 for layer_idx, is_moe in enumerate(pattern) if is_moe]
 
-
-def router_replay_dimensions(model_config: Any) -> tuple[int, int]:
+def router_replay_dimensions(model: Any) -> tuple[int, int]:
     """Return model-owned ``(num_moe_layers, top_k)`` route dimensions."""
-    num_moe_layers = len(_global_moe_layer_numbers(model_config))
+    num_moe_layers = len(_global_moe_layer_numbers_from_model(model))
+    model_config = _unwrap_model_config(model)
+    if model_config is None:
+        raise ValueError("Could not locate Megatron model config for router replay.")
     top_k = int(getattr(model_config, "moe_router_topk"))
     if num_moe_layers <= 0 or top_k <= 0:
         raise ValueError(
@@ -465,7 +467,7 @@ def build_router_replay_assignments(
     local_routed_experts = _split_for_sequence_parallel(
         model_config, local_routed_experts
     )
-    global_moe_layers = _global_moe_layer_numbers(model_config)
+    global_moe_layers = _global_moe_layer_numbers_from_model(model)
     total_num_layers = int(getattr(model_config, "num_layers"))
     num_payload_layers = local_routed_experts.shape[1]
     moe_layer_to_payload_idx = _payload_indices_for_moe_layers(

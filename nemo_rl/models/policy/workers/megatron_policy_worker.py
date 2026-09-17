@@ -464,8 +464,8 @@ class MegatronPolicyWorkerImpl(
         }
 
     def _routed_experts_dimensions(self) -> tuple[int, int]:
-        """Return route dimensions from the initialized Megatron model config."""
-        return router_replay_dimensions(self._get_model_config())
+        """Return route dimensions from the initialized Megatron model."""
+        return router_replay_dimensions(self.model)
 
     def _get_replica_group(self) -> Optional[Any]:
         """Replica group = TP × CP × PP siblings within this DP rank.
