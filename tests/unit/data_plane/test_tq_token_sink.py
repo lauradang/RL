@@ -24,10 +24,12 @@ protocol edges the kit does not cover (missing keys, stage failure shape).
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 nemo_gym = pytest.importorskip("nemo_gym.token_id_capture.staging")
 
@@ -39,15 +41,27 @@ from nemo_gym.token_id_capture.staging.protocols import (  # noqa: E402
 )
 
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    COMPACT_PREV_LEN_KEY,
+    COMPACT_TOKEN_IDS_EXTRAS_KEY,
+    MEDIA_EXTRAS_KEY,
+    MEDIA_IMGS_FIELD,
+    MEDIA_PREV_COUNT_KEY,
+    MEDIA_STAGING_FIELDS,
+    MINF_CAPTURE_PARAMS_FIELD,
     PREFIX_EOS_TOKEN_ID_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     STAGING_FIELDS,
     ChainPrefixCache,
+    PrefixChains,
     TQMegatronPromptPreparer,
     TQMegatronTokenStager,
     TQTokenSink,
     TQTokenSource,
+    _MegatronCapturePayload,
+    media_field_dict,
     resolve_admission_prefix,
+    row_to_media_tensors,
+    slice_media_tensors,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
@@ -233,74 +247,259 @@ def test_fetch_prefix_token_ids_rejects_duplicates(tq_client, staging_partition)
         source.fetch_prefix_token_ids(["r/c", "r/c"])
 
 
-def test_megatron_stager_writes_canonical_row_and_returns_coords(
-    tq_client, staging_partition
-):
+def _minf_media_tensors():
+    """Packed patches the toy encoder consumed: one 4x4 image, patch 2 -> 4 patches."""
+    return {
+        "imgs": torch.arange(4 * 12, dtype=torch.float32).reshape(1, 4, 12),
+        "imgs_sizes": torch.tensor([[4, 4]], dtype=torch.int32),
+    }
+
+
+def _minf_two_image_tensors():
+    """Turn 2's engine tensors: image 1's four patches followed by image 2's four."""
+    return {
+        "imgs": torch.arange(8 * 12, dtype=torch.float32).reshape(1, 8, 12),
+        "imgs_sizes": torch.tensor([[4, 4], [4, 4]], dtype=torch.int32),
+    }
+
+
+def _minf_payload(*, multimodal: bool, media_tensors=...):
+    """A finished MInf payload. Multimodal: compact [80, 99, 81] expanded to three 99s."""
+    if not multimodal:
+        return SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            generated_token_ids=[12, 13],
+            generated_log_probs=[-0.25, -0.5],
+        )
+    return SimpleNamespace(
+        prompt_token_ids=[80, 99, 99, 99, 81],
+        generated_token_ids=[12, 2],
+        generated_log_probs=[-0.25, -0.5],
+        compact_prompt_token_ids=[80, 99, 81],
+        media_tensors=_minf_media_tensors() if media_tensors is ... else media_tensors,
+    )
+
+
+def _stage_root(tq_client, staging_partition, payload, *, rollout_id="minf-r0"):
     stager = TQMegatronTokenStager(
         TQTokenSink(tq_client, staging_partition=staging_partition)
     )
-    payload = SimpleNamespace(
-        prompt_token_ids=[10, 11],
-        generated_token_ids=[12, 13],
-        generated_log_probs=[-0.25, -0.5],
+    root = nemo_gym.CaptureAdmission(
+        rollout_id=rollout_id, model_call_id="c1", mode="text"
     )
-    admission = nemo_gym.CaptureAdmission(
-        rollout_id="minf-r0",
-        model_call_id="c1",
-        mode="text",
-    )
-
     result = stager.stage(
         "minf-response-1",
         payload,
         finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-        offload_params={"ng_capture": admission.model_dump(mode="json")},
+        offload_params={"ng_capture": root.model_dump(mode="json")},
     )
-
     assert result is not None
-    coords = result.response_metadata["ng_commit_coords"]
+    return stager, result.response_metadata["ng_commit_coords"]
+
+
+@pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
+def test_megatron_stager_writes_canonical_row_and_returns_coords(
+    tq_client, staging_partition, multimodal
+):
+    """The expanded delta is the canonical row. A VLM call also stages the compact
+    delta in its own column, the media geometry in the extras JSON, and the engine's
+    media tensors as extra columns on the same key; a text call stages none of those
+    and its compact chain falls back to the expanded one."""
+    _, coords = _stage_root(
+        tq_client, staging_partition, _minf_payload(multimodal=multimodal)
+    )
     assert coords["staging_key"] == "minf-r0/c1"
     assert coords["weight_version"] == 7
     assert coords["disposition"] == "staged"
-    [snapshot] = TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
-        ["minf-r0/c1"]
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    [fetched] = source.fetch_for_finalization(["minf-r0/c1"])
+    chains = source.fetch_prefix_chains(["minf-r0/c1"])
+    assert source.fetch_prefix_token_ids(["minf-r0/c1"]) == chains.expanded
+
+    if not multimodal:
+        assert fetched.snapshot.token_ids_delta == [10, 11, 12, 13]
+        assert fetched.snapshot.token_mask_delta == [0.0, 0.0, 1.0, 1.0]
+        assert fetched.snapshot.generation_log_probs_delta == [0.0, 0.0, -0.25, -0.5]
+        assert fetched.extras is None
+        assert chains.compact == chains.expanded == [10, 11, 12, 13]
+        with pytest.raises(KeyError, match="media columns"):
+            source.fetch_media("minf-r0/c1")
+        return
+
+    assert fetched.snapshot.token_ids_delta == [80, 99, 99, 99, 81, 12, 2]
+    # Mask and log probs are aligned with the *expanded* delta: every media
+    # token is prompt (mask 0); only the two generated tokens train.
+    assert fetched.snapshot.token_mask_delta == [0.0] * 5 + [1.0, 1.0]
+    assert fetched.snapshot.generation_log_probs_delta == [0.0] * 5 + [-0.25, -0.5]
+    assert (coords["prev_len"], coords["delta_len"]) == (0, 7)
+    assert chains.expanded == [80, 99, 99, 99, 81, 12, 2]
+    assert chains.compact == [80, 99, 81, 12, 2]
+    assert fetched.extras == {
+        "media": {
+            "modality": "image",
+            "imgs_sizes": [[4, 4]],
+            "num_frames": None,
+            "num_tiles": None,
+        }
+    }
+    media = source.fetch_media("minf-r0/c1")
+    assert torch.equal(media.imgs, _minf_media_tensors()["imgs"])
+    assert media.imgs.dtype == torch.float32
+    assert media.imgs_sizes.tolist() == [[4, 4]]
+    assert media.num_frames is None and media.num_tiles is None
+
+
+@pytest.mark.parametrize(
+    ("media_tensors", "error"),
+    [
+        ({"imgs_sizes": torch.tensor([[4, 4]])}, "non-empty imgs"),
+        (
+            {"imgs": torch.ones(1, 2, 3), "pixel_values": torch.ones(1)},
+            "unsupported media tensors",
+        ),
+    ],
+)
+def test_media_field_dict_rejects_malformed_tensors(media_tensors, error):
+    with pytest.raises(ValueError, match=error):
+        media_field_dict(media_tensors)
+
+
+@pytest.mark.parametrize(
+    "media_tensors",
+    [
+        # Packed patches, one still image.
+        {
+            "imgs": torch.arange(48, dtype=torch.float32).reshape(1, 4, 12),
+            "imgs_sizes": torch.tensor([[4, 4]], dtype=torch.int32),
+        },
+        # Packed patches, bf16 as the engine may hand them over.
+        {
+            "imgs": torch.arange(48, dtype=torch.float32)
+            .reshape(1, 4, 12)
+            .to(torch.bfloat16),
+            "imgs_sizes": torch.tensor([[4, 4]], dtype=torch.int32),
+        },
+        # Video: per-frame sizes plus frames per video.
+        {
+            "imgs": torch.arange(96, dtype=torch.float32).reshape(1, 8, 12),
+            "imgs_sizes": torch.tensor([[4, 4], [4, 4]], dtype=torch.int32),
+            "num_frames": torch.tensor([2], dtype=torch.int32),
+        },
+        # Padded pixels with static tiling.
+        {
+            "imgs": torch.arange(2 * 3 * 4 * 4, dtype=torch.float32).reshape(
+                2, 3, 4, 4
+            ),
+            "num_tiles": torch.tensor([2], dtype=torch.int64),
+        },
+    ],
+    ids=["packed-f32", "packed-bf16", "video", "tiled-pixels"],
+)
+def test_media_column_codec_round_trips_without_a_store(media_tensors):
+    """``row_to_media_tensors`` inverts ``media_field_dict`` exactly, dtype included."""
+    fields = media_field_dict(media_tensors)
+    assert set(fields) == set(MEDIA_STAGING_FIELDS)
+    assert all(tensor.shape[0] == 1 for tensor in fields.values())
+
+    restored = row_to_media_tensors(fields)
+
+    for name in ("imgs", "imgs_sizes", "num_frames", "num_tiles"):
+        expected = media_tensors.get(name)
+        actual = getattr(restored, name)
+        if expected is None:
+            assert actual is None, name
+        else:
+            assert actual.dtype == expected.dtype, name
+            assert torch.equal(actual, expected), name
+
+
+def test_row_to_media_tensors_rejects_geometry_column_disagreement():
+    fields = media_field_dict(
+        {
+            "imgs": torch.ones(1, 4, 12),
+            "imgs_sizes": torch.tensor([[4, 4]], dtype=torch.int32),
+        }
     )
-    assert snapshot.token_ids_delta == [10, 11, 12, 13]
-    assert snapshot.token_mask_delta == [0.0, 0.0, 1.0, 1.0]
-    assert snapshot.generation_log_probs_delta == [0.0, 0.0, -0.25, -0.5]
+    # The columns are outside Gym's digest; a truncated column must not decode.
+    fields[MEDIA_IMGS_FIELD] = fields[MEDIA_IMGS_FIELD][:, :-1]
+    with pytest.raises(ValueError, match="geometry describes"):
+        row_to_media_tensors(fields)
 
 
-@pytest.mark.parametrize("prefix_source", ["staging_chain", "capture_admission"])
+_PREPARER_CASES = {
+    # (root payload or None for an inline prefix, prev_len, prompt, template prefix, eos,
+    #  expected prompt, expected required prefix, expected compact_prev_len,
+    #  expected media_prev_count)
+    "staging_chain": (
+        SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            generated_token_ids=[12, 99],
+            generated_log_probs=[-0.25, -0.5],
+        ),
+        4,
+        [80, 81, 99, 20, 21],
+        [80, 81, 99],
+        99,
+        [10, 11, 12, 99, 20, 21],
+        [10, 11, 12, 99],
+        4,
+        0,
+    ),
+    "capture_admission": (
+        None,
+        4,
+        [80, 81, 99, 20, 21],
+        [80, 81, 99],
+        99,
+        [10, 11, 12, 99, 20, 21],
+        [10, 11, 12, 99],
+        4,
+        0,
+    ),
+    # Turn 2 of a VLM rollout: the chat endpoint renders the history in compact form
+    # (one media token per image, "a cat" retokenized as 13 not 12), so the preparer
+    # splices the *compact* chain, hands Gym the *expanded* chain to verify the engine
+    # prompt against, and tells the stager how much of the compact prompt and how many
+    # media items the chain already covers. The new turn adds a second image.
+    "multimodal_chain": (
+        _minf_payload(multimodal=True),
+        7,
+        [80, 99, 81, 13, 2, 20, 99, 21],
+        [80, 99, 81, 13, 2],
+        2,
+        [80, 99, 81, 12, 2, 20, 99, 21],
+        [80, 99, 99, 99, 81, 12, 2],
+        5,
+        1,
+    ),
+}
+
+
+@pytest.mark.parametrize("prefix_source", list(_PREPARER_CASES))
 def test_megatron_prompt_preparer_splices_resolved_prefix(
     tq_client, staging_partition, prefix_source
 ):
-    admission_kwargs = {}
-    if prefix_source == "staging_chain":
-        stager = TQMegatronTokenStager(
-            TQTokenSink(tq_client, staging_partition=staging_partition)
-        )
-        root = nemo_gym.CaptureAdmission(
-            rollout_id="minf-r0", model_call_id="c1", mode="text"
-        )
-        root_result = stager.stage(
-            "minf-response-1",
-            SimpleNamespace(
-                prompt_token_ids=[10, 11],
-                generated_token_ids=[12, 99],
-                generated_log_probs=[-0.25, -0.5],
-            ),
-            finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-            offload_params={"ng_capture": root.model_dump(mode="json")},
-        )
-        assert root_result is not None
-        root_coords = root_result.response_metadata["ng_commit_coords"]
+    (
+        root_payload,
+        prev_len,
+        prompt,
+        template_prefix,
+        eos,
+        expected_prompt,
+        expected_required,
+        expected_compact_prev_len,
+        expected_media_prev_count,
+    ) = _PREPARER_CASES[prefix_source]
+    stager = None
+    if root_payload is not None:
+        stager, root_coords = _stage_root(tq_client, staging_partition, root_payload)
         admission_kwargs = {
             "staging_chain": [root_coords["staging_key"]],
             "parent_chain_hash": root_coords["chain_hash"],
         }
     else:
         admission_kwargs = {
-            "required_prefix_token_ids": [10, 11, 12, 99],
+            "required_prefix_token_ids": expected_required,
             "parent_chain_hash": _digest("chain:c1"),
         }
 
@@ -308,7 +507,7 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
         rollout_id="minf-r0",
         model_call_id="c2",
         parent_call_id="c1",
-        prev_len=4,
+        prev_len=prev_len,
         mode="token_in",
         **admission_kwargs,
     )
@@ -317,22 +516,59 @@ def test_megatron_prompt_preparer_splices_resolved_prefix(
     )
 
     result = preparer.prepare_prompt(
-        [80, 81, 99, 20, 21],
+        prompt,
         offload_params={
             "ng_capture": admission.model_dump(mode="json"),
-            PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [80, 81, 99],
-            PREFIX_EOS_TOKEN_ID_FIELD: 99,
+            PREFIX_TEMPLATE_TOKEN_IDS_FIELD: template_prefix,
+            PREFIX_EOS_TOKEN_ID_FIELD: eos,
         },
     )
 
-    assert result.prompt == [10, 11, 12, 99, 20, 21]
+    assert result.prompt == expected_prompt
     assert result.offload_params is not None
-    assert result.offload_params["ng_capture"]["required_prefix_token_ids"] == [
-        10,
-        11,
-        12,
-        99,
-    ]
+    assert (
+        result.offload_params["ng_capture"]["required_prefix_token_ids"]
+        == expected_required
+    )
+    assert result.offload_params[MINF_CAPTURE_PARAMS_FIELD] == {
+        COMPACT_PREV_LEN_KEY: expected_compact_prev_len,
+        MEDIA_PREV_COUNT_KEY: expected_media_prev_count,
+    }
+
+    if prefix_source != "multimodal_chain":
+        return
+    # The engine expands the spliced compact prompt (both images) and hands the
+    # stager pixels for both; the stager cuts the compact delta at compact_prev_len,
+    # keeps only image 2's pixels (media_prev_count), and Gym verifies the expanded prefix.
+    two_images = _minf_two_image_tensors()
+    turn2 = stager.stage(
+        "minf-response-2",
+        SimpleNamespace(
+            prompt_token_ids=[80, 99, 99, 99, 81, 12, 2, 20, 99, 99, 99, 21],
+            generated_token_ids=[30],
+            generated_log_probs=[-0.1],
+            compact_prompt_token_ids=result.prompt,
+            media_tensors=two_images,
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        offload_params=result.offload_params,
+    )
+    coords2 = turn2.response_metadata["ng_commit_coords"]
+    assert coords2["disposition"] == "staged"
+    assert (coords2["prev_len"], coords2["delta_len"]) == (7, 6)
+    source = TQTokenSource(tq_client, staging_partition=staging_partition)
+    chains = source.fetch_prefix_chains(
+        [root_coords["staging_key"], coords2["staging_key"]]
+    )
+    assert chains.expanded == [80, 99, 99, 99, 81, 12, 2, 20, 99, 99, 99, 21, 30]
+    assert chains.compact == [80, 99, 81, 12, 2, 20, 99, 21, 30]
+    assert chains.media_count == 2
+    # Turn 2's row holds only the media new to it.
+    media2 = source.fetch_media(coords2["staging_key"])
+    assert torch.equal(media2.imgs, two_images["imgs"][:, 4:, :])
+    assert media2.imgs_sizes.tolist() == [[4, 4]]
+    [fetched2] = source.fetch_for_finalization([coords2["staging_key"]])
+    assert fetched2.extras["media"]["imgs_sizes"] == [[4, 4]]
 
 
 def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(
@@ -453,7 +689,10 @@ def test_megatron_stager_declines_ineligible_requests(
 
 
 class _RecordingSource:
-    """Stand-in for TQTokenSource: records fetched keys, returns 2 tokens per key."""
+    """Stand-in for TQTokenSource that records fetched keys.
+
+    Serves both token spaces: two expanded tokens and one compact token per key.
+    """
 
     def __init__(self):
         self.calls = []
@@ -461,6 +700,12 @@ class _RecordingSource:
     def fetch_prefix_token_ids(self, keys):
         self.calls.append(list(keys))
         return [int(k[1:]) * 10 + i for k in keys for i in range(2)]
+
+    def fetch_prefix_chains(self, keys):
+        return PrefixChains(
+            expanded=self.fetch_prefix_token_ids(keys),
+            compact=[int(k[1:]) * 10 for k in keys],
+        )
 
 
 def test_chain_prefix_cache_fetches_only_uncached_suffix():
@@ -470,6 +715,10 @@ def test_chain_prefix_cache_fetches_only_uncached_suffix():
     assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
     assert cache.fetch(["k1", "k2", "k3"]) == [10, 11, 20, 21, 30, 31]
     assert cache.fetch(["k1", "k2"]) == [10, 11, 20, 21]
+    assert source.calls == [["k1", "k2"], ["k3"]]
+    assert cache.fetch_chains(["k1", "k2", "k3"]) == PrefixChains(
+        expanded=[10, 11, 20, 21, 30, 31], compact=[10, 20, 30]
+    )
     assert source.calls == [["k1", "k2"], ["k3"]]
 
 
@@ -560,3 +809,142 @@ def test_prefix_field_keys_match_megatron_constants():
         )
     assert PREFIX_TEMPLATE_TOKEN_IDS_FIELD == mcore.PREFIX_TEMPLATE_TOKEN_IDS_FIELD
     assert PREFIX_EOS_TOKEN_ID_FIELD == mcore.PREFIX_EOS_TOKEN_ID_FIELD
+
+
+def test_extras_and_payload_keys_match_gym_constants():
+    """Pin the Gym extras keys and payload-view attribute names to Gym's constants.
+
+    The sink pops Gym's extras keys, and the stager's payload view feeds Gym's
+    Megatron adapter by attribute name.
+    """
+    media = pytest.importorskip("nemo_gym.token_id_capture.staging.media")
+    adapter = pytest.importorskip("nemo_gym.token_id_capture.adapters.megatron")
+    if not hasattr(adapter, "COMPACT_PREV_LEN_FIELD"):
+        pytest.skip(
+            "pinned nemo_gym predates multimodal Megatron extras (NVIDIA-NeMo/Gym#2823)"
+        )
+    assert COMPACT_TOKEN_IDS_EXTRAS_KEY == media.COMPACT_TOKEN_IDS_DELTA_FIELD
+    assert MEDIA_EXTRAS_KEY == media.MEDIA_FIELD
+    assert COMPACT_PREV_LEN_KEY == adapter.COMPACT_PREV_LEN_FIELD
+    payload_fields = {f.name for f in dataclasses.fields(_MegatronCapturePayload)}
+    assert payload_fields >= {
+        adapter.PROMPT_IDS_FIELD,
+        adapter.GENERATED_IDS_FIELD,
+        adapter.GENERATED_LOGPROBS_FIELD,
+        adapter.COMPACT_PROMPT_IDS_FIELD,
+        adapter.COMPACT_PREV_LEN_FIELD,
+        adapter.MEDIA_FIELD,
+    }
+
+
+@pytest.mark.parametrize(
+    ("media_tensors", "prev_count", "expected"),
+    [
+        # Packed patches, two 4x4 images of 4 patches each: drop image 1.
+        (
+            {
+                "imgs": torch.arange(96.0).reshape(1, 8, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+            1,
+            {
+                "imgs": torch.arange(48.0, 96.0).reshape(1, 4, 12),
+                "imgs_sizes": torch.tensor([[4, 4]]),
+            },
+        ),
+        # Nothing already staged: unchanged.
+        (
+            {
+                "imgs": torch.arange(96.0).reshape(1, 8, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+            0,
+            {
+                "imgs": torch.arange(96.0).reshape(1, 8, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+        ),
+        # Everything already staged: no media for this call.
+        (
+            {
+                "imgs": torch.arange(96.0).reshape(1, 8, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+            2,
+            None,
+        ),
+        # Video: one 2-frame video already staged, one 1-frame video new.
+        (
+            {
+                "imgs": torch.arange(144.0).reshape(1, 12, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4], [4, 4]]),
+                "num_frames": torch.tensor([2, 1]),
+            },
+            1,
+            {
+                "imgs": torch.arange(96.0, 144.0).reshape(1, 4, 12),
+                "imgs_sizes": torch.tensor([[4, 4]]),
+                "num_frames": torch.tensor([1]),
+            },
+        ),
+        # Padded pixels [N, C, H, W]: one row per image.
+        (
+            {
+                "imgs": torch.arange(2 * 3 * 4 * 4.0).reshape(2, 3, 4, 4),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+            1,
+            {
+                "imgs": torch.arange(48.0, 96.0).reshape(1, 3, 4, 4),
+                "imgs_sizes": torch.tensor([[4, 4]]),
+            },
+        ),
+    ],
+    ids=["patches", "none-staged", "all-staged", "video", "padded-pixels"],
+)
+def test_slice_media_tensors_keeps_only_new_items(media_tensors, prev_count, expected):
+    sliced = slice_media_tensors(media_tensors, prev_count)
+    if expected is None:
+        assert sliced is None
+        return
+    assert set(sliced) == set(expected)
+    for name, value in expected.items():
+        assert torch.equal(sliced[name], value), name
+
+
+@pytest.mark.parametrize(
+    ("media_tensors", "prev_count", "error"),
+    [
+        (
+            {"imgs": torch.ones(1, 4, 12), "imgs_sizes": torch.tensor([[4, 4]])},
+            2,
+            "exceeds",
+        ),
+        # No per-item geometry at all: nothing says where image 1 ends.
+        ({"imgs": torch.ones(1, 4, 12)}, 1, "requires imgs_sizes or num_tiles"),
+        # 5 patches cannot tile two 4x4 images (area 32).
+        (
+            {
+                "imgs": torch.ones(1, 5, 12),
+                "imgs_sizes": torch.tensor([[4, 4], [4, 4]]),
+            },
+            1,
+            "do not divide",
+        ),
+        # Area 18 over 2 patches -> 9 per patch; image 1 (area 6) ends mid-patch.
+        (
+            {
+                "imgs": torch.ones(1, 2, 12),
+                "imgs_sizes": torch.tensor([[2, 3], [3, 4]]),
+            },
+            1,
+            "patch boundary",
+        ),
+    ],
+    ids=["exceeds", "no-geometry", "non-dividing", "mid-patch"],
+)
+def test_slice_media_tensors_rejects_inconsistent_geometry(
+    media_tensors, prev_count, error
+):
+    with pytest.raises(ValueError, match=error):
+        slice_media_tensors(media_tensors, prev_count)

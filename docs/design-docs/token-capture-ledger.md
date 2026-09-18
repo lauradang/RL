@@ -117,6 +117,72 @@ conversion is involved in the active path.
 
 ![Token capture custody](../assets/token-capture-ledger-queue-data-flow.png)
 
+### Multimodal rollouts (Megatron Inference only)
+
+A vision-language engine has two token spaces. The chat endpoint tokenizes the
+render in *compact* form (one media token per image or video); the engine
+expands every media token into one token per projected embedding and runs on
+the *expanded* form. The trainer needs the expanded ids (they align with the
+projected features); the next turn's chat render can only be spliced against
+the compact ids, because the engine expands whatever it is handed and would
+otherwise expand the previous turn twice and reject the request on its
+placeholder count.
+
+Capture therefore stages both spaces and the media geometry inside the digest,
+and the media tensors themselves as extra, digest-external columns on the same
+call row:
+
+- MInf's `OffloadedRequestPayload` carries `compact_prompt_token_ids` and
+  `media_tensors` (the vision-encoder inputs: packed patches `imgs`,
+  `imgs_sizes`, `num_frames` / `num_tiles`). RL derives a small media geometry
+  from those tensors (`tq_token_sink.media_geometry`), and Gym's
+  `MegatronCaptureAdapter` stages the compact delta and that geometry as
+  `StagedCallRecord.extras` (`nemo_gym.token_id_capture.staging.media`), so both
+  are bound by `extras_digest`. `TQTokenSink` pops the compact delta into its
+  own column (`compact_token_ids_delta` / `compact_len`, like `routed_experts`)
+  and keeps the geometry in the extras JSON. These payload fields come from
+  tdene/Megatron-LM#20 (on top of NVIDIA/Megatron-LM#7015) and the media extras
+  from Gym's `staging/media.py` (lauradang/Gym#1 on top of
+  NVIDIA-NeMo/Gym#2823); neither is in the pinned submodules yet, so this path
+  requires both re-pins.
+- `TQMegatronPromptPreparer` resolves a `staging_chain` in both spaces
+  (`TQTokenSource.fetch_prefix_chains`), splices the *compact* chain into the
+  render, hands Gym the *expanded* chain as `required_prefix_token_ids`, and
+  records the compact chain length in `offload_params["ng_capture_minf"]` so
+  the stager can cut the call's compact delta. Gym's existing prefix check on
+  the engine's expanded prompt then verifies that re-expanding the same media
+  reproduced the same tokens; drift poisons the call.
+- The media tensors themselves ride the call row: `TQMegatronTokenStager`
+  writes `media_tensors` as extra columns on the call row
+  (`MEDIA_STAGING_FIELDS`), in the same put as the token columns: the stager
+  parks the tensors on the sink before Gym stages the record, so a call is
+  staged whole or not at all. Routed experts ride the row the same way. Like the token
+  columns they are per-call deltas: every chat request carries the whole
+  conversation, so the engine hands over pixels for every image in the prompt,
+  and the stager drops the items the parent chain already staged
+  (`media_prev_count`, recorded by the preparer next to `compact_prev_len` from
+  the parent rows' geometry; `slice_media_tensors`). They are outside Gym's
+  digest; the digest-covered geometry names what each row holds. Receipts stay
+  token-free and no new key exists: cleanup of the call rows clears the media.
+- `RolloutReassembler.finalize_rollout` walks the terminal chain: for each
+  call whose staged geometry names media it reads that row's media columns,
+  requires the staged `imgs_sizes` / `num_frames` / `num_tiles` to equal the
+  geometry, and rejects the rollout otherwise (`media_columns_missing`,
+  `media_mismatch`, `invalid_media_columns`). The per-call deltas are
+  concatenated in chain order, as the token deltas are. The packed-patch layout is handed to the trainer
+  unchanged as `pixel_values` `[total_patches, C*P*P]` per row (the
+  Megatron-Bridge Omni model passes already-patchified inputs through), with
+  `imgs_sizes` and `num_frames` beside it, so training projects exactly the
+  pixels the policy generated against. `finalize_group` stacks the per-rollout
+  `PackedTensor`s (empty rows for text siblings and placeholders) into the
+  canonical batch through the same `pack_payload` transport the token-echo path
+  uses.
+
+Setup rejects `token_capture.enabled` with a multimodal policy on the vLLM
+backend (that capture path stages the pre-processor prompt and carries no
+media) and with `grpo.deduplicate_multimodal_data=true` (capture rows carry
+their own media).
+
 ## Framework-owned receipt and cleanup
 
 NeMo RL fetches the manifest at rollout end and assembles the receipt locally.

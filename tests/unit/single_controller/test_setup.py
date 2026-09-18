@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import sys
 import threading
 import types
@@ -2608,3 +2609,125 @@ def test_load_opd_full_teacher_lm_heads_rejects_two_teacher_checkpoints(monkeypa
             },
         )
     trainer.worker_group.run_all_workers_single_data.assert_not_called()
+
+
+# ── multimodal token capture guards ──────────────────────────────────────────
+
+
+def _make_gym_megatron_capture_config() -> MasterConfig:
+    mc = _make_master_config(backend="megatron", megatron_enabled=True)
+    mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = True
+    mc.policy["generation"]["stop_strings"] = None
+    mc.policy["generation"]["stop_token_ids"] = None
+    mc.policy["generation"]["top_k"] = None
+    mc.logger = {**mc.logger, "log_dir": "/tmp/test-megatron-token-capture-mm"}
+    mc.token_capture.enabled = True
+    return mc
+
+
+@pytest.mark.parametrize(
+    ("backend", "deduplicate", "error", "match"),
+    [
+        # vLLM capture stages the pre-processor prompt and carries no media.
+        ("vllm", False, NotImplementedError, "backend=megatron only"),
+        # Capture rows carry their own media, so dedup has nothing to share.
+        ("megatron", True, ValueError, "deduplicate_multimodal_data"),
+    ],
+    ids=["vllm-backend", "deduplicated-media"],
+)
+def test_token_capture_rejects_unsupported_multimodal_combinations(
+    patched_factories, backend, deduplicate, error, match
+):
+    if backend == "vllm":
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc.token_capture.enabled = True
+    else:
+        mc = _make_gym_megatron_capture_config()
+    mc.grpo.deduplicate_multimodal_data = deduplicate
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
+        pytest.raises(error, match=match),
+    ):
+        setup_single_controller(
+            mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
+        )
+
+    mock_gate.assert_not_called()
+    patched_factories["setup_response_data"].assert_not_called()
+    patched_factories["_build_clusters"].assert_not_called()
+
+
+@pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
+def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
+    patched_factories, multimodal
+):
+    """Only a multimodal Megatron capture run registers the engine-media
+    columns on the staging partition; a text run keeps the base schema."""
+    from nemo_rl.data_plane.tq_token_sink import MEDIA_STAGING_FIELDS
+
+    mc = _make_gym_megatron_capture_config()
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    fake_gym_actor = MagicMock(name="nemo_gym_actor")
+    port_holders = [MagicMock(name="port_holder_rank_0")]
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(
+            sc_setup_mod, "spinup_nemo_gym_actor", return_value=fake_gym_actor
+        ) as mock_spinup,
+        patch.object(sc_setup_mod, "_require_minf_capture_hooks"),
+        patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+        patch.object(sc_setup_mod, "ray"),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[MagicMock(name="finalizer_0")],
+        ),
+    ):
+        mock_megatron.reserve_http_server_addresses.return_value = (
+            ["http://10.0.0.1:5555/v1"],
+            {0: 5555},
+            port_holders,
+        )
+        setup_single_controller(
+            mc,
+            MagicMock(pad_token_id=0),
+            processor=MagicMock(name="processor") if multimodal else None,
+        )
+
+    assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+        "megatron"
+    )
+    dp_client = patched_factories["build_data_plane_client"].return_value
+    staging_calls = [
+        call
+        for call in dp_client.register_partition.call_args_list
+        if call.kwargs.get("partition_id") == mc.token_capture.staging_partition
+    ]
+    assert len(staging_calls) == 1
+    fields = set(staging_calls[0].kwargs["fields"])
+    if multimodal:
+        assert set(MEDIA_STAGING_FIELDS) <= fields
+    else:
+        assert set(MEDIA_STAGING_FIELDS).isdisjoint(fields)
+
+
+@pytest.mark.mcore
+def test_offloaded_payload_exposes_multimodal_capture_fields():
+    """Pin the engine payload fields the multimodal stager reads with getattr defaults."""
+    # Deferred import: megatron-core is a heavy, optional dependency that the
+    # driver venv may not carry at all.
+    from megatron.core.inference import inference_request
+
+    if not hasattr(inference_request, "RequestPayloadStager"):
+        pytest.skip(
+            "pinned megatron-core predates MInf capture hooks (Megatron-LM #7015)"
+        )
+    names = {
+        field.name
+        for field in dataclasses.fields(inference_request.OffloadedRequestPayload)
+    }
+    # Expected to fail at today's pin; goes green once the Megatron-Bridge pointer
+    # includes tdene/Megatron-LM#20, which adds these two payload fields.
+    assert {"media_tensors", "compact_prompt_token_ids"} <= names
