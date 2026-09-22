@@ -293,7 +293,9 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
     [without_routes] = TQTokenSource(
         tq_client, staging_partition=staging_partition
     ).fetch_for_finalization(["minf-r0/c1"])
-    assert without_routes.routed_len == 0
+    # routed_len is transport metadata carried even when the route payload is
+    # left in TQ (deferred finalization); only the fragment is omitted.
+    assert without_routes.routed_len == 4
     assert without_routes.fragment is None
 
 
@@ -414,13 +416,13 @@ def test_megatron_stager_delta_aligns_token_in_routes(tq_client, staging_partiti
     assert result is not None
     coords = result.response_metadata["ng_commit_coords"]
     assert coords["disposition"] == "staged"
-    [snapshot] = TQTokenSource(
+    [fetched] = TQTokenSource(
         tq_client, staging_partition=staging_partition
     ).fetch_for_finalization(["minf-r0/c2"], include_route_fragments=True)
-    assert snapshot.token_ids_delta == [13, 14, 15]
-    assert snapshot.routed_len == 3
-    assert snapshot.fragment is not None
-    assert snapshot.fragment.routes.tolist() == [
+    assert fetched.snapshot.token_ids_delta == [13, 14, 15]
+    assert fetched.routed_len == 3
+    assert fetched.fragment is not None
+    assert fetched.fragment.routes.tolist() == [
         routes[3].tolist(),
         routes[4].tolist(),
         [[-1, -1], [-1, -1]],
