@@ -9,10 +9,7 @@ state machine; serving workers coordinate only through the ledger, and NeMo RL
 
 The external staging contract (`StagingSink` / `StagingSource`), the vLLM
 worker capture path, and the `verify_and_linearize()` trust boundary are
-unchanged from the worker-custody design. The recipe exercising this path end
-to end is [Nano SWE with Token Capture](../guides/nano-swe-token-capture.md);
-the verification trust boundary is described in
-[Rollout Verification Boundary](rollout-verification-boundary.md).
+unchanged from the worker-custody design.
 
 ## Why a ledger and not a gate
 
@@ -37,9 +34,10 @@ deleted.
 In external-staging mode (`token_id_capture.external_staging: true`) each row
 additionally carries the token-free `CallRecord` custody columns —
 `parent_call_id`, `staging_key`, `weight_version`, `prev_len` / `delta_len` /
-`cum_len`, the staged record's `digest` and `extras_digest`, `mode`, and
-`logical_request_id` (the client header when present, else the vLLM response
-id). Three surfaces make it the single record of capture state (the
+`cum_len`, the staged record's `digest` and `extras_digest`, `mode`, the
+served `response_id` (the envelope id the agent received; terminal
+attribution's join key), `admitted_at`, and the call's content fingerprints.
+Four surfaces make it the single record of capture state (the
 `CaptureLedger` protocol):
 
 - `record(...)` — the extended commit row, written by the model server's
@@ -49,7 +47,10 @@ id). Three surfaces make it the single record of capture state (the
   `resolve()` can never return them as parents.
 - `manifest(rollout_id)` — the token-free read-back (committed rows +
   failures), exposed over one bearer-protected control route:
-  `GET /training-token-capture/rollouts/{rollout_id}/manifest`.
+  `GET /training-token-capture/control/rollouts/{rollout_id}/manifest`.
+- `has_rows(rollout_id)` — whether any ledger row (committed or failed)
+  exists for the rollout; this is how admission tells a seeded assistant
+  history (no rows) from a broken chain.
 
 `InMemoryLineageStore` cannot serve the ledger role: its resolution index
 evicts rollouts under memory bounds, which is fine for a cache but not for a
@@ -88,8 +89,8 @@ dies after admission is poisoned from the capture middleware's `finally` hook.
 
 MInf now uses the same canonical durability boundary through two generic engine
 hooks. These hooks (`DynamicInferenceEngine.payload_stager` /
-`prompt_preparer`, the `RequestPayloadStager` protocol, and the prefix-splice
-request metadata) come from
+`prompt_preparer`, the `RequestPayloadStager` protocol, and the rendered
+prior-turn tokens plus EOS id carried as request metadata) come from
 [NVIDIA/Megatron-LM PR #7015](https://github.com/NVIDIA/Megatron-LM/pull/7015)
 and are not yet in the Megatron-LM pinned through Megatron-Bridge; setup fails
 with a `NotImplementedError` naming that dependency until the pin is bumped.
@@ -97,10 +98,15 @@ with a `NotImplementedError` naming that dependency until the pin is bumped.
 Gym's complete `CaptureAdmission` travels as opaque request metadata.
 Before engine admission, the model-parallel coordinator resolves an admitted
 `staging_chain` through `TQTokenSource`, splices the exact parent tokens into
-the rendered prompt, and broadcasts that prepared request to every rank. When
+the rendered prompt with the same `replace_prefix_tokens` the vLLM worker uses,
+and broadcasts that prepared request to every rank. When
 generation completes, the coordinator passes that admission, the exact
 `OffloadedRequestPayload`, and the finished request's policy epoch to
-`TQMegatronTokenStager`.
+`TQMegatronTokenStager`. A request that straddles a refit carries more than
+one `policy_epoch` boundary; the stager stamps the admission epoch — the
+first `policy_epoch` boundary — matching vLLM's `begin_call` semantics, and
+counts the span on `epoch_span_count` (logged at WARNING) rather than masking
+the rollout.
 
 The stager invokes Gym's engine-neutral `RolloutTokenCapture`, which constructs
 the canonical delta and writes it through the same `TQTokenSink` used by vLLM.
@@ -108,6 +114,8 @@ Only after that write returns does MInf attach `ng_commit_coords` to the HTTP
 response. Gym consequently commits an ordinary token-free `CallRecord` before
 the response is released to the agent. No local metadata ledger or rollout-end
 conversion is involved in the active path.
+
+![Token capture custody](../assets/token-capture-ledger-queue-data-flow.png)
 
 ### MInf router replay
 
@@ -172,25 +180,31 @@ NeMo RL fetches the manifest at rollout end and assembles the receipt locally.
 For vLLM:
 
 - `manifest` = the fetched `CallRecord` list, deduped by `model_call_id`;
-- `terminal_model_call_id` = the row whose `logical_request_id` matches the
-  rollout's reported terminal logical request (a response id);
+- `terminal_model_call_id` = the row Gym's `resolve_terminal(records,
+  scored_response, declared_response_id=...)` attributes: the harness's
+  declared response id, the scored response's own `id`, and the response's
+  content fingerprints each independently name a row through
+  `CallRecord.response_id` and the recorded fingerprints; agreeing witnesses
+  attribute, disagreeing witnesses attribute nothing;
 - `capture_poisoned` = any failure row present, or no row for the terminal
   request.
 
 MInf and vLLM both produce committed `manifest` rows that point directly to
 canonical TQ records.
 
-Terminal selection has a strict precedence: **declared > heuristic > mask**. A
-harness-declared terminal is authoritative — a declared id that matches no
-committed row masks the rollout and never falls back. When the harness reports
-no terminal at all, Gym's `select_terminal_call` infers one from the
+Terminal selection has a strict precedence: **declared / response-id /
+content witnesses > heuristic > mask**. A harness-declared terminal is
+authoritative — a declared id that matches no committed row masks the rollout
+and never falls back. When no witness attributes (and nothing was declared),
+Gym's `select_terminal_call` infers one from the
 manifest's explicit parent links (earliest-admitted root by `admitted_at`, an
 extended sibling beating an abandoned childless retry); any ambiguous shape —
 a retry of the final call, divergent extended branches — masks with the
 selection reason. The heuristic only chooses *among* digest-verified rows:
 `verify_and_linearize` still verifies the chosen chain. The receipt records
-the path in `terminal_selection` and the finalizer emits
-`finalize/heuristic_terminal_fraction` per group.
+the resolving stage in `terminal_selection` (`declared` / `response_id` /
+`content` / `heuristic`) and the finalizer emits
+`finalize/terminal_selection_heuristic_fraction` per group.
 
 `verify_and_linearize(receipt, snapshots)` runs unchanged. Retry duplicates
 appear as dead-branch sibling rows in the manifest: their staged rows are

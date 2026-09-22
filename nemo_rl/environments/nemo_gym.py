@@ -45,6 +45,11 @@ from nemo_rl.environments.nemo_gym_multimodal import (
     _without_initial_media_sources,
     normalize_media_in_examples,
 )
+from nemo_rl.environments.nemo_gym_shards import (
+    SHARDING_CONFIG_KEYS,
+    ShardConfigError,
+    parse_shard_plan,
+)
 from nemo_rl.experience.failures import (
     GymTransportError,
     RolloutDataFailure,
@@ -86,6 +91,50 @@ DEFAULT_INVALID_TOOL_CALL_PATTERNS = [
     "</function_call>",
 ]
 DEFAULT_THINKING_TAGS = ["<think>", "</think>"]
+
+
+def _require_resolved_agent_refs(nemo_gym_examples: list[dict]) -> None:
+    """Fail readably when Gym did not stamp an agent_ref onto every row.
+
+    ``run_examples`` resolves ``task_source`` to ``agent_ref`` in place before it returns,
+    and every read after that point -- this module's counters, and Gym's own dispatch,
+    which posts to ``row["agent_ref"]["name"]`` -- assumes it happened. Unguarded, a row
+    that was not resolved surfaces as ``KeyError: 'agent_ref'`` inside a Ray TaskError
+    inside an ExceptionGroup, forty lines from anything that names the cause.
+
+    The cause worth naming is a version skew rather than a bad row. ``task_source`` routing
+    is new: an older Gym has no resolver, so a dataset prepared with a current Gym -- which
+    strips ``agent_ref`` and stamps ``task_source`` instead -- arrives unroutable. That
+    happens when the Gym actor's venv is older than the checkout that prepared the data,
+    which is what ``NRL_FORCE_REBUILD_VENVS=true`` exists to correct.
+    """
+    unresolved = [
+        index
+        for index, row in enumerate(nemo_gym_examples)
+        if not (row.get("agent_ref") or {}).get("name")
+    ]
+    if not unresolved:
+        return
+    task_sources = sorted(
+        {
+            source
+            for index in unresolved
+            if (source := nemo_gym_examples[index].get("task_source")) is not None
+        }
+    )
+    raise RuntimeError(
+        f"{len(unresolved)} of {len(nemo_gym_examples)} rollout rows have no agent_ref "
+        "after run_examples(), so Gym cannot route them and neither can this actor. "
+        + (
+            f"They carry task_source {task_sources}, which a current Gym resolves and an "
+            "older one ignores -- the Gym in this actor's venv is most likely older than "
+            "the checkout that prepared the data. Rebuild the actor venvs "
+            "(NRL_FORCE_REBUILD_VENVS=true) so both come from the same Gym."
+            if task_sources
+            else "They carry no task_source either, so nothing can route them: the "
+            "dataset was prepared without routing information."
+        )
+    )
 
 
 class NemoGymCompatibleConfig(Protocol):
@@ -444,9 +493,6 @@ class NemoGym(EnvironmentInterface):
         # NeMo-Gym server (same pattern as the pops in run_grpo_nemo_gym.py).
         initial_global_config_dict.pop("effort_levels", None)
         initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
-        self.rollout_max_attempts_to_avoid_lp_nan = initial_global_config_dict.pop(
-            "rollout_max_attempts_to_avoid_lp_nan", 1
-        )
         # Policy information
         initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
         initial_global_config_dict["policy_api_key"] = (
@@ -509,12 +555,6 @@ Depending on your data shape, you may want to change these values."""
         self._control_timeout_s = 60.0
         if self._token_capture_enabled:
             assert token_capture is not None
-            if self.rollout_max_attempts_to_avoid_lp_nan != 1:
-                raise ValueError(
-                    "token_capture.enabled requires "
-                    "rollout_max_attempts_to_avoid_lp_nan == 1: a NaN retry "
-                    "would resolve against the first attempt's ledger rows"
-                )
             policy_overrides = (
                 initial_global_config_dict.setdefault("policy_model", {})
                 .setdefault("responses_api_models", {})
@@ -703,6 +743,7 @@ Depending on your data shape, you may want to change these values."""
         )
         # Gym resolves task_source to agent_ref synchronously in run_examples().
         # Build the counter afterward so completion rows use the resolved identity.
+        _require_resolved_agent_refs(nemo_gym_examples)
         counts_left = Counter(row["agent_ref"]["name"] for row in nemo_gym_examples)
 
         num_results = 0
@@ -862,7 +903,8 @@ Depending on your data shape, you may want to change these values."""
 
         The receipt records the resolving stage in ``terminal_selection``
         (``declared``/``response_id``/``content``/``heuristic`` — failed
-        selections stamp the last stage attempted) and the witness trail in
+        selections stamp the last stage attempted; ``None`` when no stage ran
+        because the manifest failed to parse) and the witness trail in
         ``terminal_attribution_reason``. Retry duplicates are dead-branch
         rows: they stay in the manifest (their staged rows are fetched,
         verified, and cleaned) but never join the terminal chain —
@@ -878,9 +920,10 @@ Depending on your data shape, you may want to change these values."""
         Such rows are structurally off-chain and do not poison; if the
         *terminal* request itself died this way, the missing-terminal-row
         check below still masks the rollout. Every other failure reason
-        (``worker_capture_failed``, ``invalid_worker_commit_coordinates``)
-        marks a call whose completion WAS served — a hole in the chain —
-        and poisons.
+        (for example ``worker_capture_failed``,
+        ``invalid_worker_commit_coordinates``, or ``unresolved_parent``; a
+        reason-less failure row poisons as ``capture_failed``) marks a call
+        whose completion WAS served — a hole in the chain — and poisons.
         """
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
@@ -896,7 +939,7 @@ Depending on your data shape, you may want to change these values."""
         terminal_record = None
         selection_reason = None
         attribution_reason = None
-        terminal_selection = "heuristic"
+        terminal_selection = None
         parsed_records = None
         try:
             parsed_records = [
@@ -920,6 +963,7 @@ Depending on your data shape, you may want to change these values."""
                 terminal_selection = "declared"
                 selection_reason = None
             else:
+                terminal_selection = "heuristic"
                 selection = select_terminal_call(parsed_records)
                 if selection.terminal_model_call_id is not None:
                     terminal_record = deduped[selection.terminal_model_call_id]
@@ -937,7 +981,7 @@ Depending on your data shape, you may want to change these values."""
             )
         elif terminal_record is None:
             failure_reason = selection_reason or "missing_terminal_row"
-        receipt = {
+        return {
             "rollout_id": rollout_id,
             "reward": reward,
             "terminal_model_call_id": (
@@ -951,7 +995,6 @@ Depending on your data shape, you may want to change these values."""
             "terminal_selection": terminal_selection,
             "terminal_attribution_reason": attribution_reason,
         }
-        return receipt
 
     def _postprocess_nemo_gym_to_nemo_rl_result(
         self,
@@ -1388,11 +1431,34 @@ def build_nemo_gym_config(
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
 
+    # Validate the shards block even though only single-actor creation is wired
+    # up so far, so a malformed or premature sharded config fails at setup with
+    # a precise message instead of silently running unsharded.
+    shard_plan = parse_shard_plan(nemo_gym_dict)
+    if shard_plan is not None:
+        raise ShardConfigError(
+            f"env.nemo_gym.shards defines {len(shard_plan.shards)} shards "
+            f"({', '.join(s.name for s in shard_plan.shards)}), but multi-actor "
+            f"creation is not wired up yet. Remove 'shards' and use "
+            f"'config_paths' to run this job on a single actor."
+        )
+
+    # NeMo-RL-only keys are consumed here and must never reach Gym: the merged
+    # config is serialized into every Gym child process, and unrecognized
+    # dict-shaped top-level keys are parsed as server instance configs.
+    for key in SHARDING_CONFIG_KEYS:
+        nemo_gym_dict.pop(key, None)
+
     # NeMo-RL-side detection knobs are top-level NemoGymConfig fields
     # (where the detector reads them), not part of Gym's global config.
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
+    port_range = {
+        key: value
+        for key in ("port_range_low", "port_range_high")
+        if (value := nemo_gym_dict.pop(key, None)) is not None
+    }
     # Same treatment for the multimodal knobs: NemoGymConfig declares them as
     # top-level fields, so populate them here instead of leaving the actor to
     # read them back out of Gym's global config dict.
@@ -1428,6 +1494,7 @@ def build_nemo_gym_config(
         use_fastokens=use_fastokens,
         initial_global_config_dict=nemo_gym_dict,
         token_capture=token_capture,
+        **port_range,
         **multimodal_flags,
     )
 

@@ -178,11 +178,9 @@ class RolloutReassembler:
             return rejected("missing_receipt", [])
         try:
             parsed = RolloutReceipt.model_validate(receipt)
-            staging_keys = [record.staging_key for record in parsed.manifest]
-        except KeyError as error:
-            return rejected(f"missing_staging_row:{error}", [])
         except (TypeError, ValueError) as error:
             return rejected(f"invalid_receipt:{error}", [])
+        staging_keys = [record.staging_key for record in parsed.manifest]
         if parsed.rollout_id != rollout_id:
             return rejected(f"identity_mismatch:{parsed.rollout_id}", staging_keys)
         if parsed.failure_reason is not None:
@@ -419,7 +417,7 @@ class RolloutReassembler:
             record
             for receipt in receipts
             if isinstance(receipt, dict)
-            for record in receipt.get("manifest") or []
+            for record in (receipt.get("manifest") or [])
             if isinstance(record, dict)
         ]
         if manifest_rows:
@@ -444,15 +442,23 @@ class RolloutReassembler:
         # on a declaring harness is a regression signal. Failed selections
         # stamp the last stage attempted, so masked rollouts stay visible in
         # their method's bucket (cross-reference finalize/invalid_row_rate).
-        # Method list is derived from Gym's own type rather than hand-copied,
-        # so a new resolution method Gym adds gets a bucket automatically
-        # instead of silently missing from these metrics.
-        from typing import get_args
+        # Receipts whose manifest never parsed carry no method (None) and
+        # fall in no bucket. Method list is derived from Gym's own type
+        # rather than hand-copied, so a new resolution method Gym adds gets a
+        # bucket automatically instead of silently missing from these
+        # metrics; the annotation is ``Literal[...] | None``, so unwrap the
+        # Literal and skip the None member.
+        from typing import Literal, get_args, get_origin
 
         from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
-        terminal_selection_methods = get_args(
-            RolloutReceipt.model_fields["terminal_selection"].annotation
+        terminal_selection_methods = tuple(
+            method
+            for member in get_args(
+                RolloutReceipt.model_fields["terminal_selection"].annotation
+            )
+            if get_origin(member) is Literal
+            for method in get_args(member)
         )
         for method in terminal_selection_methods:
             method_receipts = sum(
