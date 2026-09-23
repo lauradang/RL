@@ -170,8 +170,48 @@ def _unwrap_model_config(model: Any) -> Optional[Any]:
     return None
 
 
+# Megatron-Core hybrid layer pattern symbols (megatron.core.models.hybrid.layers.utils.Symbols).
+_HYBRID_MOE_SYMBOL = "E"
+_HYBRID_PIPE_SYMBOL = "|"
+_HYBRID_MTP_SEPARATOR = "/"
+
+
+def _hybrid_layer_pattern(model_config: Any) -> Optional[str]:
+    """The main-decoder hybrid layer pattern, or None for a plain transformer.
+
+    Megatron-Bridge's ``HybridModelProvider`` carries ``hybrid_layer_pattern``
+    (``hybrid_override_pattern`` is the deprecated alias it normalizes from).
+    The MTP depths after ``/`` and the pipeline separators ``|`` are not layers.
+    """
+    for name in ("hybrid_layer_pattern", "hybrid_override_pattern"):
+        pattern = getattr(model_config, name, None)
+        if pattern:
+            main = str(pattern).split(_HYBRID_MTP_SEPARATOR)[0]
+            return main.replace(_HYBRID_PIPE_SYMBOL, "")
+    return None
+
+
 def _global_moe_layer_numbers(model_config: Any) -> list[int]:
     num_layers = int(getattr(model_config, "num_layers"))
+
+    # Hybrid (Mamba/attention/MoE) stacks place MoE layers by pattern symbol,
+    # not by moe_layer_freq: HybridBlock numbers every layer 1..len(pattern)
+    # and builds an MoE layer only at 'E'. MInf records one route column per
+    # RouterReplay instance, so the expected layer list must follow the same
+    # placement or the [T, L, K] payload is rejected as a layout mismatch.
+    hybrid_pattern = _hybrid_layer_pattern(model_config)
+    if hybrid_pattern is not None:
+        if len(hybrid_pattern) != num_layers:
+            raise ValueError(
+                f"hybrid layer pattern has {len(hybrid_pattern)} layers but "
+                f"num_layers={num_layers}"
+            )
+        return [
+            layer_idx + 1
+            for layer_idx, symbol in enumerate(hybrid_pattern)
+            if symbol == _HYBRID_MOE_SYMBOL
+        ]
+
     moe_layer_freq = getattr(model_config, "moe_layer_freq", 1)
 
     if isinstance(moe_layer_freq, int):

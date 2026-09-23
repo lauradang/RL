@@ -1483,3 +1483,61 @@ def test_reset_global_router_replay_instances_for_model_requires_routers():
             reset_global_router_replay_instances_for_model(torch.nn.Linear(2, 2))
     finally:
         RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_global_moe_layer_numbers_follow_hybrid_layer_pattern():
+    """Nemotron-H places MoE layers by 'E' in the hybrid pattern, not moe_layer_freq."""
+    from nemo_rl.models.megatron.router_replay import (
+        _global_moe_layer_numbers,
+        router_replay_dimensions,
+    )
+
+    # Nano 3.5 layout: 52 layers, 23 MoE ('E'); moe_layer_freq stays at its
+    # default of 1, which would otherwise predict 52 MoE layers.
+    pattern = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+    config = SimpleNamespace(
+        num_layers=52,
+        moe_layer_freq=1,
+        moe_router_topk=6,
+        hybrid_layer_pattern=pattern,
+    )
+
+    layers = _global_moe_layer_numbers(config)
+
+    assert len(layers) == 23
+    assert layers[:4] == [2, 4, 7, 9]
+    assert layers[-1] == 52
+    assert all(pattern[n - 1] == "E" for n in layers)
+    assert router_replay_dimensions(config) == (23, 6)
+
+
+@pytest.mark.mcore
+def test_global_moe_layer_numbers_hybrid_pattern_ignores_pipe_and_mtp():
+    from nemo_rl.models.megatron.router_replay import _global_moe_layer_numbers
+
+    # Deprecated alias, pipeline separator, and one MTP depth after '/'.
+    config = SimpleNamespace(
+        num_layers=4, moe_layer_freq=1, hybrid_override_pattern="ME|*E/ME"
+    )
+
+    assert _global_moe_layer_numbers(config) == [2, 4]
+
+
+@pytest.mark.mcore
+def test_global_moe_layer_numbers_hybrid_pattern_length_must_match_num_layers():
+    from nemo_rl.models.megatron.router_replay import _global_moe_layer_numbers
+
+    config = SimpleNamespace(num_layers=5, hybrid_layer_pattern="ME*E")
+
+    with pytest.raises(ValueError, match="hybrid layer pattern has 4 layers"):
+        _global_moe_layer_numbers(config)
+
+
+@pytest.mark.mcore
+def test_global_moe_layer_numbers_without_hybrid_pattern_uses_moe_layer_freq():
+    from nemo_rl.models.megatron.router_replay import _global_moe_layer_numbers
+
+    config = SimpleNamespace(num_layers=4, moe_layer_freq=[0, 1, 0, 1])
+
+    assert _global_moe_layer_numbers(config) == [2, 4]
