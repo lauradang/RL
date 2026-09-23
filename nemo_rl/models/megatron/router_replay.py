@@ -68,7 +68,53 @@ def validate_router_replay_config(config: PolicyConfig) -> None:
         raise ValueError(
             "router_replay.enabled does not support virtual pipeline parallelism yet."
         )
+    if generation.get("backend") == "megatron":
+        _validate_megatron_generation_router_replay_config(config)
     _install_missing_route_fallback_patch()
+
+
+def _validate_megatron_generation_router_replay_config(config: PolicyConfig) -> None:
+    """Reject MInf layouts that cannot record whole-model routes.
+
+    Kept inside the ``backend == "megatron"`` branch: ``merged_inference_megatron_cfg``
+    raises on unrelated ``inference_optimized`` combinations that vLLM configs
+    never see.
+    """
+    # Deferred: nemo_rl.models.generation.megatron.config imports this module's
+    # package siblings; importing lazily keeps the pair cycle-free.
+    from nemo_rl.models.generation.megatron.config import (
+        merged_inference_megatron_cfg,
+    )
+
+    generation = config.get("generation") or {}
+
+    # MInf records routes into RouterReplay.global_router_replay_instances, which
+    # is rank-local, and only ever all-gathers them across TP. With inference
+    # PP > 1 the payload's layer axis covers one pipeline stage, and
+    # _payload_indices_for_moe_layers rejects it a full rollout later. Inference
+    # PP defaults to training PP, so this is not opt-in.
+    inference_pp = merged_inference_megatron_cfg(config).get(
+        "pipeline_model_parallel_size", 1
+    )
+    if inference_pp != 1:
+        raise ValueError(
+            "router_replay.enabled with Megatron generation requires "
+            "pipeline_model_parallel_size=1 on the generation model (got "
+            f"{inference_pp}); MInf routing indices are recorded per pipeline "
+            "stage and are never gathered across PP. Set policy.generation."
+            "mcore_generation_config.pipeline_model_parallel_size=1."
+        )
+    # mcore raises the same rejection from DynamicInferenceEngine.__init__, but
+    # only after cluster build and weight load.
+    async_sched_mode = (generation.get("mcore_generation_config") or {}).get(
+        "async_sched_mode"
+    )
+    if async_sched_mode == "async":
+        raise ValueError(
+            "router_replay.enabled requires policy.generation."
+            "mcore_generation_config.async_sched_mode='legacy'; mcore async "
+            "scheduling does not support routing replay."
+        )
 
 
 def _iter_model_modules_with_mtp_ancestry(
@@ -154,6 +200,16 @@ def router_replay_dimensions(model_config: Any) -> tuple[int, int]:
             f"num_moe_layers={num_moe_layers}, top_k={top_k}"
         )
     return num_moe_layers, top_k
+
+
+def router_replay_dimensions_for_model(model: Any) -> tuple[int, int]:
+    """``router_replay_dimensions`` for a possibly wrapped (DDP/Float16) model."""
+    model_config = _unwrap_model_config(model)
+    if model_config is None:
+        raise ValueError(
+            "router replay could not resolve the model's TransformerConfig"
+        )
+    return router_replay_dimensions(model_config)
 
 
 def _router_replay_instances_for_model(model: Any) -> list[tuple[Any, int]]:
@@ -570,3 +626,28 @@ def clear_global_router_replay_instances() -> None:
     from megatron.core.transformer.moe.router_replay import RouterReplay
 
     RouterReplay.clear_global_router_replay_instances()
+
+
+def reset_global_router_replay_instances_for_model(model: Any) -> None:
+    """Point MInf's process-wide router registry at ``model``'s routers.
+
+    MInf records routes only through ``RouterReplay.global_router_replay_instances``:
+    the route buffer takes its layer count from ``len()`` of that list and
+    ``RECORD`` is broadcast to its members. The list is process-wide, so a
+    colocated worker that also built a reference model has either emptied it
+    (``setup_reference_model_state`` clears it in ``finally``) or left both
+    models' routers in it. Call before the inference engine is constructed:
+    the engine captures CUDA graphs and sizes the route buffer from the list.
+
+    MTP routers are skipped by default (``NRL_ROUTER_REPLAY_EXCLUDE_MTP``),
+    matching the layer count the trainer replays.
+    """
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    instances = [replay for replay, _ in _router_replay_instances_for_model(model)]
+    if not instances:
+        raise RuntimeError(
+            "router replay is enabled but the served model has no RouterReplay "
+            "instances; MInf cannot record routing indices for it"
+        )
+    RouterReplay.global_router_replay_instances[:] = instances

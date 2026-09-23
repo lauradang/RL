@@ -421,8 +421,14 @@ def _delta_align_minf_routing_indices(
     *,
     total_tokens: int,
     prev_len: int,
+    expected_route_dims: tuple[int, int] | None = None,
 ) -> torch.Tensor:
-    """Convert MInf ``[T - 1, L, K]`` routes to Gym's delta-token layout."""
+    """Convert MInf ``[T - 1, L, K]`` routes to Gym's delta-token layout.
+
+    ``expected_route_dims`` is the model-owned ``(L, K)``; when given, a payload
+    whose layer or top-k axis differs is rejected here, at the first request,
+    rather than a full rollout later in the reassembler.
+    """
     if not 0 <= prev_len <= total_tokens:
         raise ValueError(
             f"MInf route prev_len must be in [0, {total_tokens}], got {prev_len}"
@@ -442,6 +448,15 @@ def _delta_align_minf_routing_indices(
     if routes.shape[1] <= 0 or routes.shape[2] <= 0:
         raise ValueError(
             "MInf routing_indices layer and top-k dimensions must be positive"
+        )
+    if expected_route_dims is not None and tuple(routes.shape[1:]) != tuple(
+        expected_route_dims
+    ):
+        raise ValueError(
+            "MInf routing_indices (layers, top_k) does not match the served "
+            f"model: got {tuple(routes.shape[1:])}, expected "
+            f"{tuple(expected_route_dims)}. MInf records routes per pipeline "
+            "stage; check the generation model's parallel layout."
         )
     aligned = torch.full(
         (total_tokens, routes.shape[1], routes.shape[2]),
@@ -560,6 +575,7 @@ class TQMegatronTokenStager:
         sink: TQTokenSink,
         *,
         require_routed_experts: bool = False,
+        expected_route_dims: tuple[int, int] | None = None,
     ) -> None:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.megatron import (
@@ -577,6 +593,7 @@ class TQMegatronTokenStager:
             adapter=self._adapter,
         )
         self._require_routed_experts = require_routed_experts
+        self._expected_route_dims = expected_route_dims
         # Requests that straddled a refit (more than one policy_epoch boundary).
         # Metered here because they are stamped, not masked; see _weight_version.
         self._epoch_span_count = 0
@@ -697,6 +714,7 @@ class TQMegatronTokenStager:
                 routing_indices,
                 total_tokens=len(prompt_token_ids) + len(generated_token_ids),
                 prev_len=call.admission.prev_len,
+                expected_route_dims=self._expected_route_dims,
             )
             extras = {"routed_experts": encode_routed_experts(routed_experts)}
         coords = self._capture.complete_call(

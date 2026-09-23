@@ -350,6 +350,21 @@ def test_delta_align_minf_routing_indices_rejects_malformed_routes(
         )
 
 
+def test_delta_align_minf_routing_indices_checks_model_route_dims():
+    routes = torch.zeros((3, 4, 2), dtype=torch.int32)
+
+    aligned = _delta_align_minf_routing_indices(
+        routes, total_tokens=4, prev_len=0, expected_route_dims=(4, 2)
+    )
+    assert tuple(aligned.shape) == (4, 4, 2)
+
+    # One pipeline stage's worth of layers instead of the whole model's.
+    with pytest.raises(ValueError, match=r"got \(4, 2\), expected \(8, 2\)"):
+        _delta_align_minf_routing_indices(
+            routes, total_tokens=4, prev_len=0, expected_route_dims=(8, 2)
+        )
+
+
 def test_megatron_stager_rejects_misaligned_routes(tq_client, staging_partition):
     stager = TQMegatronTokenStager(
         TQTokenSink(tq_client, staging_partition=staging_partition)

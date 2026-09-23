@@ -69,6 +69,73 @@ def test_validate_router_replay_config_allows_megatron_generation():
 
 
 @pytest.mark.mcore
+def test_validate_router_replay_config_rejects_inherited_inference_pp():
+    """Inference PP defaults to training PP: no generation key set at all."""
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {"backend": "megatron", "mcore_generation_config": {}},
+        "megatron_cfg": {"enabled": True, "pipeline_model_parallel_size": 4},
+    }
+
+    with pytest.raises(ValueError, match="pipeline_model_parallel_size=1"):
+        validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
+def test_validate_router_replay_config_allows_generation_pp_override_to_one():
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {
+            "backend": "megatron",
+            "mcore_generation_config": {"pipeline_model_parallel_size": 1},
+        },
+        "megatron_cfg": {"enabled": True, "pipeline_model_parallel_size": 4},
+    }
+
+    validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
+def test_validate_router_replay_config_rejects_async_sched_mode():
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {
+            "backend": "megatron",
+            "mcore_generation_config": {"async_sched_mode": "async"},
+        },
+        "megatron_cfg": {"enabled": True},
+    }
+
+    with pytest.raises(ValueError, match="async_sched_mode='legacy'"):
+        validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
+def test_validate_router_replay_config_vllm_ignores_megatron_generation_gates():
+    """vLLM configs never go through merged_inference_megatron_cfg."""
+    from nemo_rl.models.megatron.router_replay import validate_router_replay_config
+
+    config = {
+        "router_replay": {"enabled": True},
+        "generation": {
+            "backend": "vllm",
+            "vllm_cfg": {},
+            "vllm_kwargs": {},
+            "mcore_generation_config": {"async_sched_mode": "async"},
+        },
+        "megatron_cfg": {"enabled": True, "pipeline_model_parallel_size": 4},
+    }
+
+    validate_router_replay_config(config)
+
+
+@pytest.mark.mcore
 def test_validate_router_replay_config_rejects_unsupported_generation_backend():
     from nemo_rl.models.megatron.router_replay import validate_router_replay_config
 
@@ -1313,5 +1380,106 @@ def test_clear_global_router_replay_instances_clears_registry():
         clear_global_router_replay_instances()
 
         assert RouterReplay.global_router_replay_instances == []
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_reset_global_router_replay_instances_for_model_restores_served_routers():
+    """A reference-model build clears the registry; the reset repoints it."""
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        clear_global_router_replay_instances,
+        reset_global_router_replay_instances_for_model,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, layer_number):
+            super().__init__()
+            self.router_replay = RouterReplay()
+            self.layer_number = layer_number
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router_1 = DummyRouter(layer_number=1)
+            self.router_3 = DummyRouter(layer_number=3)
+
+    try:
+        served = DummyModel()
+        reference = DummyModel()
+        assert len(RouterReplay.global_router_replay_instances) == 4
+
+        # setup_reference_model_state ends with this clear.
+        clear_global_router_replay_instances()
+        assert RouterReplay.global_router_replay_instances == []
+
+        reset_global_router_replay_instances_for_model(served)
+
+        assert RouterReplay.global_router_replay_instances == [
+            served.router_1.router_replay,
+            served.router_3.router_replay,
+        ]
+        assert reference.router_1.router_replay not in (
+            RouterReplay.global_router_replay_instances
+        )
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_reset_global_router_replay_instances_for_model_drops_other_models():
+    """Reshard + KL=0 leaves both models' routers registered; only the served stay."""
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        reset_global_router_replay_instances_for_model,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+
+    class DummyRouter(torch.nn.Module):
+        def __init__(self, layer_number):
+            super().__init__()
+            self.router_replay = RouterReplay()
+            self.layer_number = layer_number
+
+    class DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.router_1 = DummyRouter(layer_number=1)
+
+    try:
+        training = DummyModel()
+        inference = DummyModel()
+        assert len(RouterReplay.global_router_replay_instances) == 2
+
+        reset_global_router_replay_instances_for_model(inference)
+
+        assert RouterReplay.global_router_replay_instances == [
+            inference.router_1.router_replay
+        ]
+        assert training.router_1.router_replay not in (
+            RouterReplay.global_router_replay_instances
+        )
+    finally:
+        RouterReplay.clear_global_router_replay_instances()
+
+
+@pytest.mark.mcore
+def test_reset_global_router_replay_instances_for_model_requires_routers():
+    from megatron.core.transformer.moe.router_replay import RouterReplay
+
+    from nemo_rl.models.megatron.router_replay import (
+        reset_global_router_replay_instances_for_model,
+    )
+
+    RouterReplay.clear_global_router_replay_instances()
+    try:
+        with pytest.raises(RuntimeError, match="no RouterReplay instances"):
+            reset_global_router_replay_instances_for_model(torch.nn.Linear(2, 2))
     finally:
         RouterReplay.clear_global_router_replay_instances()

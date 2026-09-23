@@ -515,6 +515,17 @@ class MegatronGenerationMixin:
         pg_collection = get_attr_wrapped_model(self._gen_model(), "pg_collection")
         model_config = inference_model.config
 
+        if self._router_replay_enabled:
+            # Must precede engine construction: the engine captures CUDA graphs
+            # and sizes its route buffer from the registry length. A colocated
+            # worker that built a reference model has already had the registry
+            # cleared (or double-filled) by setup_reference_model_state.
+            from nemo_rl.models.megatron.router_replay import (
+                reset_global_router_replay_instances_for_model,
+            )
+
+            reset_global_router_replay_instances_for_model(self._gen_model())
+
         buffer_size_gb = mcore_generation_config["buffer_size_gb"]
         num_cuda_graphs = mcore_generation_config["num_cuda_graphs"]
         block_size_tokens = mcore_generation_config["block_size_tokens"]
@@ -1002,9 +1013,17 @@ class MegatronGenerationMixin:
         )
         engine.prompt_preparer = prompt_preparer
         self._request_prompt_preparer = prompt_preparer
+        expected_route_dims = None
+        if self._router_replay_enabled:
+            from nemo_rl.models.megatron.router_replay import (
+                router_replay_dimensions_for_model,
+            )
+
+            expected_route_dims = router_replay_dimensions_for_model(self._gen_model())
         stager = TQMegatronTokenStager(
             TQTokenSink(dp_client, staging_partition=staging_partition),
             require_routed_experts=self._router_replay_enabled,
+            expected_route_dims=expected_route_dims,
         )
         engine.payload_stager = stager
         self._request_payload_stager = stager
