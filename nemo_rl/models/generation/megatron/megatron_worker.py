@@ -278,6 +278,8 @@ class MegatronGenerationMixin:
      - processor: optional multimodal processor.
      - is_generation_colocated: Whether colocated or distributed.
      - _reserved_http_server_port: driver-reserved server port, or None.
+     - _router_replay_enabled: whether MInf must emit routing indices with
+       every captured payload (read by setup_token_capture).
     """
 
     # Colocated-reshard hosts assign the dedicated inference-layout model here

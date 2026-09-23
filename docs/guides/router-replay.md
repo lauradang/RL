@@ -32,8 +32,11 @@ rollout and policy data path as the `routed_experts` field.
 
 ### Megatron Inference generation
 
-MInf Router Replay is supported only by the SingleController NeMo-Gym path.
-Configure all of the following:
+MInf Router Replay is supported only by the SingleController NeMo-Gym path:
+launch with `examples/run_grpo_single_controller.py` (`examples/run_grpo.py`
+rejects this combination) on top of a config that already meets the
+[Single-Controller requirements](single-controller.md), such as
+`data_plane.enabled: true`. Then set:
 
 ```yaml
 env:
@@ -57,7 +60,7 @@ for the component-level data flow and multi-turn boundary behavior.
 
 For models that also train MoE-based MTP heads, Router Replay skips MTP
 routers by default. This keeps MTP routers on their native routing decisions
-while replaying vLLM routes only in the decoder layers. Set
+while replaying rollout routes only in the decoder layers. Set
 `NRL_ROUTER_REPLAY_EXCLUDE_MTP=0` only when intentionally debugging the legacy
 behavior that replays MTP routers too.
 

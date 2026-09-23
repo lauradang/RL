@@ -91,8 +91,9 @@ def test_worker_rejects_invalid_rollout_weight_versions(monkeypatch, version) ->
     assert epochs == []
 
 
+@pytest.mark.parametrize("router_replay_enabled", [True, False])
 def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
-    monkeypatch,
+    monkeypatch, router_replay_enabled
 ):
     installed_sinks = []
     installed_sources = []
@@ -141,7 +142,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         set_generation_epoch=lambda version: epochs.append(version)
     )
     worker._token_capture_enabled = False
-    worker._router_replay_enabled = True
+    worker._router_replay_enabled = router_replay_enabled
     worker._request_payload_stager = None
     worker._request_prompt_preparer = None
 
@@ -155,7 +156,10 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     )
     assert installed_sinks == [("dp", "rollout_staging")]
     assert installed_sources == [("dp", "rollout_staging")]
-    assert worker._request_payload_stager.require_routed_experts
+    # Pins the wiring, not the constant: a hardcoded True/False fails one leg.
+    assert (
+        worker._request_payload_stager.require_routed_experts is router_replay_enabled
+    )
 
     worker.set_rollout_weight_version(7)
     assert epochs == [7]
@@ -167,7 +171,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         is_mp_coordinator=False,
     )
     follower._token_capture_enabled = False
-    follower._router_replay_enabled = True
+    follower._router_replay_enabled = router_replay_enabled
     follower._request_payload_stager = None
     follower._request_prompt_preparer = None
     assert not follower.setup_token_capture({}, "rollout_staging")

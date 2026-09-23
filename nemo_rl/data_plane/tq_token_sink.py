@@ -443,11 +443,6 @@ def _delta_align_minf_routing_indices(
         raise ValueError(
             "MInf routing_indices layer and top-k dimensions must be positive"
         )
-    if routes.dtype not in (torch.int8, torch.int16, torch.int32):
-        raise ValueError(
-            "MInf routing_indices must use int8, int16, or int32 storage, "
-            f"got {routes.dtype}"
-        )
     aligned = torch.full(
         (total_tokens, routes.shape[1], routes.shape[2]),
         ROUTE_MISSING_SENTINEL,

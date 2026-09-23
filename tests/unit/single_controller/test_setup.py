@@ -1943,9 +1943,6 @@ class TestSetup:
         gym = scenario != "native"
         if gym:
             mc = self._make_gym_megatron_config(colocated=colocated)
-            if scenario == "gym":
-                # Direct MInf route staging is the supported Megatron R3 mode.
-                mc.policy["router_replay"] = {"enabled": True}
             patched_factories["setup_response_data"].return_value = (
                 list(range(8)),
                 None,
@@ -2194,23 +2191,47 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
-    def test_megatron_token_capture_rejects_router_replay(self, patched_factories):
+    def test_megatron_token_capture_accepts_router_replay(self, patched_factories):
+        """MInf router replay (defer_routed_experts_to_policy=false) wires routes end to end."""
         mc = self._make_megatron_token_capture_config()
         # The real router_replay_enabled predicate reads policy.router_replay.enabled.
         mc.policy["router_replay"] = {"enabled": True}
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
 
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "spinup_nemo_gym_actor", return_value=MagicMock()
+            ),
             patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
-            pytest.raises(NotImplementedError, match="router replay"),
+            patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+            patch.object(sc_setup_mod, "ray"),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[MagicMock(name="finalizer_0")],
+            ) as mock_create_finalizer_actors,
         ):
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
+            mock_megatron.reserve_http_server_addresses.return_value = (
+                ["http://10.0.0.1:5555/v1"],
+                {0: 5555},
+                [MagicMock(name="port_holder_rank_0")],
+            )
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-        # Router replay is rejected before the megatron-core pin is consulted.
-        mock_gate.assert_not_called()
-        assert mc.token_capture.generation_backend is None
-        patched_factories["setup_response_data"].assert_not_called()
-        patched_factories["_build_clusters"].assert_not_called()
+        mock_gate.assert_called_once_with()
+        # Both the training partition and the staging partition carry routes.
+        rollout_call, staging_call = (
+            actor_args.dp_client.register_partition.call_args_list
+        )
+        assert "routed_experts" in rollout_call.kwargs["fields"]
+        assert "routed_experts" in staging_call.kwargs["fields"]
+        (_, finalizer_config), _ = mock_create_finalizer_actors.call_args
+        assert finalizer_config.router_replay_enabled is True
+        assert finalizer_config.defer_routed_experts_to_policy is False
+        assert actor_args.tq_buffer._require_routed_experts is True
 
     def test_megatron_token_capture_requires_minf_capture_hooks(
         self, patched_factories, monkeypatch

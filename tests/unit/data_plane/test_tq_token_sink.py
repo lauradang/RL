@@ -331,13 +331,6 @@ def test_megatron_stager_writes_canonical_row_and_returns_coords(
             id="zero-topk",
         ),
         pytest.param(
-            torch.zeros((2, 1, 2), dtype=torch.int64),
-            3,
-            0,
-            "must use int8, int16, or int32 storage",
-            id="dtype",
-        ),
-        pytest.param(
             torch.zeros((2, 1, 2), dtype=torch.int32),
             3,
             4,
@@ -430,7 +423,7 @@ def test_megatron_stager_delta_aligns_token_in_routes(tq_client, staging_partiti
 
 
 def test_megatron_stager_requires_routes_when_router_replay_is_enabled(
-    tq_client, staging_partition
+    tq_client, staging_partition, caplog
 ):
     stager = TQMegatronTokenStager(
         TQTokenSink(tq_client, staging_partition=staging_partition),
@@ -442,22 +435,25 @@ def test_megatron_stager_requires_routes_when_router_replay_is_enabled(
         mode="text",
     )
 
-    result = stager.stage(
-        "minf-response-1",
-        SimpleNamespace(
-            prompt_token_ids=[10],
-            generated_token_ids=[11],
-            generated_log_probs=[-0.1],
-            routing_indices=None,
-        ),
-        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
-        offload_params={"ng_capture": admission.model_dump(mode="json")},
-    )
+    with caplog.at_level("ERROR", logger="nemo_rl.data_plane.tq_token_sink"):
+        result = stager.stage(
+            "minf-response-1",
+            SimpleNamespace(
+                prompt_token_ids=[10],
+                generated_token_ids=[11],
+                generated_log_probs=[-0.1],
+                routing_indices=None,
+            ),
+            finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+            offload_params={"ng_capture": admission.model_dump(mode="json")},
+        )
 
     assert result is not None
     assert (
         result.response_metadata["ng_commit_coords"]["disposition"] == "capture_failed"
     )
+    # Any exception inside stage() poisons the call identically; pin the cause.
+    assert "carries no routing_indices" in caplog.text
 
 
 @pytest.mark.parametrize("prefix_source", ["staging_chain", "capture_admission"])
