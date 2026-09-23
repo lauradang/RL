@@ -101,8 +101,9 @@ def test_worker_rejects_invalid_rollout_weight_versions(monkeypatch, version) ->
     assert epochs == []
 
 
+@pytest.mark.parametrize("router_replay_enabled", [True, False])
 def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
-    monkeypatch, inference_loop
+    monkeypatch, inference_loop, router_replay_enabled
 ):
     installed_sinks = []
     installed_sources = []
@@ -120,8 +121,10 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
             self.source = source
 
     class _Stager:
-        def __init__(self, sink):
+        def __init__(self, sink, *, require_routed_experts, expected_route_dims):
             self.sink = sink
+            self.require_routed_experts = require_routed_experts
+            self.expected_route_dims = expected_route_dims
 
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
@@ -140,6 +143,13 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         "nemo_rl.models.generation.megatron.megatron_worker.torch.distributed.get_rank",
         lambda: 0,
     )
+    # With router replay on, the worker sizes the stager's route check from the
+    # served model; the model itself is not built here.
+    gen_model = object()
+    monkeypatch.setattr(
+        "nemo_rl.models.megatron.router_replay.router_replay_dimensions_for_model",
+        lambda model: (4, 2) if model is gen_model else pytest.fail("wrong model"),
+    )
 
     worker = object.__new__(MegatronGenerationMixin)
     worker.dynamic_inference_engine = SimpleNamespace(
@@ -147,6 +157,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         prompt_preparer=None,
         is_mp_coordinator=True,
     )
+    monkeypatch.setattr(MegatronGenerationMixin, "_gen_model", lambda self: gen_model)
     loop, loop_thread = inference_loop
     worker._inference_loop = loop
     epochs = []
@@ -156,6 +167,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         )
     )
     worker._token_capture_enabled = False
+    worker._router_replay_enabled = router_replay_enabled
     worker._request_payload_stager = None
     worker._request_prompt_preparer = None
 
@@ -169,6 +181,13 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     )
     assert installed_sinks == [("dp", "rollout_staging")]
     assert installed_sources == [("dp", "rollout_staging")]
+    # Pins the wiring, not the constant: a hardcoded True/False fails one leg.
+    assert (
+        worker._request_payload_stager.require_routed_experts is router_replay_enabled
+    )
+    assert worker._request_payload_stager.expected_route_dims == (
+        (4, 2) if router_replay_enabled else None
+    )
 
     worker.set_rollout_weight_version(7)
     # The client's ZMQ socket is not thread safe and its listener task runs on
@@ -182,6 +201,7 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
         is_mp_coordinator=False,
     )
     follower._token_capture_enabled = False
+    follower._router_replay_enabled = router_replay_enabled
     follower._request_payload_stager = None
     follower._request_prompt_preparer = None
     assert not follower.setup_token_capture({}, "rollout_staging")
