@@ -183,6 +183,8 @@ run_test      env VICTIM_STATE=serving uv run --no-sync bash ./tests/functional/
 run_test      uv run --no-sync bash ./tests/functional/grpo_checkpoint_single_controller.sh
 # Native TQ + metadata-only completed replay recovery (#3480).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
+# Same recovery flow with Mooncake CPU storage; skips without an RDMA device.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh
 # Deterministic process restart with an admitted group held before canonical TQ
 # commit, followed by exact-once redispatch at its stable group ID.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_unfinished_recovery.sh
@@ -193,6 +195,10 @@ run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controll
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and
 # redispatch only its unfinished peer after restoring the step checkpoint.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
+# The same two-process recovery through Megatron generation, which stages
+# deltas from MCore rather than the vLLM worker. The vLLM run above cannot
+# cover that custody path.
+run_test fast env SC_SIBLING_RECOVERY_GENERATION_BACKEND=megatron uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_sibling_recovery.sh
 # Periodic native-TQ snapshot while a streamed step owns only part of its
 # rollout batch, followed by SIGKILL and rollback to the durable trainer anchor.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_streaming_recovery.sh
