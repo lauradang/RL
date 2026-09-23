@@ -743,7 +743,34 @@ class RolloutReassembler:
             )
         # Media rides the same packed/tagged transport as the token-echo path
         # (pack_payload encodes PackedTensor fields and mints row-shape tags).
-        train_batch.update(_media_fields_for_group(rows))
+        media_fields = _media_fields_for_group(rows)
+        if self._capture_media and not media_fields:
+            # No valid row carried media, so this group would publish without
+            # the media columns. TQ answers a batch fetch with only the fields
+            # every requested key produced, so a train shard mixing these keys
+            # with VLM keys would lose pixel_values for the VLM rows too and
+            # run image-blind. Drop the group; only the caller can source a
+            # replacement.
+            print(
+                f"  finalize: group {group_id} dropped — media capture on but no "
+                "valid rollout carried media",
+                flush=True,
+            )
+            self._clear_staging(staging_keys)
+            metrics["finalize/group_dropped"] = 1.0
+            return FinalizedGroup(
+                meta=None,
+                group_min_wv=group_min_wv,
+                group_max_wv=group_max_wv,
+                staging_keys=[],
+                canonical_output_tokens=0,
+                metrics=metrics,
+                dropped=True,
+                drop_reason="media capture on, no valid rollout carried media",
+                valid_row_count=0,
+                total_row_count=0,
+            )
+        train_batch.update(media_fields)
         sample_ids, fields, tags = pack_payload(
             train_batch,
             weight_version=group_min_wv,

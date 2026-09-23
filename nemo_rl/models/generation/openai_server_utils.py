@@ -40,6 +40,8 @@ def replace_prefix_tokens(
     model_prefix_token_ids: list[int],
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
+    *,
+    eos_token_id: int | None = None,
 ) -> list[int]:
     """Replace a rendered history with the exact previously generated tokens."""
     return splice_prefix_tokens(
@@ -47,6 +49,7 @@ def replace_prefix_tokens(
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
+        eos_token_id=eos_token_id,
     ).token_ids
 
 
@@ -56,6 +59,7 @@ def splice_prefix_tokens(
     model_prefix_token_ids: list[int],
     template_prefix_token_ids: list[int],
     template_token_ids: list[int],
+    eos_token_id: int | None = None,
 ) -> PrefixSplice:
     """This is a subroutine used inside the OpenAI-compatible Chat Completion server.
 
@@ -114,11 +118,16 @@ def splice_prefix_tokens(
         replace_prefix_tokens keeps the exact prior model tokens up to EOS and
         resumes from the template after that EOS:
             output => [11,12,13,40,41,220,17,2,21,22,40,41]
+
+    ``eos_token_id`` overrides ``tokenizer.eos_token_id``; with it, ``tokenizer``
+    may be ``None`` (callers that only hold token ids, e.g. the Megatron prompt
+    preparer) and the failure message skips the detokenized reprs.
     """
     if not model_prefix_token_ids:
         return PrefixSplice(template_token_ids, 0, 0)
 
-    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        eos_token_id = tokenizer.eos_token_id
     assert eos_token_id is not None, "Tokenizer must have an EOS token ID"
 
     # The model isn't guaranteed to end on EOS (e.g. it hit max_tokens); chat
@@ -141,14 +150,19 @@ def splice_prefix_tokens(
                 template_cut_start = pos
                 break
 
-    assert template_cut_start >= 0, (
-        f"EOS token #{count_needed} not found in template_token_ids "
-        f"(only found {count_seen} EOS tokens total)!\n"
-        f"Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}\n\n"
-        f"Template token IDs (everything that was sent to the model endpoint): {template_token_ids}\n\n"
-        f"Template prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}\n\n"
-        f"Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
-    )
+    if template_cut_start < 0:
+        message = (
+            f"EOS token #{count_needed} not found in template_token_ids "
+            f"(only found {count_seen} EOS tokens total)!\n"
+            f"Template prefix token IDs (everything before the final assistant message): {template_prefix_token_ids}\n\n"
+            f"Template token IDs (everything that was sent to the model endpoint): {template_token_ids}"
+        )
+        if tokenizer is not None:
+            message += (
+                f"\n\nTemplate prefix repr (detokenized): {repr(tokenizer.decode(template_prefix_token_ids))}\n\n"
+                f"Template repr (detokenized): {repr(tokenizer.decode(template_token_ids))}"
+            )
+        raise AssertionError(message)
 
     return PrefixSplice(
         model_prefix_token_ids[:model_cut_end]

@@ -17,11 +17,14 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import sys
 import threading
+import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 import torch
@@ -233,6 +236,101 @@ def _save_state(
     state.current_epoch = epoch
     state.trainer_version = trainer_version
     return state
+
+
+def _stub_megatron_inference_request(
+    monkeypatch: pytest.MonkeyPatch, inference_request: types.SimpleNamespace
+) -> None:
+    """Make ``from megatron.core.inference import inference_request`` resolve to a stub.
+
+    Stubs the parent packages too, so the check does not depend on whether the
+    driver venv carries megatron-core (unit tests run without it).
+    """
+    for name in ("megatron", "megatron.core", "megatron.core.inference"):
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.inference.inference_request", inference_request
+    )
+
+
+def test_require_minf_capture_hooks_rejects_megatron_core_without_pr_7015(
+    monkeypatch,
+) -> None:
+    _stub_megatron_inference_request(
+        monkeypatch, types.SimpleNamespace(RequestPayloadStager=object)
+    )
+
+    with pytest.raises(NotImplementedError, match="lacks RequestPromptPreparer"):
+        sc_setup_mod._require_minf_capture_hooks()
+
+
+def test_require_minf_capture_hooks_accepts_megatron_core_with_pr_7015(
+    monkeypatch,
+) -> None:
+    _stub_megatron_inference_request(
+        monkeypatch,
+        types.SimpleNamespace(
+            RequestPayloadStager=object, RequestPromptPreparer=object
+        ),
+    )
+
+    assert sc_setup_mod._require_minf_capture_hooks() is None
+
+
+def test_require_minf_capture_hooks_defers_to_worker_without_megatron_core(
+    monkeypatch,
+) -> None:
+    # None in sys.modules makes the import raise ModuleNotFoundError.
+    monkeypatch.setitem(sys.modules, "megatron", None)
+
+    assert sc_setup_mod._require_minf_capture_hooks() is None
+
+
+def _stub_offloaded_payload(*field_names: str) -> type:
+    """Build a stand-in ``OffloadedRequestPayload`` dataclass with the given fields."""
+    return dataclasses.make_dataclass(
+        "OffloadedRequestPayload", [(name, object) for name in field_names]
+    )
+
+
+def test_require_minf_media_payload_fields_rejects_payload_without_media_tensors(
+    monkeypatch,
+) -> None:
+    _stub_megatron_inference_request(
+        monkeypatch,
+        types.SimpleNamespace(
+            OffloadedRequestPayload=_stub_offloaded_payload(
+                "prompt_token_ids", "compact_prompt_token_ids"
+            )
+        ),
+    )
+
+    with pytest.raises(NotImplementedError, match="lacks: media_tensors"):
+        sc_setup_mod._require_minf_media_payload_fields()
+
+
+def test_require_minf_media_payload_fields_accepts_payload_with_media_fields(
+    monkeypatch,
+) -> None:
+    _stub_megatron_inference_request(
+        monkeypatch,
+        types.SimpleNamespace(
+            OffloadedRequestPayload=_stub_offloaded_payload(
+                "prompt_token_ids", "media_tensors", "compact_prompt_token_ids"
+            )
+        ),
+    )
+
+    assert sc_setup_mod._require_minf_media_payload_fields() is None
+
+
+def test_require_minf_media_payload_fields_defers_to_worker_without_megatron_core(
+    monkeypatch,
+) -> None:
+    # None in sys.modules makes the import raise ModuleNotFoundError.
+    monkeypatch.setitem(sys.modules, "megatron", None)
+
+    assert sc_setup_mod._require_minf_media_payload_fields() is None
 
 
 @pytest.fixture
@@ -2262,6 +2360,115 @@ class TestSetup:
             assert metrics.generation_init_reserve_time_s is None
             assert metrics.weight_sync_time_s is None
 
+    def _make_megatron_token_capture_config(self) -> MasterConfig:
+        """Gym-on Megatron config with token capture enabled (expose_http_server=true)."""
+        mc = self._make_gym_megatron_config()
+        # Extend, don't replace: setup_single_controller also indexes the
+        # wandb keys that _make_master_config populates.
+        mc.logger = {**mc.logger, "log_dir": "/tmp/test-megatron-token-capture"}
+        mc.token_capture.enabled = True
+        return mc
+
+    def test_megatron_token_capture_propagates_backend(self, patched_factories):
+        """Megatron token capture derives generation_backend and rides into Gym.
+
+        The #7015 gate is stubbed to pass so the happy path is deterministic
+        regardless of the pinned megatron-core; the gate itself is covered by
+        test_megatron_token_capture_requires_minf_capture_hooks.
+        """
+        mc = self._make_megatron_token_capture_config()
+        patched_factories["setup_response_data"].return_value = (
+            list(range(8)),
+            None,
+        )
+        fake_gym_actor = MagicMock(name="nemo_gym_actor")
+        reserved_urls = ["http://10.0.0.1:5555/v1"]
+        port_holders = [MagicMock(name="port_holder_rank_0")]
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
+            ) as mock_spinup,
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
+            patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+            patch.object(sc_setup_mod, "ray"),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[MagicMock(name="finalizer_0")],
+            ) as mock_create_finalizer_actors,
+        ):
+            mock_megatron.reserve_http_server_addresses.return_value = (
+                reserved_urls,
+                {0: 5555},
+                port_holders,
+            )
+            actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        mock_gate.assert_called_once_with()
+        assert mc.token_capture.generation_backend == "megatron"
+        assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+            "megatron"
+        )
+        mock_create_finalizer_actors.assert_called_once()
+        assert actor_args.env_handles["nemo_gym"] is fake_gym_actor
+
+    def test_megatron_token_capture_requires_exposed_http_server(
+        self, patched_factories
+    ):
+        mc = self._make_megatron_token_capture_config()
+        mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = False
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
+            pytest.raises(ValueError, match="expose_http_server=true"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        mock_gate.assert_not_called()
+        assert mc.token_capture.generation_backend is None
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_megatron_token_capture_rejects_router_replay(self, patched_factories):
+        mc = self._make_megatron_token_capture_config()
+        # The real router_replay_enabled predicate reads policy.router_replay.enabled.
+        mc.policy["router_replay"] = {"enabled": True}
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
+            pytest.raises(NotImplementedError, match="router replay"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # Router replay is rejected before the megatron-core pin is consulted.
+        mock_gate.assert_not_called()
+        assert mc.token_capture.generation_backend is None
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
+    def test_megatron_token_capture_requires_minf_capture_hooks(
+        self, patched_factories, monkeypatch
+    ):
+        """A pinned megatron-core without PR #7015 fails before any factory runs."""
+        mc = self._make_megatron_token_capture_config()
+        _stub_megatron_inference_request(
+            monkeypatch, types.SimpleNamespace(RequestPayloadStager=object)
+        )
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            pytest.raises(NotImplementedError, match="7015"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        assert mc.token_capture.generation_backend is None
+        patched_factories["setup_response_data"].assert_not_called()
+        patched_factories["_build_clusters"].assert_not_called()
+
     @pytest.mark.parametrize("backend", ["sglang"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):
         """SC nemo-gym wiring supports vllm and megatron; every other backend must raise."""
@@ -2897,3 +3104,199 @@ def test_load_opd_full_teacher_lm_heads_loads_one_head_per_unique_teacher(monkey
         "Qwen/teacher-a",
         "Qwen/teacher-b",
     ]
+
+
+# ── multimodal token capture guards ──────────────────────────────────────────
+
+
+def _make_gym_megatron_capture_config() -> MasterConfig:
+    mc = _make_master_config(backend="megatron", megatron_enabled=True)
+    mc.policy["generation"]["mcore_generation_config"]["expose_http_server"] = True
+    mc.policy["generation"]["stop_strings"] = None
+    mc.policy["generation"]["stop_token_ids"] = None
+    mc.policy["generation"]["top_k"] = None
+    mc.logger = {**mc.logger, "log_dir": "/tmp/test-megatron-token-capture-mm"}
+    mc.token_capture.enabled = True
+    return mc
+
+
+def test_token_capture_rejects_deduplicated_media(patched_factories):
+    """Capture rows carry their own media, so dedup has nothing to share."""
+    mc = _make_gym_megatron_capture_config()
+    mc.grpo.deduplicate_multimodal_data = True
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(sc_setup_mod, "_require_minf_capture_hooks") as mock_gate,
+        pytest.raises(ValueError, match="deduplicate_multimodal_data"),
+    ):
+        setup_single_controller(
+            mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
+        )
+
+    mock_gate.assert_not_called()
+    patched_factories["setup_response_data"].assert_not_called()
+    patched_factories["_build_clusters"].assert_not_called()
+
+
+@pytest.mark.parametrize("multimodal", [False, True], ids=["text", "multimodal"])
+def test_token_capture_megatron_registers_media_columns_only_for_multimodal(
+    patched_factories, multimodal
+):
+    """Only a multimodal Megatron capture run registers the engine-media
+    columns on the staging partition and turns media capture on in the
+    workers and the finalizer; a text run keeps the base schema."""
+    mc = _make_gym_megatron_capture_config()
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    fake_gym_actor = MagicMock(name="nemo_gym_actor")
+    port_holders = [MagicMock(name="port_holder_rank_0")]
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch.object(
+            sc_setup_mod, "build_nemo_gym_actors", return_value=fake_gym_actor
+        ) as mock_spinup,
+        patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+        patch.object(sc_setup_mod, "_require_minf_capture_hooks"),
+        patch.object(
+            sc_setup_mod, "_require_minf_media_payload_fields"
+        ) as mock_media_gate,
+        patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+        patch.object(sc_setup_mod, "ray"),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+            return_value=[MagicMock(name="finalizer_0")],
+        ) as mock_finalizers,
+    ):
+        mock_megatron.reserve_http_server_addresses.return_value = (
+            ["http://10.0.0.1:5555/v1"],
+            {0: 5555},
+            port_holders,
+        )
+        actor_args, _ = setup_single_controller(
+            mc,
+            MagicMock(pad_token_id=0),
+            processor=MagicMock(name="processor") if multimodal else None,
+        )
+
+    assert mock_spinup.call_args.kwargs["token_capture"]["generation_backend"] == (
+        "megatron"
+    )
+    dp_client = patched_factories["build_data_plane_client"].return_value
+    staging_calls = [
+        call
+        for call in dp_client.register_partition.call_args_list
+        if call.kwargs.get("partition_id") == mc.token_capture.staging_partition
+    ]
+    assert len(staging_calls) == 1
+    fields = set(staging_calls[0].kwargs["fields"])
+    if multimodal:
+        assert set(MEDIA_STAGING_FIELDS) <= fields
+    else:
+        assert set(MEDIA_STAGING_FIELDS).isdisjoint(fields)
+    # The finalizer learns whether a group without media may be published:
+    # in a media run it must be dropped (see RolloutReassembler.finalize_group).
+    finalizer_config = mock_finalizers.call_args.args[1]
+    assert finalizer_config.capture_media is multimodal
+    # The workers build their sink/source against the same schema; the handle
+    # setup hands the actor is the backend it configured, whichever factory
+    # (colocated MegatronGeneration or _build_generation) produced it.
+    actor_args.gen_handle.setup_token_capture.assert_called_once_with(
+        ANY, mc.token_capture.staging_partition, capture_media=multimodal
+    )
+    # Only a media run consults the MInf payload fields; a text run never
+    # touches them (its stager reads token columns only).
+    assert mock_media_gate.call_count == (1 if multimodal else 0)
+
+
+def test_token_capture_megatron_media_requires_minf_media_payload_fields(
+    patched_factories, monkeypatch
+):
+    """A multimodal Megatron capture run fails at setup, before any factory
+    runs, when the pinned megatron-core payload lacks ``media_tensors``
+    (otherwise every VLM call would stage a text sentinel and the finalizer
+    would drop every group)."""
+    mc = _make_gym_megatron_capture_config()
+    _stub_megatron_inference_request(
+        monkeypatch,
+        types.SimpleNamespace(
+            RequestPayloadStager=object,
+            RequestPromptPreparer=object,
+            OffloadedRequestPayload=_stub_offloaded_payload(
+                "prompt_token_ids", "compact_prompt_token_ids"
+            ),
+        ),
+    )
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        pytest.raises(NotImplementedError, match="media_tensors"),
+    ):
+        setup_single_controller(
+            mc, MagicMock(pad_token_id=0), processor=MagicMock(name="processor")
+        )
+
+    assert mc.token_capture.generation_backend is None
+    patched_factories["setup_response_data"].assert_not_called()
+    patched_factories["_build_clusters"].assert_not_called()
+
+
+@pytest.mark.mcore
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "pending Megatron-LM pin carrying tdene/Megatron-LM#20 "
+        "(media_tensors on OffloadedRequestPayload)"
+    ),
+)
+def test_offloaded_payload_exposes_multimodal_capture_fields():
+    """Pin the engine payload fields the multimodal stager reads with getattr defaults."""
+    # Deferred import: megatron-core is a heavy, optional dependency that the
+    # driver venv may not carry at all.
+    from megatron.core.inference import inference_request
+
+    if not hasattr(inference_request, "RequestPayloadStager"):
+        pytest.skip(
+            "pinned megatron-core predates MInf capture hooks (Megatron-LM #7015)"
+        )
+    names = {
+        field.name
+        for field in dataclasses.fields(inference_request.OffloadedRequestPayload)
+    }
+    assert {"media_tensors", "compact_prompt_token_ids"} <= names
+
+
+@pytest.mark.mcore
+def test_minf_image_preprocessing_emits_pinned_pixel_dtype():
+    """Pin the premise behind MINF_MEDIA_PIXEL_DTYPE: MInf's wire image path
+    hands the payload stager float32 packed patches, whatever the model's
+    params dtype, so the Megatron worker's media column must match it."""
+    # Deferred imports: megatron-core (and its torchvision dependency for the
+    # image path) are heavy, optional dependencies of the mcore lane only.
+    Image = pytest.importorskip("PIL.Image")
+    pytest.importorskip("torchvision")
+    from megatron.core.inference.config import ImageProcessingConfig
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (
+        preprocess_image,
+    )
+
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MINF_MEDIA_PIXEL_DTYPE,
+    )
+
+    # 4x4 RGB with 2x2 patches: dynamic resolution keeps it at a 2x2 patch grid.
+    config = ImageProcessingConfig(
+        patch_dim=2,
+        dynamic_resolution=True,
+        pixel_mean=[0.5, 0.5, 0.5],
+        pixel_std=[0.5, 0.5, 0.5],
+    )
+    imgs, imgs_sizes = preprocess_image(Image.new("RGB", (4, 4)), config)
+
+    assert imgs.dtype == MINF_MEDIA_PIXEL_DTYPE
+    assert tuple(imgs.shape) == (1, 4, 3 * 2 * 2)
+    assert imgs_sizes.dtype == torch.int32
+    assert imgs_sizes.tolist() == [[4, 4]]
