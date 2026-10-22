@@ -121,6 +121,9 @@ class MegatronDynamoWorkerClient:
     def pinned_handoff_block_count(self) -> ray.ObjectRef:
         return self.leader.pinned_handoff_block_count.remote()
 
+    def liveness_ref(self) -> ray.ObjectRef:
+        return self.leader.is_alive.remote()
+
 
 class PinnedHandoffTimeout(TimeoutError):
     """Prefill engines still held handoff blocks when the pause wait expired."""
@@ -194,6 +197,22 @@ class MegatronRefitChannel:
     def client_copy(self) -> "MegatronRefitChannel":
         """The channel holds only actor handles and owns nothing; it is its own copy."""
         return self
+
+    def check_alive(self) -> None:
+        """Raise if any engine's leading worker has died.
+
+        Used while waiting for the engines to register with the frontend, so a
+        dead engine fails the wait at once instead of at the startup timeout.
+        """
+        alive = ray.get(
+            [self._client(record).liveness_ref() for record in self._records],
+            timeout=self._control_timeout_s,
+        )
+        dead = [
+            record.instance_id for record, ok in zip(self._records, alive) if not ok
+        ]
+        if dead:
+            raise RuntimeError(f"Megatron engines died: {', '.join(dead)}")
 
     @staticmethod
     def _client(record: DynamoWorkerRecord) -> MegatronDynamoWorkerClient:

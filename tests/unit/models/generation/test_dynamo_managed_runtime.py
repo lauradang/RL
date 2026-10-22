@@ -30,6 +30,7 @@ from nemo_rl.models.generation.dynamo.dynamo_worker import (
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
     _managed_namespace,
+    wait_for_frontend_registrations,
 )
 from nemo_rl.models.generation.dynamo.worker_pool import (
     FixedDynamoWorkerPool,
@@ -40,8 +41,11 @@ from nemo_rl.models.generation.dynamo.worker_pool import (
 class _Cluster:
     num_gpus_per_node = 4
 
+    def __init__(self, world_size: int = 4) -> None:
+        self._world_size = world_size
+
     def world_size(self) -> int:
-        return 4
+        return self._world_size
 
 
 def test_dynamo_package_directory_does_not_shadow_stdlib_http() -> None:
@@ -938,7 +942,15 @@ def test_frontend_waits_for_model_after_endpoint_registration(monkeypatch) -> No
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.managed_runtime.time.sleep", lambda _: None
     )
-    runtime._wait_for_frontend({"backend": 1, "prefill": 1})
+    wait_for_frontend_registrations(
+        base_url="http://127.0.0.1:3000",
+        namespace="nemo-rl-test",
+        expected_components={"backend": 1, "prefill": 1},
+        expected_endpoints={"generate", "rl"},
+        expected_model="model",
+        timeout_s=5,
+        check_alive=runtime._check_fleet_alive,
+    )
     assert urls == [
         "http://127.0.0.1:3000/health",
         "http://127.0.0.1:3000/health",
@@ -955,7 +967,171 @@ def test_frontend_wait_fails_immediately_when_worker_exits(monkeypatch) -> None:
     runtime._pool = SimpleNamespace(is_alive=lambda: False)
 
     with pytest.raises(RuntimeError, match="worker exited while the frontend"):
-        runtime._wait_for_frontend({"backend": 1})
+        wait_for_frontend_registrations(
+            base_url="http://127.0.0.1:3000",
+            namespace="nemo-rl-test",
+            expected_components={"backend": 1},
+            expected_endpoints={"generate", "rl"},
+            expected_model="model",
+            timeout_s=5,
+            check_alive=runtime._check_fleet_alive,
+        )
+
+
+def _megatron_engine_config() -> dict:
+    config = _config()
+    config["dynamo_cfg"]["engine"] = "megatron"
+    config["vllm_cfg"] = None
+    config["refit_transport"] = None
+    config["disaggregation"] = {
+        "enabled": True,
+        "num_prefill_engines": 1,
+        "num_decode_engines": 1,
+    }
+    config["mcore_generation_config"] = {
+        "enable_prefix_caching": True,
+        "kv_cache_management_mode": "persist",
+        "expose_http_server": False,
+    }
+    return config
+
+
+_MEGATRON_POLICY = {
+    "model_name": "model",
+    "megatron_cfg": {
+        "enabled": True,
+        "tensor_model_parallel_size": 2,
+        "pipeline_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "expert_tensor_parallel_size": 1,
+        "expert_model_parallel_size": 1,
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("prefill", "world_size", "widths"),
+    [
+        ({}, 4, {"prefill": 2, "decode": 2}),
+        # Prefill at TP 4 next to decode at the shared TP 2: a 6-GPU replica.
+        (
+            {"tensor_model_parallel_size": 4, "pipeline_model_parallel_size": 1},
+            6,
+            {"prefill": 4, "decode": 2},
+        ),
+    ],
+    ids=["uniform", "mixed"],
+)
+def test_runtime_with_worker_pool_starts_it_and_does_not_wait(
+    monkeypatch, prefill, world_size, widths
+) -> None:
+    """A pool's engines register later, so start() returns before the frontend is ready."""
+    calls: list = []
+    config = _megatron_engine_config()
+    config["dynamo_cfg"]["prefill_engines"] = [prefill] if prefill else []
+    policy = {**_MEGATRON_POLICY, "generation": config}
+    with pytest.raises(ValueError, match="require an worker pool factory"):
+        ManagedDynamoRuntime(
+            cluster=_Cluster(world_size), config=config, policy_config=policy
+        )
+
+    class FakePool:
+        records = ["record"]
+
+        def start(self, workers):
+            calls.append(
+                (
+                    "pool-start",
+                    [w.role for w in workers],
+                    {w.role: w.width for w in workers},
+                )
+            )
+            return self.records
+
+        def expected_components(self):
+            return {"prefill": 1, "backend": 1}
+
+        def is_alive(self):
+            return True
+
+        def validate(self, expected):
+            return list(expected)
+
+        def shutdown(self):
+            calls.append("pool-shutdown")
+
+    def factory(*, namespace, manager_env):
+        calls.append(("factory", namespace, manager_env["DYN_NAMESPACE"]))
+        return FakePool()
+
+    runtime = ManagedDynamoRuntime(
+        cluster=_Cluster(world_size),
+        config=config,
+        policy_config=policy,
+        worker_pool_factory=factory,
+    )
+    ports = iter([1313, 1314, 1315, 3000])
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime._get_node_ip_local",
+        lambda: "10.0.0.1",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime._get_free_port_local",
+        lambda low, high, **kwargs: next(ports),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.atexit.register",
+        lambda hook: None,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.wait_for_frontend_registrations",
+        lambda **kwargs: calls.append("wait"),
+    )
+    for step in ("_start_etcd", "_start_nats", "_start_frontend"):
+        monkeypatch.setattr(runtime, step, lambda step=step: calls.append(step))
+
+    runtime.start()
+
+    assert calls == [
+        "_start_etcd",
+        "_start_nats",
+        ("factory", runtime.namespace, runtime.namespace),
+        ("pool-start", ["prefill", "decode"], widths),
+        "_start_frontend",
+    ]
+    assert runtime.fleet_ready is False
+    assert runtime.frontend_base_url == "http://10.0.0.1:3000"
+    assert runtime.frontend_url == "http://10.0.0.1:3000/v1"
+    assert runtime.expected_registrations() == (
+        {"prefill": 1, "backend": 1},
+        frozenset({"generate"}),
+    )
+    # Records and validation pass through once the services are alive.
+    for name in ("_etcd_process", "_nats_process", "_frontend_process"):
+        setattr(runtime, name, _FakeProcess())
+    assert runtime.worker_records() == ["record"]
+    assert runtime.validate_worker_records(["record"]) == ["record"]
+    runtime.wait_until_ready()
+    runtime.wait_until_ready()
+    assert calls.count("wait") == 1 and runtime.fleet_ready is True
+    monkeypatch.setattr(runtime, "_stop_process", lambda *args, **kwargs: None)
+    runtime.shutdown()
+    assert calls[-1] == "pool-shutdown" and runtime.fleet_ready is False
+
+
+def test_runtime_names_the_role_whose_engine_does_not_fit_a_node() -> None:
+    config = _megatron_engine_config()
+    config["dynamo_cfg"]["decode_engines"] = [
+        {"tensor_model_parallel_size": 8, "pipeline_model_parallel_size": 1}
+    ]
+    policy = {**_MEGATRON_POLICY, "generation": config}
+    with pytest.raises(ValueError, match="a decode engine spans 8 ranks"):
+        ManagedDynamoRuntime(
+            cluster=_Cluster(),
+            config=config,
+            policy_config=policy,
+            worker_pool_factory=lambda **kwargs: None,
+        )
 
 
 def test_frontend_logs_resolved_tokenizer_environment(monkeypatch, capsys) -> None:
