@@ -286,6 +286,151 @@ Current limits on this path:
 
 Setup rejects any of these before allocating clusters.
 
+## Run Megatron prefill/decode engines under the SingleController
+
+The SingleController can also put NeMo RL's own Megatron inference engines
+behind the Dynamo frontend, split into a prefill pool and a decode pool. Start
+from
+[`examples/configs/grpo_math_1B_dynamo_pd_megatron_single_controller.yaml`](../../examples/configs/grpo_math_1B_dynamo_pd_megatron_single_controller.yaml)
+and launch it with `examples/run_grpo_single_controller.py`. The config
+boundary is:
+
+```yaml
+async_rl:
+  recompute_kv_cache_after_weight_updates: false   # the engines keep their caches
+policy:
+  megatron_cfg:
+    enabled: true            # the engines receive logical weights from a Megatron trainer
+  generation:
+    backend: dynamo
+    refit_transport: null    # collective refit only
+    dynamo_cfg:
+      engine: megatron
+      megatron_root: null    # Megatron-LM tree the adapter imports; null = the Bridge submodule's
+    disaggregation:
+      enabled: true
+      num_prefill_engines: 1
+      num_decode_engines: 1
+    mcore_generation_config:
+      enable_prefix_caching: true
+      kv_cache_management_mode: persist
+      expose_http_server: false
+    vllm_cfg: null
+    vllm_kwargs: {}
+```
+
+What runs:
+
+- **Engines.** `disaggregation` tiles the inference GPUs into replicas of
+  `num_prefill_engines` prefill engines followed by `num_decode_engines` decode
+  engines, exactly as for the vLLM fleet. Each engine slot becomes one dedicated
+  Megatron inference policy (its own worker group, data parallel one), the same
+  object `backend: megatron` builds when `colocated.enabled` is false. Every
+  engine has the layout of `policy.megatron_cfg` with
+  `mcore_generation_config` applied, plus its own entry in
+  `dynamo_cfg.prefill_engines` / `decode_engines` (below); each engine's width
+  (TP x PP) must fit on one node.
+- **Adapter sidecars.** Next to each engine, a CPU Ray actor runs Megatron-LM's
+  Dynamo adapter (`megatron.inference.integrations.dynamo`) from the Dynamo
+  virtual environment in external launch mode. It registers the engine with the
+  frontend, forwards requests to the engine's coordinator, and carries the KV
+  handoff between prefill and decode over NIXL. It never owns GPUs or weights.
+- **Frontend, etcd, NATS.** Driver-owned, as for the vLLM fleet. Prefill
+  engines register as the `prefill` component and decode engines as `backend`;
+  the frontend's prefill router splits each request between them.
+
+Every engine may use its own layout. `dynamo_cfg.prefill_engines` and
+`dynamo_cfg.decode_engines` list one entry per prefill and decode engine of a
+replica, in launch order; each entry gives that engine's
+`tensor_model_parallel_size` and `pipeline_model_parallel_size` (both
+required; everything else comes from the shared layout). A non-empty list must have exactly `num_prefill_engines` (`num_decode_engines`)
+entries, and every replica repeats the same layouts; an empty list (the
+default) runs every engine of that role at the shared layout. Megatron reshards
+the KV cache during each handoff, so any prefill engine may hand off to any
+decode engine. For example, one prefill engine at TP 4 next to a decode engine
+at TP 2 and one at TP 1 x PP 2 is an 8-GPU replica:
+
+```yaml
+policy:
+  generation:
+    dynamo_cfg:
+      engine: megatron
+      prefill_engines:
+        - tensor_model_parallel_size: 4
+          pipeline_model_parallel_size: 1
+      decode_engines:
+        - tensor_model_parallel_size: 2
+          pipeline_model_parallel_size: 1
+        - tensor_model_parallel_size: 1
+          pipeline_model_parallel_size: 2
+    disaggregation:
+      enabled: true
+      num_prefill_engines: 1
+      num_decode_engines: 2
+    mcore_generation_config:
+      tensor_model_parallel_size: 2
+```
+
+With `T` trainer ranks, the refit collective places the trainer ranks first,
+then the engines in launch order, each starting where the previous one ended:
+the prefill engine at `T..T+3`, the decode engines at `T+4..T+5` and
+`T+6..T+7`. Per-engine layouts are implemented for `engine: megatron` only; the
+managed vLLM fleet runs every worker at the `vllm_cfg` layout and rejects a
+non-empty list.
+
+Refit and startup differ from the vLLM fleet:
+
+- The engines are built at the first weight update (they start without
+  weights), so the sidecars start at setup but the frontend becomes ready only
+  after that first refit. `dynamo_cfg.startup_timeout_s` must cover trainer
+  construction plus the first refit; the first resume after a refit waits for
+  the frontend to list every engine and the model before rollouts start. That
+  first resume also builds each engine and captures its CUDA graphs, so it is
+  bounded by at least `startup_timeout_s` instead of the controller's resume
+  timeout.
+- A request spans two engines, and a prefill engine must not be suspended while
+  a decode engine may still be pulling one of its KV blocks (a "handoff pin").
+  So the pause stops the prefill engines from scheduling first, keeps decode
+  running until every pin on prefill has cleared, then suspends prefill, then
+  decode. The SingleController bounds that wait with its pause timeout:
+  `async_rl.generation_fleet_health.refit_timeout_s` plus a 60-second grace, or
+  360 seconds when `refit_timeout_s` is null. (`dynamo_cfg.control_timeout_s`
+  applies only when a caller passes no timeout.) If the
+  pins do not clear in time the prefill engines are unpaused again and the
+  refit fails rather than leaving the fleet half stopped. Resume brings decode
+  back first, then prefill, because decode is the reader of prefill's KV. The
+  controller's refit sequence is unchanged.
+- The collective is one NCCL group over the trainers plus all engines. Engine
+  `i` sits at rank prefix `T` plus the widths of the engines before it, where
+  `T` is the trainer world size (`T + i * w` when every engine has width `w`,
+  the same placement a vLLM engine would have). The engines receive logical
+  (unfused) weights, as the Megatron backend does.
+- Shutdown stops decode engines first, confirms their termination to every
+  prefill coordinator so pinned blocks are released, then stops prefill.
+
+Limits:
+
+- Prefill/decode only: aggregated Megatron engines behind Dynamo are rejected
+  (use `backend: megatron` for that).
+- Native rollouts only; NeMo-Gym under the SingleController does not support
+  `backend: dynamo`.
+- Each engine fits on one node; `refit_transport` must be null;
+  `recompute_kv_cache_after_weight_updates` must be false (the engines keep
+  their caches, mode `persist`); setup rejects the last two otherwise.
+- Data-plane storage units cannot be placed on the `inference` cluster
+  (`storage_unit_placement: all` or `[inference]`): the engines reserve those
+  GPUs through their own clusters. Place them on `train`.
+- Of `dynamo_cfg.worker_args`, the Megatron adapter reads only
+  `endpoint_types` and `extra_cli_args`; setting a tool-call or reasoning
+  parser, a custom chat template, or `enable_structural_tag` is rejected.
+- The engine workers need the `nixl` package in the Megatron environment for
+  the KV handoff, and the adapter sidecar needs a Megatron-LM tree with the
+  Dynamo integration (`megatron/inference/integrations/dynamo`).
+
+The functional test is
+`tests/functional/grpo_dynamo_pd_megatron_single_controller.sh` (three GPUs:
+trainer, prefill, decode).
+
 ## Run SWE1 with W&B
 
 The three-node nightly recipe targets

@@ -815,6 +815,19 @@ def test_megatron_engine_width_must_hold_the_expert_parallel_grid() -> None:
         config.engine_world_size(policy)
 
 
+def test_configure_generation_config_leaves_megatron_engines_without_vllm_cfg() -> None:
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 1
+
+    configured = configure_generation_config(
+        _megatron_config(stop_token_ids=None), Tokenizer()
+    )
+
+    assert configured["vllm_cfg"] is None
+    DynamoConfig.model_validate(configured)
+
+
 @pytest.mark.parametrize(
     ("mutate", "match"),
     [
@@ -842,6 +855,26 @@ def test_megatron_engine_width_must_hold_the_expert_parallel_grid() -> None:
             _set("refit_transport", value="nccl_reshard"),
             "refit_transport must be null",
             id="refit_transport",
+        ),
+        pytest.param(
+            _set("dynamo_cfg", "worker_args", "tool_call_parser", value="hermes"),
+            r"\['tool_call_parser'\] are not read",
+            id="worker_args_tool_call_parser",
+        ),
+        pytest.param(
+            _set("dynamo_cfg", "worker_args", "reasoning_parser", value="qwen3"),
+            r"\['reasoning_parser'\] are not read",
+            id="worker_args_reasoning_parser",
+        ),
+        pytest.param(
+            _set("dynamo_cfg", "worker_args", "enable_structural_tag", value=True),
+            r"\['enable_structural_tag'\] are not read",
+            id="worker_args_structural_tag",
+        ),
+        pytest.param(
+            _set("dynamo_cfg", "worker_args", "custom_jinja_template", value="t.j2"),
+            r"\['custom_jinja_template'\] are not read",
+            id="worker_args_jinja_template",
         ),
         pytest.param(
             _set("mcore_generation_config", "enable_prefix_caching", value=False),

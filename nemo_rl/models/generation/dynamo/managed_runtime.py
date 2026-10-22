@@ -12,7 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Driver-owned lifecycle for a fixed Ray-managed Dynamo deployment."""
+"""Driver-owned lifecycle for a fixed Dynamo deployment.
+
+The runtime owns etcd, NATS, and the frontend, and either the fixed Ray-managed
+``dynamo.vllm`` worker fleet or a ``DynamoWorkerPool`` (NeMo RL's own Megatron
+engines) registered behind that frontend.
+"""
 
 import atexit
 import json
@@ -28,7 +33,8 @@ import time
 import urllib.error
 import urllib.request
 from collections import Counter
-from typing import Any
+from collections.abc import Callable, Collection, Mapping
+from typing import Any, Protocol
 
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
@@ -45,6 +51,10 @@ from nemo_rl.models.generation.dynamo.arguments import (
     redact_environment,
 )
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
+from nemo_rl.models.generation.dynamo.protocols import (
+    DynamoWorkerPool,
+    DynamoWorkerRecord,
+)
 from nemo_rl.models.generation.dynamo.venv import (
     get_dynamo_python,
     get_dynamo_service_executable,
@@ -62,32 +72,187 @@ def _managed_namespace() -> str:
     return namespace
 
 
+class WorkerPoolFactory(Protocol):
+    """Builds an worker pool once the runtime knows its namespace and env."""
+
+    def __call__(
+        self, *, namespace: str, manager_env: dict[str, str]
+    ) -> DynamoWorkerPool: ...
+
+
+# Endpoints each engine registers: the vLLM fleet serves generation and the
+# RL control route; Megatron adapters serve generation only.
+VLLM_ENGINE_ENDPOINTS: frozenset[str] = frozenset({"generate", "rl"})
+POOL_ENGINE_ENDPOINTS: frozenset[str] = frozenset({"generate"})
+
+
+def wait_for_frontend_registrations(
+    *,
+    base_url: str,
+    namespace: str,
+    expected_components: Mapping[str, int],
+    expected_endpoints: Collection[str],
+    expected_model: str,
+    timeout_s: float,
+    check_alive: Callable[[], None] | None = None,
+) -> None:
+    """Block until the frontend lists every expected engine and the model.
+
+    ``/health`` lists discovery registrations. Every component in
+    ``expected_components`` must show exactly its count of instance ids on each
+    endpoint in ``expected_endpoints``, with the same ids across those endpoints.
+    ``/v1/models`` must then list ``expected_model``: the frontend installs its
+    OpenAI routes from a model watcher that can lag discovery, and exposing the
+    URL before that races a transient 404. The frontend answers 503 until both
+    prefill and decode are live and never falls back to aggregated serving, so
+    under disaggregation every component must register.
+
+    Args:
+        base_url: Frontend root without the ``/v1`` suffix.
+        namespace: Dynamo namespace the engines register under.
+        expected_components: Component name to the number of engines in it.
+        expected_endpoints: Endpoints each engine registers.
+        expected_model: Served model name ``/v1/models`` must list.
+        timeout_s: Total wait budget.
+        check_alive: Raises when a process the caller owns has died.
+
+    Raises:
+        RuntimeError: When the fleet is not fully registered within ``timeout_s``.
+    """
+    root = base_url.rstrip("/")
+    health_url = f"{root}/health"
+    models_url = f"{root}/v1/models"
+    endpoints = sorted(expected_endpoints)
+    deadline = time.monotonic() + timeout_s
+    last_counts: dict[str, dict[str, int]] = {
+        component: {endpoint: 0 for endpoint in endpoints}
+        for component in expected_components
+    }
+    last_models: set[str] = set()
+    while time.monotonic() < deadline:
+        if check_alive is not None:
+            check_alive()
+        try:
+            with urllib.request.urlopen(health_url, timeout=5) as response:
+                payload = json.loads(response.read())
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            time.sleep(1)
+            continue
+        # component -> endpoint -> instance ids
+        observed: dict[str, dict[str, set[str]]] = {
+            component: {endpoint: set() for endpoint in endpoints}
+            for component in expected_components
+        }
+        for instance in payload.get("instances", []):
+            if not isinstance(instance, dict):
+                continue
+            if instance.get("namespace") != namespace:
+                continue
+            component = instance.get("component")
+            endpoint = instance.get("endpoint")
+            instance_id = instance.get("instance_id")
+            if (
+                isinstance(component, str)
+                and component in observed
+                and endpoint in observed[component]
+                and instance_id is not None
+            ):
+                observed[component][str(endpoint)].add(str(instance_id))
+        last_counts = {
+            component: {endpoint: len(ids) for endpoint, ids in by_endpoint.items()}
+            for component, by_endpoint in observed.items()
+        }
+        complete = all(
+            all(len(observed[component][endpoint]) == count for endpoint in endpoints)
+            and len({frozenset(observed[component][e]) for e in endpoints}) == 1
+            for component, count in expected_components.items()
+        )
+        if not complete:
+            time.sleep(1)
+            continue
+        try:
+            with urllib.request.urlopen(models_url, timeout=5) as response:
+                models_payload = json.loads(response.read())
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+            time.sleep(1)
+            continue
+        last_models = {
+            str(model["id"])
+            for model in models_payload.get("data", [])
+            if isinstance(model, dict) and model.get("id") is not None
+        }
+        if expected_model not in last_models:
+            time.sleep(1)
+            continue
+        print(
+            f"  [Dynamo] frontend ready: {dict(expected_components)} engines "
+            f"serving {endpoints} for {expected_model!r}",
+            flush=True,
+        )
+        return
+    raise RuntimeError(
+        "Dynamo frontend did not observe the fixed engine fleet within "
+        f"{timeout_s}s: expected={dict(expected_components)} on {endpoints}, "
+        f"last counts={last_counts}, expected_model={expected_model!r}, "
+        f"last_models={sorted(last_models)!r}."
+    )
+
+
 class ManagedDynamoRuntime:
-    """Own etcd, NATS, frontend, and a fixed Ray actor worker fleet."""
+    """Own etcd, NATS, frontend, and the engines registered behind them.
+
+    Engines are either the fixed Ray-managed ``dynamo.vllm`` fleet (the default)
+    or a ``DynamoWorkerPool`` built by ``worker_pool_factory`` once the namespace
+    and service environment exist. A pool's engines may register only later
+    (Megatron engines come up at the first refit), so readiness is a separate
+    step, :meth:`wait_until_ready`, that the vLLM path runs inside :meth:`start`
+    and a pool's owner runs once its engines are serving.
+    """
 
     def __init__(
         self,
         *,
         cluster: RayVirtualCluster,
         config: dict[str, Any],
+        policy_config: Mapping[str, Any] | None = None,
+        worker_pool_factory: WorkerPoolFactory | None = None,
     ) -> None:
+        """Validate the fleet shape without starting anything.
+
+        Args:
+            cluster: Non-colocated inference cluster the engines run on.
+            config: ``policy.generation`` (a ``DynamoConfig``).
+            policy_config: Full ``policy`` config; Megatron engines take their
+                width from it. None for vLLM engines.
+            worker_pool_factory: Builds the worker pool; required for Megatron
+                engines, absent for the vLLM fleet.
+
+        Raises:
+            ValueError: When Megatron engines come without a factory, or one
+                engine does not fit on a node.
+        """
         validated_config = DynamoConfig.model_validate(config)
         self._cluster = cluster
         self._config = validated_config.model_dump()
         self._dynamo_cfg = validated_config.dynamo_cfg
-        self._engine_world_size = validated_config.engine_world_size()
-        if self._engine_world_size > cluster.num_gpus_per_node:
+        self._worker_pool_factory = worker_pool_factory
+        if validated_config.is_megatron_engine and worker_pool_factory is None:
+            raise ValueError(
+                "Megatron engines behind Dynamo require an worker pool factory"
+            )
+        # Every engine of the fleet in launch order, each with its own width.
+        replica_layout = validated_config.replica_layout(policy_config)
+        widest = max(replica_layout, key=lambda worker: worker.width)
+        if widest.width > cluster.num_gpus_per_node:
             raise ValueError(
                 "Managed Dynamo requires each TP/PP engine group to fit on one "
-                f"node: tp*pp={self._engine_world_size} exceeds "
-                f"cluster.num_gpus_per_node={cluster.num_gpus_per_node}"
+                f"node: a {widest.role} engine spans {widest.width} ranks, which "
+                f"exceeds cluster.num_gpus_per_node={cluster.num_gpus_per_node}"
             )
-        self._worker_roles = [
-            worker.role
-            for worker in validated_config.worker_layouts(
-                cluster.world_size(), validated_config.replica_layout()
-            )
-        ]
+        self._worker_layouts = validated_config.worker_layouts(
+            cluster.world_size(), replica_layout
+        )
+        self._worker_roles = [worker.role for worker in self._worker_layouts]
         # Dynamo component names: aggregated and decode workers register as
         # "backend", prefill workers as "prefill".
         self._expected_components = dict(
@@ -111,13 +276,41 @@ class ManagedDynamoRuntime:
         self._etcd_data_dir: str | None = None
         self._nats_data_dir: str | None = None
         self._pool: FixedDynamoWorkerPool | None = None
+        self._worker_pool: DynamoWorkerPool | None = None
+        self._fleet_ready = False
 
     @property
-    def frontend_url(self) -> str:
+    def namespace(self) -> str:
+        return self._namespace
+
+    @property
+    def frontend_base_url(self) -> str:
+        """Frontend root, without the ``/v1`` suffix."""
         if not self._started:
             raise RuntimeError("Managed Dynamo runtime has not been started")
         host = f"[{self._host}]" if ":" in self._host else self._host
-        return f"http://{host}:{self._frontend_port}/v1"
+        return f"http://{host}:{self._frontend_port}"
+
+    @property
+    def frontend_url(self) -> str:
+        return f"{self.frontend_base_url}/v1"
+
+    @property
+    def fleet_ready(self) -> bool:
+        """Whether the frontend has listed every engine and the model."""
+        return self._fleet_ready
+
+    def expected_registrations(self) -> tuple[dict[str, int], frozenset[str]]:
+        """What the frontend must list before the fleet counts as ready.
+
+        Returns:
+            The component counts and the endpoints each engine registers; the
+            arguments :func:`wait_for_frontend_registrations` needs, so a copy
+            of the owner in another process can run the same wait.
+        """
+        if self._worker_pool is not None:
+            return self._worker_pool.expected_components(), POOL_ENGINE_ENDPOINTS
+        return dict(self._expected_components), VLLM_ENGINE_ENDPOINTS
 
     def start(self) -> None:
         """Start the complete managed service fleet."""
@@ -182,11 +375,22 @@ class ManagedDynamoRuntime:
         try:
             self._start_etcd()
             self._start_nats()
+            if self._worker_pool_factory is not None:
+                self._worker_pool = self._worker_pool_factory(
+                    namespace=self._namespace, manager_env=dict(self._manager_env)
+                )
+                self._worker_pool.start(self._worker_layouts)
+                self._start_frontend()
+                # The engines register when they come up, which for Megatron
+                # engines is the first refit; the owner calls wait_until_ready
+                # then.
+                self._started = True
+                return
             self._pool = FixedDynamoWorkerPool(
                 cluster=self._cluster,
                 config=self._config,
                 namespace=self._namespace,
-                engine_world_size=self._engine_world_size,
+                engine_world_size=self._vllm_engine_world_size(),
                 worker_roles=self._worker_roles,
                 # Only the prefill hop is KV-routed under disaggregation.
                 prefill_kv_events=self._dynamo_cfg.frontend_args.router_mode == "kv",
@@ -195,11 +399,64 @@ class ManagedDynamoRuntime:
             )
             self._pool.start()
             self._start_frontend()
-            self._wait_for_frontend(self._expected_components)
             self._started = True
+            self.wait_until_ready()
         except Exception:
             self.shutdown()
             raise
+
+    def _vllm_engine_world_size(self) -> int:
+        """The one width every Dynamo-managed vLLM worker has.
+
+        ``DynamoConfig`` rejects per-worker layouts for vLLM, so every worker
+        has the same width; this guards that invariant rather than handling a
+        mixed fleet.
+        """
+        widths = {worker.width for worker in self._worker_layouts}
+        assert len(widths) == 1, (
+            f"Dynamo-managed vLLM workers all share one width, got {sorted(widths)}"
+        )
+        return next(iter(widths))
+
+    def wait_until_ready(self) -> None:
+        """Wait for every engine to register and the model to be routable.
+
+        Idempotent: returns at once after the first successful wait.
+        """
+        if self._fleet_ready:
+            return
+        expected_components, expected_endpoints = self.expected_registrations()
+        wait_for_frontend_registrations(
+            base_url=f"http://127.0.0.1:{self._frontend_port}",
+            namespace=self._namespace,
+            expected_components=expected_components,
+            expected_endpoints=expected_endpoints,
+            expected_model=str(self._config["model_name"]),
+            timeout_s=self._dynamo_cfg.startup_timeout_s,
+            check_alive=self._check_fleet_alive,
+        )
+        self._fleet_ready = True
+
+    def _check_fleet_alive(self) -> None:
+        """Raise if an engine, a worker, or the frontend process has died."""
+        if self._worker_pool is not None:
+            if not self._worker_pool.is_alive():
+                raise RuntimeError(
+                    "An engine behind the Dynamo frontend exited while the "
+                    "frontend was waiting for model registration."
+                )
+        elif self._pool is None or not self._pool.is_alive():
+            raise RuntimeError(
+                "A Ray-managed Dynamo vLLM worker exited while the frontend "
+                "was waiting for model registration."
+            )
+        if (
+            self._frontend_process is not None
+            and self._frontend_process.poll() is not None
+        ):
+            raise RuntimeError(
+                f"Dynamo frontend exited with code {self._frontend_process.returncode}."
+            )
 
     @staticmethod
     def _stop_process(
@@ -345,105 +602,6 @@ class ManagedDynamoRuntime:
             command, env=frontend_env, start_new_session=True
         )
 
-    def _wait_for_frontend(self, expected_components: dict[str, int]) -> None:
-        """Wait until every component's workers serve generate and rl.
-
-        The frontend answers 503 until both prefill and decode are live, and
-        never falls back to aggregated serving, so all of them must register.
-        """
-        health_url = f"http://127.0.0.1:{self._frontend_port}/health"
-        models_url = f"http://127.0.0.1:{self._frontend_port}/v1/models"
-        expected_model = str(self._config["model_name"])
-        deadline = time.monotonic() + self._dynamo_cfg.startup_timeout_s
-        last_counts: dict[str, tuple[int, int]] = {
-            component: (0, 0) for component in expected_components
-        }
-        last_models: set[str] = set()
-        while time.monotonic() < deadline:
-            if self._pool is None or not self._pool.is_alive():
-                raise RuntimeError(
-                    "A Ray-managed Dynamo vLLM worker exited while the frontend "
-                    "was waiting for model registration."
-                )
-            if (
-                self._frontend_process is not None
-                and self._frontend_process.poll() is not None
-            ):
-                raise RuntimeError(
-                    f"Dynamo frontend exited with code {self._frontend_process.returncode}."
-                )
-            try:
-                with urllib.request.urlopen(health_url, timeout=5) as response:
-                    payload = json.loads(response.read())
-            except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
-                time.sleep(1)
-                continue
-            # component -> endpoint ("generate" or "rl") -> instance ids
-            observed: dict[str, dict[str, set[str]]] = {
-                component: {"generate": set(), "rl": set()}
-                for component in expected_components
-            }
-            for instance in payload.get("instances", []):
-                if not isinstance(instance, dict):
-                    continue
-                if instance.get("namespace") != self._namespace:
-                    continue
-                component = instance.get("component")
-                endpoint = instance.get("endpoint")
-                instance_id = instance.get("instance_id")
-                if (
-                    isinstance(component, str)
-                    and component in observed
-                    and endpoint in ("generate", "rl")
-                    and instance_id is not None
-                ):
-                    observed[component][str(endpoint)].add(str(instance_id))
-            last_counts = {
-                component: (len(ids["generate"]), len(ids["rl"]))
-                for component, ids in observed.items()
-            }
-            if all(
-                last_counts[component] == (count, count)
-                and observed[component]["generate"] == observed[component]["rl"]
-                for component, count in expected_components.items()
-            ):
-                # /health reflects discovery registrations before the frontend's
-                # model watcher has necessarily installed its OpenAI routes. Do
-                # not expose frontend_url until the served model is visible;
-                # otherwise an immediate /v1/completions request can race with
-                # watcher setup and receive a transient 404.
-                try:
-                    with urllib.request.urlopen(models_url, timeout=5) as response:
-                        models_payload = json.loads(response.read())
-                except (
-                    urllib.error.URLError,
-                    TimeoutError,
-                    json.JSONDecodeError,
-                ):
-                    time.sleep(1)
-                    continue
-                last_models = {
-                    str(model["id"])
-                    for model in models_payload.get("data", [])
-                    if isinstance(model, dict) and model.get("id") is not None
-                }
-                if expected_model not in last_models:
-                    time.sleep(1)
-                    continue
-                print(
-                    "  [Dynamo] frontend ready with generation and RL workers "
-                    f"{expected_components}",
-                    flush=True,
-                )
-                return
-            time.sleep(1)
-        raise RuntimeError(
-            "Dynamo frontend did not observe the fixed worker fleet within "
-            f"{self._dynamo_cfg.startup_timeout_s}s: expected={expected_components}, "
-            f"last (generate, rl) counts={last_counts}, "
-            f"expected_model={expected_model!r}, last_models={sorted(last_models)!r}."
-        )
-
     def refit_workers(self) -> list[dict[str, Any]]:
         self._assert_services_alive()
         if self._pool is None:
@@ -455,6 +613,22 @@ class ManagedDynamoRuntime:
         if self._pool is None:
             raise RuntimeError("Managed Dynamo worker pool is not running.")
         return self._pool.validate(expected)
+
+    def worker_records(self) -> list[DynamoWorkerRecord]:
+        """Records of the pool's engines, in role order."""
+        self._assert_services_alive()
+        if self._worker_pool is None:
+            raise RuntimeError("Managed Dynamo worker pool is not running.")
+        return self._worker_pool.records
+
+    def validate_worker_records(
+        self, expected: list[DynamoWorkerRecord]
+    ) -> list[DynamoWorkerRecord]:
+        """Fail if the pool's live engines no longer match ``expected``."""
+        self._assert_services_alive()
+        if self._worker_pool is None:
+            raise RuntimeError("Managed Dynamo worker pool is not running.")
+        return self._worker_pool.validate(expected)
 
     def _assert_services_alive(self) -> None:
         for label, process in (
@@ -482,6 +656,13 @@ class ManagedDynamoRuntime:
                 pool.shutdown()
             except Exception:
                 LOGGER.exception("Failed to stop the managed Dynamo worker pool")
+        worker_pool = self._worker_pool
+        self._worker_pool = None
+        if worker_pool is not None:
+            try:
+                worker_pool.shutdown()
+            except Exception:
+                LOGGER.exception("Failed to stop the Dynamo worker pool")
         try:
             self._stop_process(self._nats_process, "NATS")
         except Exception:
@@ -502,3 +683,4 @@ class ManagedDynamoRuntime:
             atexit.unregister(self.shutdown)
             self._atexit_registered = False
         self._started = False
+        self._fleet_ready = False

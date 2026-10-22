@@ -135,6 +135,7 @@ def _make_master_config(
     use_multiple_dataloader: bool = False,
     colocated: bool = False,
     backend: str = "vllm",
+    dynamo_engine: str = "vllm",
     megatron_enabled: bool = False,
     env: dict | None = None,
     max_num_steps: int = 100,
@@ -170,11 +171,17 @@ def _make_master_config(
     if backend == "dynamo":
         # The fields DynamoGeneration.validate_settings reads, at accepted values.
         generation_config["dynamo_cfg"] = {
+            "engine": dynamo_engine,
             "request_timeout_s": 900.0,
             "control_timeout_s": 900.0,
         }
-        generation_config["vllm_cfg"] = {"enable_vllm_metrics_logger": False}
-        generation_config["disaggregation"] = {"enabled": False}
+        if dynamo_engine == "megatron":
+            generation_config["vllm_cfg"] = None
+            generation_config["mcore_generation_config"] = {"max_model_len": 32}
+            generation_config["disaggregation"] = {"enabled": True}
+        else:
+            generation_config["vllm_cfg"] = {"enable_vllm_metrics_logger": False}
+            generation_config["disaggregation"] = {"enabled": False}
     master_config = MasterConfig.model_construct(
         data_plane={
             "enabled": dp_enabled,
@@ -221,6 +228,9 @@ def _make_master_config(
             **({} if sampler_cfg is None else {"sampler": sampler_cfg}),
         ),
     )
+    if backend == "dynamo" and dynamo_engine == "megatron":
+        # Megatron engines keep their KV caches across a refit.
+        master_config.async_rl.recompute_kv_cache_after_weight_updates = False
     return master_config
 
 
@@ -359,22 +369,34 @@ def test_build_generation_passes_sglang_config():
     generation.finish_generation.assert_called_once_with()
 
 
-def test_build_generation_constructs_dynamo_from_normalized_config():
-    """DynamoGeneration receives the generation config setup already validated."""
-    master_config = _make_master_config(backend="dynamo")
+@pytest.mark.parametrize("dynamo_engine", ["vllm", "megatron"])
+def test_build_generation_constructs_dynamo_from_normalized_config(dynamo_engine):
+    """DynamoGeneration receives the generation config setup already validated.
+
+    Megatron engines are dedicated inference policies, so they also receive the
+    tokenizer and the full policy config.
+    """
+    master_config = _make_master_config(
+        backend="dynamo", dynamo_engine=dynamo_engine, megatron_enabled=True
+    )
     master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
     inference_cluster = MagicMock(name="inference_cluster")
+    tokenizer = MagicMock(name="tokenizer")
 
     with patch.object(sc_setup_mod, "DynamoGeneration") as mock_dynamo:
         generation, _ = sc_setup_mod._build_generation(
             inference_cluster,
             master_config,
+            tokenizer=tokenizer,
         )
 
-    mock_dynamo.assert_called_once_with(
-        cluster=inference_cluster,
-        config=master_config.policy["generation"],
-    )
+    expected = {
+        "cluster": inference_cluster,
+        "config": master_config.policy["generation"],
+    }
+    if dynamo_engine == "megatron":
+        expected |= {"tokenizer": tokenizer, "policy_config": master_config.policy}
+    mock_dynamo.assert_called_once_with(**expected)
     assert master_config.policy["generation"]["model_name"] == "Qwen/Qwen3-0.6B"
     generation.finish_generation.assert_called_once_with()
 
@@ -395,12 +417,27 @@ def test_build_generation_rejects_deferred_dynamo_load():
     mock_dynamo.assert_not_called()
 
 
-def test_generation_max_seq_len_reads_dynamo_vllm_cfg():
+def test_generation_max_seq_len_reads_dynamo_engine_cfg():
     assert (
         sc_setup_mod._generation_max_seq_len(
-            {"backend": "dynamo", "vllm_cfg": {"max_model_len": 1024}}
+            {
+                "backend": "dynamo",
+                "dynamo_cfg": {"engine": "vllm"},
+                "vllm_cfg": {"max_model_len": 1024},
+            }
         )
         == 1024
+    )
+    assert (
+        sc_setup_mod._generation_max_seq_len(
+            {
+                "backend": "dynamo",
+                "dynamo_cfg": {"engine": "megatron"},
+                "vllm_cfg": None,
+                "mcore_generation_config": {"max_model_len": 2048},
+            }
+        )
+        == 2048
     )
 
 
@@ -510,10 +547,32 @@ def test_build_clusters_supports_two_node_shared_student_layout(monkeypatch):
     assert teacher_topology is None
 
 
+@pytest.mark.parametrize(
+    ("shared_tp", "prefill", "decode", "segment_size"),
+    [
+        # Every engine TP 4: a 1-prefill + 2-decode replica spans 12 GPUs, two nodes.
+        (4, {}, {}, 2),
+        # 1 prefill at TP 4 next to 2 decode at TP 2: an 8-GPU replica, one node.
+        (
+            2,
+            {"tensor_model_parallel_size": 4, "pipeline_model_parallel_size": 1},
+            {},
+            1,
+        ),
+        # Per-engine widths, not the shared TP 2, size the replica: 8 + 4 + 4 = 16.
+        (
+            2,
+            {"tensor_model_parallel_size": 8, "pipeline_model_parallel_size": 1},
+            {"tensor_model_parallel_size": 4, "pipeline_model_parallel_size": 1},
+            2,
+        ),
+    ],
+    ids=["uniform_tp4", "prefill_tp4_decode_tp2", "prefill_tp8_decode_tp4"],
+)
 def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_policy_layout(
-    monkeypatch,
+    monkeypatch, shared_tp, prefill, decode, segment_size
 ):
-    """A P/D replica of Megatron engines spans (P + D) x the engine policy's TP x PP."""
+    """A P/D replica of Megatron engines spans the sum of its engines' TP x PP."""
     from tests.unit.models.generation.test_dynamo_arguments import (
         MEGATRON_POLICY,
         _megatron_config,
@@ -521,8 +580,12 @@ def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_policy_layout(
 
     master_config = _make_master_config(backend="dynamo")
     generation = _megatron_config()
-    # One engine is TP4: a 1-prefill + 2-decode replica spans 12 GPUs, two nodes.
-    generation["mcore_generation_config"]["tensor_model_parallel_size"] = 4
+    generation["mcore_generation_config"]["tensor_model_parallel_size"] = shared_tp
+    # One entry per engine of a replica (1 prefill, 2 decode), or the shared layout.
+    generation["dynamo_cfg"].update(
+        prefill_engines=[prefill] if prefill else [],
+        decode_engines=[decode] * 2 if decode else [],
+    )
     generation["colocated"] = {
         "enabled": False,
         "resources": {"gpus_per_node": 8, "num_nodes": 2},
@@ -548,8 +611,8 @@ def test_build_clusters_sizes_megatron_dynamo_replicas_from_the_policy_layout(
 
     _, inference_cluster, _ = sc_setup_mod._build_clusters(master_config)
 
-    assert segment_calls == [("training", 1, 2), ("inference", 2, 2)]
-    assert inference_cluster.segment_size == 2
+    assert segment_calls == [("training", 1, 2), ("inference", segment_size, 2)]
+    assert inference_cluster.segment_size == segment_size
 
 
 def test_single_controller_mopd_recipe_resolves_to_runtime_contract(monkeypatch):
@@ -1764,6 +1827,20 @@ class TestSetup:
         _, sync_kwargs = patched_factories["create_weight_synchronizer"].call_args
         assert sync_kwargs["generation_backend"] == "dynamo"
         assert sync_kwargs["colocated"] is False
+
+    def test_dynamo_megatron_engines_get_no_vllm_kwargs(self, patched_factories):
+        """Megatron engines read hf_config_overrides from the policy they are built from."""
+        mc = _make_master_config(
+            backend="dynamo", dynamo_engine="megatron", megatron_enabled=True
+        )
+        mc.policy["hf_config_overrides"] = {"rope_theta": 1.0}
+
+        with patch.object(sc_setup_mod.DynamoConfig, "model_validate") as validate:
+            validate.return_value.model_dump.return_value = mc.policy["generation"]
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        (raw_config,), _ = validate.call_args
+        assert "vllm_kwargs" not in raw_config
 
     def test_returns_actor_args(self, patched_factories):
         mc = _make_master_config()

@@ -621,6 +621,29 @@ class DynamoConfig(BaseModel, extra="allow"):
                 "policy.generation.colocated.enabled must be false when "
                 "backend='dynamo'"
             )
+        # The Megatron adapter forwards only endpoint_types and extra_cli_args;
+        # the parser and template options configure dynamo.vllm workers.
+        worker_args = self.dynamo_cfg.worker_args
+        ignored_worker_args = [
+            name
+            for name, is_set in (
+                ("tool_call_parser", worker_args.tool_call_parser is not None),
+                ("reasoning_parser", worker_args.reasoning_parser is not None),
+                ("enable_structural_tag", worker_args.enable_structural_tag),
+                (
+                    "custom_jinja_template",
+                    worker_args.custom_jinja_template is not None,
+                ),
+            )
+            if is_set
+        ]
+        if ignored_worker_args:
+            raise ValueError(
+                f"policy.generation.dynamo_cfg.worker_args {ignored_worker_args} "
+                "are not read when dynamo_cfg.engine='megatron'; the Megatron "
+                "adapter forwards only endpoint_types and extra_cli_args. Leave "
+                "them null (enable_structural_tag: false)."
+            )
         if extra.get("refit_transport") is not None:
             raise ValueError(
                 "policy.generation.refit_transport must be null when "

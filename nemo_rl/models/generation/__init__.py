@@ -13,7 +13,7 @@
 # limitations under the License.
 import os
 import warnings
-from typing import cast
+from typing import Any, cast
 
 from transformers import PreTrainedTokenizerBase
 
@@ -164,8 +164,12 @@ def configure_generation_config(
     if config["stop_token_ids"] is None:
         config["stop_token_ids"] = [tokenizer.eos_token_id]
 
-    # vLLM setting shared by the standard and managed Dynamo backends.
-    if config["backend"] in ("vllm", "dynamo"):
+    # vLLM setting shared by the standard and managed Dynamo backends. Megatron
+    # engines behind Dynamo carry no vllm_cfg.
+    if config["backend"] == "vllm" or (
+        config["backend"] == "dynamo"
+        and cast(dict[str, Any], config)["dynamo_cfg"]["engine"] == "vllm"
+    ):
         vllm_backed_config = cast(VllmConfig, config)
         vllm_backed_config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
 

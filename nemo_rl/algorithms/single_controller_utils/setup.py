@@ -664,10 +664,22 @@ def _build_generation(
         )
         # setup_single_controller validated and normalized this config through
         # DynamoConfig before allocating clusters.
-        gen = DynamoGeneration(
-            cluster=inference_cluster,
-            config=cast(dict[str, Any], generation_config),
-        )
+        dynamo_generation_config = cast(dict[str, Any], generation_config)
+        if dynamo_generation_config["dynamo_cfg"]["engine"] == "megatron":
+            # Megatron prefill/decode engines are dedicated inference policies
+            # built from the full policy config, like the megatron backend above.
+            assert tokenizer is not None, "Megatron engines require a tokenizer"
+            gen = DynamoGeneration(
+                cluster=inference_cluster,
+                config=dynamo_generation_config,
+                tokenizer=tokenizer,
+                policy_config=cast(dict[str, Any], master_config.policy),
+            )
+        else:
+            gen = DynamoGeneration(
+                cluster=inference_cluster,
+                config=dynamo_generation_config,
+            )
 
     else:
         raise ValueError(
@@ -824,11 +836,13 @@ def _spinup_gym(
 def _generation_max_seq_len(generation_config) -> int:
     """Return the per-backend max sequence length.
 
-    vllm and dynamo (which manages vLLM workers) use vllm_cfg.max_model_len;
-    sglang uses sglang_cfg.context_length; megatron uses
+    vllm and dynamo with vLLM engines use vllm_cfg.max_model_len; sglang uses
+    sglang_cfg.context_length; megatron, and dynamo with Megatron engines, use
     mcore_generation_config.max_model_len.
     """
     backend = generation_config["backend"]
+    if backend == "dynamo" and generation_config["dynamo_cfg"]["engine"] == "megatron":
+        return generation_config["mcore_generation_config"]["max_model_len"]
     if backend in ("vllm", "dynamo"):
         return generation_config["vllm_cfg"]["max_model_len"]
     if backend == "sglang":
@@ -1204,7 +1218,12 @@ def setup_single_controller(
     telemetry_interval_s = master_config.rollout_checkpointing.telemetry_interval_s
     if telemetry_interval_s is not None:
         generation_backend = generation_config["backend"]
-        if generation_backend not in ("vllm", "dynamo"):
+        if generation_backend not in ("vllm", "dynamo") or (
+            generation_backend == "dynamo"
+            and cast(dict[str, Any], generation_config)["dynamo_cfg"]["engine"]
+            == "megatron"
+        ):
+            # Megatron engines behind Dynamo carry no vllm_cfg either.
             warnings.warn(
                 "rollout_checkpointing.telemetry_interval_s is enabled with "
                 f"policy.generation.backend={generation_backend!r}. Canonical "
@@ -1252,9 +1271,12 @@ def setup_single_controller(
         # Validate the complete managed-Dynamo boundary before allocating Ray
         # placement groups or starting any external services, as grpo.setup does.
         dynamo_config = cast(dict[str, Any], generation_config)
-        dynamo_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            policy_config.get("hf_config_overrides") or {}
-        )
+        if dynamo_config["dynamo_cfg"]["engine"] != "megatron":
+            # Megatron engines take hf_config_overrides through the policy config
+            # they are built from; vllm_kwargs must stay empty for them.
+            dynamo_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
+                policy_config.get("hf_config_overrides") or {}
+            )
         generation_config = cast(
             GenerationConfig, DynamoConfig.model_validate(dynamo_config).model_dump()
         )

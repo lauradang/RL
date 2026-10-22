@@ -11,7 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generation and NCCL refit through a driver-owned Dynamo vLLM fleet."""
+"""Generation and NCCL refit through a driver-owned Dynamo fleet.
+
+The fleet is either Dynamo-managed vLLM workers or NeMo RL's own Megatron
+inference engines (prefill/decode) behind the same frontend; the engine seam
+in ``protocols`` keeps this facade the same for both.
+"""
 
 import asyncio
 import logging
@@ -21,6 +26,7 @@ import ray
 import torch
 
 from nemo_rl.data.multimodal_utils import VLLM_PROMPT_KEYS
+from nemo_rl.data_plane.interfaces import storage_unit_placement
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.models.generation.dynamo.config import DynamoConfig
@@ -28,11 +34,22 @@ from nemo_rl.models.generation.dynamo.http_client import (
     async_http_post_json,
     format_dynamo_error,
 )
-from nemo_rl.models.generation.dynamo.managed_runtime import ManagedDynamoRuntime
+from nemo_rl.models.generation.dynamo.managed_runtime import (
+    ManagedDynamoRuntime,
+    wait_for_frontend_registrations,
+)
+from nemo_rl.models.generation.dynamo.megatron_refit_channel import (
+    MegatronRefitChannel,
+)
+from nemo_rl.models.generation.dynamo.megatron_worker_pool import (
+    MegatronDynamoWorkerPool,
+)
 from nemo_rl.models.generation.dynamo.metrics import DynamoMetricsSampler
+from nemo_rl.models.generation.dynamo.protocols import RefitChannel
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
 from nemo_rl.models.generation.dynamo.token_wrapper import DynamoTokenWrapperServer
 from nemo_rl.models.generation.interfaces import (
+    DisaggConfig,
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
@@ -165,11 +182,50 @@ class DynamoGeneration(GenerationInterface):
                 "policy.generation.backend='dynamo'; the Dynamo frontend owns request "
                 "routing. Set async_rl.generation_fleet_health.enabled=false."
             )
-        # Setup has already normalized this through DynamoConfig.
+        # Setup normalizes the generation block through DynamoConfig before
+        # calling this, so the block is a dict here; model_validate also
+        # accepts the DisaggConfig that MasterConfig validation produces.
         generation = cast(dict[str, Any], master_config.policy["generation"])
         dynamo_cfg = generation["dynamo_cfg"]
+        disaggregation = DisaggConfig.model_validate(generation["disaggregation"])
+        if dynamo_cfg["engine"] == "megatron":
+            # The engines are dedicated Megatron inference policies; they receive
+            # logical weights from a Megatron trainer only. There is no vllm_cfg
+            # and no metrics sampler on this path.
+            if not master_config.policy["megatron_cfg"]["enabled"]:
+                raise ValueError(
+                    "policy.generation.dynamo_cfg.engine='megatron' requires "
+                    "policy.megatron_cfg.enabled=true; Megatron prefill/decode "
+                    "engines receive weights from the Megatron trainer."
+                )
+            if master_config.async_rl.recompute_kv_cache_after_weight_updates:
+                # The refit pause ignores clear_cache yet reports a native pause,
+                # so the controller would never invalidate the caches either.
+                raise ValueError(
+                    "async_rl.recompute_kv_cache_after_weight_updates=true is not "
+                    "supported with policy.generation.dynamo_cfg.engine='megatron'; "
+                    "the engines keep their KV caches across a refit "
+                    "(kv_cache_management_mode: persist). Set it to false."
+                )
+            dp_config = master_config.data_plane
+            placement = storage_unit_placement(dp_config)
+            if placement is not None and (
+                placement == "all" or "inference" in placement
+            ):
+                # Planning storage units materializes the named clusters'
+                # placement groups. The engines run on their own per-engine
+                # clusters, so a materialized inference cluster would book
+                # their GPUs a second time and the engines could never start.
+                raise ValueError(
+                    f"data_plane.{dp_config['backend']}.storage_unit_placement="
+                    f"{placement!r} must not include the 'inference' cluster with "
+                    "policy.generation.dynamo_cfg.engine='megatron'; the Megatron "
+                    "engines reserve the inference GPUs through their own "
+                    "clusters. Place storage units on 'train' instead."
+                )
+            return
         if (
-            generation["disaggregation"]["enabled"]
+            disaggregation.enabled
             and master_config.async_rl.recompute_kv_cache_after_weight_updates
             and dynamo_cfg["control_timeout_s"] < dynamo_cfg["request_timeout_s"]
         ):
@@ -202,23 +258,29 @@ class DynamoGeneration(GenerationInterface):
         config: dict[str, Any],
         tokenizer: Any | None = None,
         tokenizer_config: Optional[dict[str, Any]] = None,
+        policy_config: Optional[dict[str, Any]] = None,
     ):
+        """Start the managed fleet.
+
+        Args:
+            cluster: Non-colocated inference cluster the engines run on.
+            config: ``policy.generation`` (a ``DynamoConfig``).
+            tokenizer: Required for the token wrapper and for Megatron engines.
+            tokenizer_config: ``policy.tokenizer`` for the token wrapper.
+            policy_config: Full ``policy`` config; required for Megatron engines,
+                whose dedicated inference policies are built from it.
+        """
         validated_config = DynamoConfig.model_validate(config)
-        if validated_config.is_megatron_engine:
-            # The config and the engine seam accept Megatron engines; the fleet
-            # that serves them (worker pool, refit channel, adapter sidecars) is
-            # not wired into this facade yet.
-            raise NotImplementedError(
-                "dynamo_cfg.engine='megatron' is not served by DynamoGeneration yet"
-            )
         self.cfg = validated_config.model_dump()
-        # The same refit-path limits as the vLLM backend: every engine refits
-        # through NeMo RL's vLLM worker extension.
-        assert_reload_refit_config_supported(cast(VllmConfig, self.cfg))
         self._dynamo_cfg = validated_config.dynamo_cfg
         dynamo_cfg = self._dynamo_cfg
         vllm_cfg = validated_config.vllm_cfg
-        expose_http_server = vllm_cfg.expose_http_server
+        self._is_megatron_engine = validated_config.is_megatron_engine
+        if vllm_cfg is not None:
+            # The same refit-path limits as the vLLM backend: every vLLM engine
+            # refits through NeMo RL's vLLM worker extension.
+            assert_reload_refit_config_supported(cast(VllmConfig, self.cfg))
+        expose_http_server = vllm_cfg is not None and vllm_cfg.expose_http_server
         tokenizer_chat_template_kwargs: Optional[dict[str, Any]] = None
         if expose_http_server:
             if tokenizer is None:
@@ -241,27 +303,94 @@ class DynamoGeneration(GenerationInterface):
             raise RuntimeError(
                 "Managed Dynamo requires a non-colocated inference RayVirtualCluster."
             )
-        self._managed_runtime: Optional[ManagedDynamoRuntime] = ManagedDynamoRuntime(
-            cluster=cluster,
-            config=self.cfg,
-        )
+        self._managed_runtime: Optional[ManagedDynamoRuntime]
+        if self._is_megatron_engine:
+            if tokenizer is None or policy_config is None:
+                raise RuntimeError(
+                    "Megatron engines behind Dynamo need the tokenizer and the full "
+                    "policy config to build their dedicated inference policies."
+                )
+            # The pool allocates its own per-engine clusters; ``cluster`` only
+            # contributes the node shape. Its placement groups are lazy and must
+            # stay unmaterialized, or the engines' GPUs would be booked twice
+            # (validate_settings keeps data-plane storage units off it). Reading
+            # its port range and node pins does not materialize it either.
+            num_gpus_per_node = cluster.num_gpus_per_node
+            port_range_low = cluster.port_range_low
+            port_range_high = cluster.port_range_high
+            node_resource_constraints = cluster.node_resource_constraints
+            # Bound outside the closure so the type checker keeps the narrowing.
+            engine_policy_config = policy_config
+
+            def worker_pool_factory(
+                *, namespace: str, manager_env: dict[str, str]
+            ) -> MegatronDynamoWorkerPool:
+                return MegatronDynamoWorkerPool(
+                    policy_config=engine_policy_config,
+                    tokenizer=tokenizer,
+                    config=validated_config,
+                    namespace=namespace,
+                    manager_env=manager_env,
+                    num_gpus_per_node=num_gpus_per_node,
+                    port_range_low=port_range_low,
+                    port_range_high=port_range_high,
+                    node_resource_constraints=node_resource_constraints,
+                )
+
+            self._managed_runtime = ManagedDynamoRuntime(
+                cluster=cluster,
+                config=self.cfg,
+                policy_config=policy_config,
+                worker_pool_factory=worker_pool_factory,
+            )
+        else:
+            # One width for every Dynamo-managed vLLM worker.
+            engine_world_size = validated_config.engine_world_size()
+            self._managed_runtime = ManagedDynamoRuntime(
+                cluster=cluster,
+                config=self.cfg,
+            )
         self._token_wrapper_server: Optional[DynamoTokenWrapperServer] = None
         self._dynamo_frontend_base_url = ""
         self.dp_openai_server_base_urls: list[Optional[str]] = []
-        self._refit_channel: DynamoRefitChannel | None = None
+        self._refit_channel: RefitChannel | None = None
         self._metrics_sampler: DynamoMetricsSampler | None = None
+        # Megatron engines register with the frontend at their first refit; the
+        # copy that runs resume_generation_after_refit waits for that
+        # registration with these parameters.
+        self._fleet_ready = False
+        self._frontend_wait: Optional[dict[str, Any]] = None
         try:
             self._managed_runtime.start()
             url = self._managed_runtime.frontend_url
             self._dynamo_frontend_base_url = url
-            workers = self._managed_runtime.refit_workers()
-            self._refit_channel = DynamoRefitChannel(
-                workers,
-                engine_world_size=validated_config.engine_world_size(),
-                control_timeout_s=dynamo_cfg.control_timeout_s,
-                validate_workers=self._managed_runtime.validate_workers,
-            )
-            self._configure_mtp_drafter()
+            if self._is_megatron_engine:
+                self._refit_channel = MegatronRefitChannel(
+                    self._managed_runtime.worker_records(),
+                    control_timeout_s=dynamo_cfg.control_timeout_s,
+                )
+                self._fleet_ready = self._managed_runtime.fleet_ready
+                expected_components, expected_endpoints = (
+                    self._managed_runtime.expected_registrations()
+                )
+                self._frontend_wait = {
+                    "namespace": self._managed_runtime.namespace,
+                    "expected_components": dict(expected_components),
+                    "expected_endpoints": set(expected_endpoints),
+                    "timeout_s": dynamo_cfg.startup_timeout_s,
+                }
+                workers: list[dict[str, Any]] = []
+            else:
+                # The vLLM runtime waits for the frontend inside start().
+                self._fleet_ready = True
+                workers = self._managed_runtime.refit_workers()
+                self._refit_channel = DynamoRefitChannel(
+                    workers,
+                    engine_world_size=engine_world_size,
+                    control_timeout_s=dynamo_cfg.control_timeout_s,
+                    validate_workers=self._managed_runtime.validate_workers,
+                )
+                self._configure_mtp_drafter()
 
             if expose_http_server:
                 self._token_wrapper_server = DynamoTokenWrapperServer(
@@ -284,7 +413,7 @@ class DynamoGeneration(GenerationInterface):
                 self.dp_openai_server_base_urls = [None]
                 print(f"  [Dynamo] Forwarding rollouts to {url}", flush=True)
 
-            if vllm_cfg.enable_vllm_metrics_logger:
+            if vllm_cfg is not None and vllm_cfg.enable_vllm_metrics_logger:
                 self._metrics_sampler = DynamoMetricsSampler(
                     workers,
                     interval_s=vllm_cfg.vllm_metrics_logger_interval,
@@ -351,7 +480,7 @@ class DynamoGeneration(GenerationInterface):
             shard_widths=None if len(set(widths)) <= 1 else widths,
         )
 
-    def _require_refit_channel(self) -> DynamoRefitChannel:
+    def _require_refit_channel(self) -> RefitChannel:
         channel = self._refit_channel
         if channel is None:
             raise RuntimeError("Dynamo refit channel is unavailable")
@@ -403,6 +532,8 @@ class DynamoGeneration(GenerationInterface):
             "_refit_channel": (
                 None if refit_channel is None else refit_channel.client_copy()
             ),
+            "_fleet_ready": self._fleet_ready,
+            "_frontend_wait": self._frontend_wait,
         }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -419,6 +550,9 @@ class DynamoGeneration(GenerationInterface):
         self._managed_runtime = None
         self._metrics_sampler = None
         self._refit_channel = state["_refit_channel"]
+        self._is_megatron_engine = validated_config.is_megatron_engine
+        self._fleet_ready = state["_fleet_ready"]
+        self._frontend_wait = state["_frontend_wait"]
 
     def _completion_url(self) -> str:
         base_url = self._dynamo_frontend_base_url
@@ -497,23 +631,30 @@ class DynamoGeneration(GenerationInterface):
 
         return payload
 
+    def _max_model_len(self) -> tuple[str, int]:
+        """The context limit and the config key it came from."""
+        if self._is_megatron_engine:
+            return (
+                "mcore_generation_config.max_model_len",
+                int(self.cfg["mcore_generation_config"]["max_model_len"]),
+            )
+        return "vllm_cfg.max_model_len", int(self.cfg["vllm_cfg"]["max_model_len"])
+
     def _allowed_new_tokens(self, input_length: int) -> int:
         """Return the generation budget for a prompt, with the vLLM backend's spec-decode clamp."""
-        remaining_ctx = int(self.cfg["vllm_cfg"]["max_model_len"]) - input_length
+        key, max_model_len = self._max_model_len()
+        remaining_ctx = max_model_len - input_length
         if remaining_ctx <= 0:
             raise ValueError(
                 f"Dynamo prompt length {input_length} must be less than "
-                f"vllm_cfg.max_model_len={self.cfg['vllm_cfg']['max_model_len']}"
+                f"{key}={max_model_len}"
             )
         allowed = min(self.cfg["max_new_tokens"], remaining_ctx)
         speculative_config = self.cfg["vllm_kwargs"].get("speculative_config") or {}
         lookahead = int(speculative_config.get("num_speculative_tokens") or 0)
         if lookahead > 0:
             allowed = spec_decode_max_tokens(
-                allowed,
-                input_length,
-                int(self.cfg["vllm_cfg"]["max_model_len"]),
-                lookahead,
+                allowed, input_length, max_model_len, lookahead
             )
         return allowed
 
@@ -521,11 +662,11 @@ class DynamoGeneration(GenerationInterface):
         self, *, input_length: int, generated_length: int
     ) -> None:
         response_length = input_length + generated_length
-        max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+        key, max_model_len = self._max_model_len()
         if response_length > max_model_len:
             raise AssertionError(
-                "Dynamo response length exceeded "
-                f"vllm_cfg.max_model_len: {response_length} > {max_model_len}"
+                f"Dynamo response length exceeded {key}: "
+                f"{response_length} > {max_model_len}"
             )
 
     async def _post_completion_request(
@@ -735,12 +876,15 @@ class DynamoGeneration(GenerationInterface):
         """Receive one packed-broadcast refit on every engine.
 
         The extension's watchdog enforces ``refit_timeout_s`` inside each engine.
+        Only vLLM engines have a reload API; Megatron engines always broadcast
+        into their live parameters.
         """
+        vllm_cfg = self.cfg["vllm_cfg"]
+        refit_with_reload_api = vllm_cfg is not None and bool(
+            vllm_cfg.get("refit_with_reload_api")
+        )
         return self._require_refit_channel().update_weights_from_collective(
-            refit_timeout_s,
-            refit_with_reload_api=bool(
-                self.cfg["vllm_cfg"].get("refit_with_reload_api")
-            ),
+            refit_timeout_s, refit_with_reload_api=refit_with_reload_api
         )
 
     def _configure_mtp_drafter(self) -> None:
@@ -753,7 +897,7 @@ class DynamoGeneration(GenerationInterface):
         )
         if not enabled:
             return
-        channel = self._require_refit_channel()
+        channel = cast(DynamoRefitChannel, self._require_refit_channel())
         ray.get(
             channel.call_on_every_engine(
                 "configure_mtp_drafter_weight_source",
@@ -839,6 +983,43 @@ class DynamoGeneration(GenerationInterface):
     def resume_generation_after_refit(
         self, *, timeout_s: Optional[float] = None
     ) -> bool:
-        """Resume every engine paused by :meth:`pause_generation_for_refit`."""
+        """Resume every engine paused by :meth:`pause_generation_for_refit`.
+
+        The first resume of a Megatron fleet is also its startup: the engines
+        were built by this refit and only now register with the frontend, so
+        this waits until the frontend routes the model before reporting
+        success. Runs on the controller's pickled copy, which carries the wait
+        parameters. That resume also builds the engines and captures their CUDA
+        graphs, so it gets at least ``dynamo_cfg.startup_timeout_s``.
+        """
+        if not self._fleet_ready:
+            if timeout_s is None:
+                timeout_s = self._dynamo_cfg.control_timeout_s
+            timeout_s = max(timeout_s, self._dynamo_cfg.startup_timeout_s)
         self._require_refit_channel().resume(timeout_s=timeout_s)
+        self._await_fleet_ready()
         return True
+
+    def _await_fleet_ready(self) -> None:
+        if self._fleet_ready:
+            return
+        wait = self._frontend_wait
+        if wait is None:
+            raise RuntimeError("Dynamo fleet readiness parameters are missing")
+        channel = self._require_refit_channel()
+        # Only Megatron fleets register at the first refit, so only their
+        # channel reaches this wait; it also knows the engines to probe.
+        assert isinstance(channel, MegatronRefitChannel)
+        base_url = self._dynamo_frontend_base_url.rstrip("/")
+        if base_url.endswith("/v1"):
+            base_url = base_url[: -len("/v1")]
+        wait_for_frontend_registrations(
+            base_url=base_url,
+            namespace=str(wait["namespace"]),
+            expected_components=wait["expected_components"],
+            expected_endpoints=wait["expected_endpoints"],
+            expected_model=str(self.cfg["model_name"]),
+            timeout_s=float(wait["timeout_s"]),
+            check_alive=channel.check_alive,
+        )
+        self._fleet_ready = True

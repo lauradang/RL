@@ -31,7 +31,7 @@ uv run examples/run_grpo_single_controller.py \
 # Both roles launched, and the frontend saw two of each before serving.
 grep -F "'--disaggregation-mode', 'prefill'" $RUN_LOG
 grep -F "'--disaggregation-mode', 'decode'" $RUN_LOG
-grep -F "frontend ready with generation and RL workers {'prefill': 2, 'backend': 2}" $RUN_LOG
+grep -F "[Dynamo] frontend ready: {'prefill': 2, 'backend': 2} engines serving ['generate', 'rl']" $RUN_LOG
 # Decode engines pulled prompt KV from prefill engines over NIXL.
 grep -F "NIXL compatibility check passed" $RUN_LOG
 # Every sync drains prefill before decode, so no handoff outlives its KV lease
