@@ -23,6 +23,7 @@ NeMo RL creates the engine process group; the sidecar only waits for the
 engine's rank zero to report readiness on the parent event socket it binds.
 """
 
+import copy
 import ctypes
 import logging
 import os
@@ -34,13 +35,15 @@ import time
 import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import ray
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH,
     DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW,
+    RayVirtualCluster,
     _get_free_port_local,
     _get_node_ip_local,
 )
@@ -49,10 +52,30 @@ from nemo_rl.models.generation.dynamo.arguments import (
     redact_argv,
     redact_environment,
 )
+from nemo_rl.models.generation.dynamo.config import (
+    DynamoConfig,
+    DynamoWorkerLayout,
+    DynamoWorkerRole,
+)
+from nemo_rl.models.generation.dynamo.protocols import DynamoWorkerRecord
+from nemo_rl.utils.venvs import make_actor_runtime_env
+
+if TYPE_CHECKING:
+    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+    from nemo_rl.models.generation.megatron.megatron_generation import (
+        MegatronGeneration,
+    )
+    from nemo_rl.models.policy import PolicyConfig
 
 LOGGER = logging.getLogger(__name__)
 
 _ADAPTER_MODULE = "megatron.inference.integrations.dynamo"
+_ADAPTER_ACTOR_FQN = (
+    "nemo_rl.models.generation.dynamo.megatron_worker_pool.DynamoMegatronAdapterActor"
+)
+# Dynamo component each engine role registers under.
+_COMPONENT_BY_ROLE: dict[str, str] = {"prefill": "prefill", "decode": "backend"}
 _HANDOFF_RECOVERY_MODULE = "megatron.inference.integrations.dynamo.handoff_recovery"
 # Binding the event socket happens before the adapter touches the engine, so it
 # never needs the full engine start timeout.
@@ -282,18 +305,57 @@ def build_megatron_adapter_argv(
     return argv
 
 
-def engine_layout_argv(policy_config: Mapping[str, Any]) -> list[str]:
+def role_policy_config(
+    policy_config: Mapping[str, Any], overrides: Mapping[str, int]
+) -> dict[str, Any]:
+    """The policy config one worker builds its engine from.
+
+    A deep copy of ``policy_config`` with ``overrides`` (the worker's entry in
+    ``dynamo_cfg.prefill_engines`` / ``decode_engines``) merged into
+    ``generation.mcore_generation_config``, which is where the dedicated
+    inference policy takes its layout from. ``policy_config`` is left as is.
+
+    Args:
+        policy_config: The full ``policy`` config.
+        overrides: Layout keys from ``DynamoConfig.layout_overrides``; empty
+            for a worker that keeps the shared layout.
+
+    Returns:
+        A fresh config whose engine layout is the shared one plus ``overrides``.
+    """
+    config = copy.deepcopy(dict(policy_config))
+    if overrides:
+        generation = dict(config["generation"])
+        generation["mcore_generation_config"] = {
+            **(generation.get("mcore_generation_config") or {}),
+            **overrides,
+        }
+        config["generation"] = generation
+    return config
+
+
+def engine_layout_argv(
+    policy_config: Mapping[str, Any], overrides: Mapping[str, int] | None = None
+) -> list[str]:
     """Megatron layout flags recorded after ``--`` for one engine.
 
     Taken from the same merged inference layout the engine workers are built
     with, so the record matches the engine the adapter attaches to.
+
+    Args:
+        policy_config: The full ``policy`` config.
+        overrides: The worker's layout keys, from ``DynamoConfig.layout_overrides``;
+            ``None`` or empty records the shared layout.
     """
     # Imported here: the Megatron config module pulls in the policy config types.
     from nemo_rl.models.generation.megatron.config import (
         merged_inference_megatron_cfg,
     )
 
-    megatron_cfg = merged_inference_megatron_cfg(policy_config)  # type: ignore[arg-type]
+    megatron_cfg = merged_inference_megatron_cfg(
+        policy_config,  # type: ignore[arg-type]
+        overrides=overrides,
+    )
     argv = [
         "--tensor-model-parallel-size",
         str(int(megatron_cfg["tensor_model_parallel_size"])),
@@ -566,3 +628,490 @@ class DynamoMegatronAdapterActor:  # pragma: no cover
 def cluster_node_ip() -> str:  # pragma: no cover
     """IP of the node a placement-group bundle lives on."""
     return _get_node_ip_local()
+
+
+class MegatronDynamoWorkerPool:
+    """``DynamoWorkerPool`` of NeMo-RL-owned Megatron engines plus adapter sidecars.
+
+    Every engine is a dedicated ``MegatronGeneration`` over its own one-node
+    virtual cluster, built with ``skip_weight_load=True`` so its inference engine
+    comes up at the first weight refit. Every engine has the layout the policy
+    config gives plus its own entry in ``dynamo_cfg.prefill_engines`` /
+    ``decode_engines``, so any two engines may differ in TP and PP (the KV
+    handoff reshards between them). An engine's role also picks the Dynamo
+    component it registers under, the engine variant and KV-transfer agents its
+    ranks bring up when the adapter attaches, and its place in the teardown
+    order.
+    """
+
+    def __init__(
+        self,
+        *,
+        policy_config: Mapping[str, Any],
+        tokenizer: "PreTrainedTokenizerBase",
+        config: DynamoConfig,
+        namespace: str,
+        manager_env: Mapping[str, str],
+        num_gpus_per_node: int,
+        port_range_low: int | None,
+        port_range_high: int | None,
+        node_resource_constraints: list[dict[str, float]] | None,
+    ) -> None:
+        """Remember what every engine and sidecar is built from.
+
+        Args:
+            policy_config: The full ``policy`` config; each engine is built from
+                it with its role's layout overrides applied.
+            tokenizer: Tokenizer handed to every engine.
+            config: Validated generation config with ``dynamo_cfg.engine='megatron'``.
+            namespace: Dynamo namespace shared by the frontend and every engine.
+            manager_env: etcd / NATS connection variables for the sidecars.
+            num_gpus_per_node: GPUs per node; one engine fits on one node.
+            port_range_low: Lower bound of every engine's master-port range,
+                as the shared inference cluster was given; ``None`` keeps the
+                ``RayVirtualCluster`` default.
+            port_range_high: Upper bound (exclusive) of that range; ``None``
+                keeps the ``RayVirtualCluster`` default.
+            node_resource_constraints: The shared inference cluster's per-node
+                NVLink-domain pins, or ``None`` when it has none. Engines tile
+                those nodes in role order, so each engine inherits the pin of
+                the inference node it takes the place of.
+
+        Raises:
+            ValueError: When ``config`` does not select Megatron engines.
+        """
+        if not config.is_megatron_engine:
+            raise ValueError(
+                "MegatronDynamoWorkerPool requires dynamo_cfg.engine='megatron'"
+            )
+        # The engines take the policy config as-is; MegatronGeneration types it.
+        self._policy_config = cast("PolicyConfig", policy_config)
+        self._tokenizer = tokenizer
+        self._config = config
+        self._namespace = namespace
+        self._manager_env = dict(manager_env)
+        self._num_gpus_per_node = num_gpus_per_node
+        self._port_range_low = port_range_low
+        self._port_range_high = port_range_high
+        self._node_resource_constraints = node_resource_constraints
+        megatron_root = config.dynamo_cfg.megatron_root
+        self._megatron_root = str(
+            Path(megatron_root).expanduser()
+            if megatron_root
+            else default_megatron_root()
+        )
+        self._roles: list[DynamoWorkerRole] = []
+        self._records: list[DynamoWorkerRecord] = []
+        self._clusters: list[RayVirtualCluster] = []
+        self._engines: list["MegatronGeneration"] = []
+        self._adapters: list[ray.actor.ActorHandle] = []
+        self._adapter_metadata: list[dict[str, Any]] = []
+
+    @property
+    def records(self) -> list[DynamoWorkerRecord]:
+        """Records returned by :meth:`start`, in engine order."""
+        return list(self._records)
+
+    def expected_components(self) -> dict[str, int]:
+        """Dynamo component name to the number of engines registering under it."""
+        counts: dict[str, int] = {}
+        for role in self._roles:
+            component = _COMPONENT_BY_ROLE[role]
+            counts[component] = counts.get(component, 0) + 1
+        return counts
+
+    def start(self, workers: Sequence[DynamoWorkerLayout]) -> list[DynamoWorkerRecord]:
+        """Bring up one engine and one sidecar per worker, in order.
+
+        Args:
+            workers: Role, width, and layout overrides per engine, from
+                ``DynamoConfig.worker_layouts``; the order is the refit rank
+                order.
+
+        Returns:
+            One record per engine, in ``workers`` order.
+
+        Raises:
+            ValueError: On an aggregated role, an engine wider than a node, or
+                more engines than the node pins hold.
+            RuntimeError: When the pool is already started, or an engine's
+                GPUs land on more than one node.
+        """
+        if self._engines or self._adapters:
+            raise RuntimeError("MegatronDynamoWorkerPool is already started")
+        workers = list(workers)
+        roles = [worker.role for worker in workers]
+        unsupported = sorted({role for role in roles if role not in _COMPONENT_BY_ROLE})
+        if unsupported:
+            raise ValueError(
+                "Megatron engines behind Dynamo are prefill or decode engines; "
+                f"got {unsupported}. Aggregated Megatron engines are not supported "
+                "(use policy.generation.backend=megatron)."
+            )
+        for worker in workers:
+            if worker.width > self._num_gpus_per_node:
+                raise ValueError(
+                    f"A Megatron {worker.role} engine spans {worker.width} GPUs "
+                    f"but nodes have {self._num_gpus_per_node}; multi-node "
+                    "engines are not supported behind Dynamo. Lower "
+                    f"policy.generation.dynamo_cfg.{worker.role}_engines or "
+                    "mcore_generation_config tensor_model_parallel_size x "
+                    "pipeline_model_parallel_size."
+                )
+        # Which pinned inference node each engine takes, when the shared
+        # inference cluster has node pins. Engines tile the pinned nodes in
+        # launch order, each engine wholly on one node: an engine that does not
+        # fit in the GPUs the earlier engines left on the current node starts
+        # the next one. With one width this is engine_index // engines_per_node.
+        constraints = self._node_resource_constraints
+        pin_index_by_engine: list[int] = []
+        node_index = 0
+        used_on_node = 0
+        for worker in workers:
+            width = worker.width
+            if used_on_node + width > self._num_gpus_per_node:
+                node_index += 1
+                used_on_node = 0
+            pin_index_by_engine.append(node_index)
+            used_on_node += width
+        nodes_needed = node_index + 1
+        if constraints is not None and nodes_needed > len(constraints):
+            widths = [worker.width for worker in workers]
+            raise ValueError(
+                f"{len(workers)} Megatron engines of widths {widths} GPUs tile "
+                f"{nodes_needed} nodes of {self._num_gpus_per_node} GPUs, more "
+                f"than the {len(constraints)} pinned inference nodes."
+            )
+        self._roles = roles
+        try:
+            # Imported here: this module is also the sidecar actor's module and
+            # is imported inside the Dynamo venv, which never builds an engine
+            # and need not load the Megatron generation backend and its
+            # generation-config chain.
+            from nemo_rl.models.generation.megatron.megatron_generation import (
+                MegatronGeneration,
+            )
+
+            # Builds the dynamo extra's venv on every node when uv-managed, the
+            # same venv the vLLM sidecar launches from.
+            runtime_env = make_actor_runtime_env(
+                _ADAPTER_ACTOR_FQN,
+                extra_env_vars={"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"},
+            )
+            ports_by_node: dict[str, set[int]] = {}
+            role_counts: dict[str, int] = {}
+            for engine_index, worker in enumerate(workers):
+                role = worker.role
+                ordinal = role_counts.get(role, 0)
+                role_counts[role] = ordinal + 1
+                instance_id = f"{role}-{ordinal}"
+                width = worker.width
+                # Each engine is built from the policy config with its own
+                # layout overrides, and its sidecar records the same layout.
+                engine_policy_config = cast(
+                    "PolicyConfig",
+                    role_policy_config(self._policy_config, worker.overrides),
+                )
+                cluster = RayVirtualCluster(
+                    name=f"dynamo_{self._namespace}_{instance_id}",
+                    bundle_ct_per_node_list=[width],
+                    use_gpus=True,
+                    num_gpus_per_node=self._num_gpus_per_node,
+                    max_colocated_worker_groups=1,
+                    port_range_low=self._port_range_low,
+                    port_range_high=self._port_range_high,
+                    node_resource_constraints=(
+                        None
+                        if constraints is None
+                        else [constraints[pin_index_by_engine[engine_index]]]
+                    ),
+                )
+                self._clusters.append(cluster)
+                # Reserved the way the engine will reserve them (always PACK,
+                # since Dynamo engines are never colocated; idempotent), so a
+                # split engine fails before any worker is scheduled.
+                MegatronGeneration.init_cluster_placement_groups(
+                    cluster, engine_policy_config
+                )
+                node_ip = self._engine_node_ip(cluster, instance_id)
+                engine = MegatronGeneration(
+                    config=engine_policy_config,
+                    tokenizer=self._tokenizer,
+                    cluster=cluster,
+                    name_prefix=f"dynamo_{instance_id}",
+                    skip_weight_load=True,
+                )
+                self._engines.append(engine)
+                metadata = self._start_adapter(
+                    instance_id=instance_id,
+                    role=role,
+                    cluster=cluster,
+                    node_ip=node_ip,
+                    runtime_env=runtime_env,
+                    engine_argv=engine_layout_argv(
+                        self._policy_config, overrides=worker.overrides
+                    ),
+                    ports_by_node=ports_by_node,
+                )
+                engine.attach_dynamo_adapter(
+                    parent_event_address=metadata["parent_event_address"], role=role
+                )
+                self._records.append(
+                    DynamoWorkerRecord(
+                        role=role,
+                        world_size=width,
+                        instance_id=instance_id,
+                        node_ip=metadata["node_ip"],
+                        control=engine,
+                    )
+                )
+                print(
+                    f"  [Dynamo:{instance_id}] engine ready for refit on "
+                    f"{metadata['node_ip']} ({width} ranks), adapter "
+                    f"owner={metadata['handoff_owner']}",
+                    flush=True,
+                )
+        except Exception:
+            self.shutdown()
+            raise
+        return self.records
+
+    def _engine_node_ip(self, cluster: RayVirtualCluster, instance_id: str) -> str:
+        """Node every bundle of an engine's cluster sits on.
+
+        ``PACK`` is best effort: on a fragmented or partly busy cluster Ray may
+        spread an engine's bundles over several nodes, and its tensor-parallel
+        group would then silently run across them.
+        """
+        refs = [
+            cluster_node_ip.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=placement_group,
+                    placement_group_bundle_index=bundle_index,
+                )
+            ).remote()
+            for placement_group in cluster.get_placement_groups()
+            for bundle_index in range(placement_group.bundle_count)
+        ]
+        node_ips = set(ray.get(refs))
+        if len(node_ips) != 1:
+            raise RuntimeError(
+                f"Megatron engine {instance_id} spans multiple nodes "
+                f"{sorted(node_ips)}. Multi-node engines are not supported "
+                "behind Dynamo."
+            )
+        return next(iter(node_ips))
+
+    def _start_adapter(
+        self,
+        *,
+        instance_id: str,
+        role: str,
+        cluster: RayVirtualCluster,
+        node_ip: str,
+        runtime_env: dict[str, Any],
+        engine_argv: list[str],
+        ports_by_node: dict[str, set[int]],
+    ) -> dict[str, Any]:
+        """Schedule the sidecar on the engine's first bundle and return its metadata."""
+        placement_group = cluster.get_placement_groups()[0]
+        strategy = PlacementGroupSchedulingStrategy(
+            placement_group=placement_group,
+            placement_group_bundle_index=0,
+            placement_group_capture_child_tasks=True,
+        )
+        # Ports are node-local: a later sidecar on a node avoids the ports the
+        # earlier sidecars on that node reported.
+        used_ports = ports_by_node.setdefault(node_ip, set())
+        worker_args = self._config.dynamo_cfg.worker_args
+        adapter = DynamoMegatronAdapterActor.options(
+            num_gpus=0,
+            runtime_env=runtime_env,
+            scheduling_strategy=strategy,
+            name=f"{self._namespace}-dynamo-adapter-{instance_id}",
+        ).remote(
+            instance_id=instance_id,
+            role=role,
+            component=_COMPONENT_BY_ROLE[role],
+            model_name=str(self._policy_config["model_name"]),
+            namespace=self._namespace,
+            megatron_root=self._megatron_root,
+            manager_env=self._manager_env,
+            engine_start_timeout_s=self._config.dynamo_cfg.startup_timeout_s,
+            endpoint_types=list(worker_args.endpoint_types),
+            extra_cli_args=list(worker_args.extra_cli_args),
+            engine_argv=list(engine_argv),
+            excluded_ports=sorted(used_ports),
+        )
+        # Appended before the first call so a failed launch is still torn down.
+        self._adapters.append(adapter)
+        metadata = dict(ray.get(adapter.metadata.remote()))
+        self._adapter_metadata.append(metadata)
+        used_ports.update({int(metadata["event_port"]), int(metadata["system_port"])})
+        return metadata
+
+    def is_alive(self) -> bool:
+        """Whether every sidecar process and every engine's rank zero is alive."""
+        if not self._records:
+            return False
+        # A dead actor must read as "not alive", not raise, so validate() can
+        # report it.
+        try:
+            adapters_alive = ray.get(
+                [adapter.is_alive.remote() for adapter in self._adapters]
+            )
+            if not all(adapters_alive):
+                return False
+            engines_alive = ray.get(
+                [engine.shard_liveness_ref(0) for engine in self._engines]
+            )
+        except ray.exceptions.RayActorError:
+            return False
+        return all(engines_alive)
+
+    def validate(
+        self, expected: Sequence[DynamoWorkerRecord]
+    ) -> list[DynamoWorkerRecord]:
+        """Fail if the fleet died, a sidecar restarted, or identities changed."""
+        if not self.is_alive():
+            raise RuntimeError(
+                "A Megatron engine or its Dynamo adapter exited behind the frontend."
+            )
+        current = ray.get([adapter.metadata.remote() for adapter in self._adapters])
+        recorded_pids = [m["process_pid"] for m in self._adapter_metadata]
+        if [m["process_pid"] for m in current] != recorded_pids:
+            raise RuntimeError(
+                "Dynamo adapter membership changed after collective initialization."
+            )
+        identities = [
+            (r.role, r.world_size, r.instance_id, r.node_ip) for r in expected
+        ]
+        live = [(r.role, r.world_size, r.instance_id, r.node_ip) for r in self._records]
+        if identities != live:
+            raise RuntimeError(
+                "Megatron engine membership changed after collective "
+                f"initialization: expected={identities}, current={live}."
+            )
+        return self.records
+
+    def prefill_coordinator_addresses(self) -> list[str]:
+        """Coordinator addresses of the prefill engines that are listening."""
+        addresses = []
+        # After a partial start there are engines without a record yet; none of
+        # them has a coordinator.
+        engines = self._engines[: len(self._records)]
+        for record, engine in zip(self._records, engines, strict=True):
+            if record.role != "prefill":
+                continue
+            address = engine.dynamo_coordinator_address()
+            if address:
+                addresses.append(address)
+        return addresses
+
+    def shutdown(self) -> None:
+        """Decode first, then attest their termination to prefill, then prefill.
+
+        Prefill engines keep KV blocks pinned for decode attempts they have not
+        heard back from. Once every decode rank is gone, their owner IDs are
+        reported to each prefill coordinator so the pins are released before
+        the prefill engines themselves go down. A decode engine that did not
+        stop cleanly is not attested. Best effort and idempotent: every failure
+        is logged and the teardown continues.
+        """
+        indexed = list(enumerate(self._records))
+        decode = [i for i, record in indexed if record.role == "decode"]
+        prefill = [i for i, record in indexed if record.role == "prefill"]
+        stopped_decode = []
+        for index in decode:
+            if self._stop_engine(index):
+                stopped_decode.append(index)
+            else:
+                LOGGER.warning(
+                    "Decode engine %s did not stop cleanly; its handoff owner is "
+                    "not attested as terminated",
+                    self._records[index].instance_id,
+                )
+        if stopped_decode and prefill:
+            self._confirm_decode_terminated(
+                attester=self._adapters[prefill[0]], decode_indices=stopped_decode
+            )
+        for index in prefill:
+            self._stop_engine(index)
+        # Engines and sidecars that failed before their record existed.
+        for index in range(
+            len(self._records), max(len(self._engines), len(self._adapters))
+        ):
+            self._stop_engine(index)
+        for cluster in self._clusters:
+            try:
+                cluster.shutdown()
+            except Exception:
+                LOGGER.exception("Could not remove an engine placement group")
+        self._roles = []
+        self._records.clear()
+        self._engines.clear()
+        self._adapters.clear()
+        self._adapter_metadata.clear()
+        self._clusters.clear()
+
+    def _confirm_decode_terminated(
+        self, *, attester: ray.actor.ActorHandle, decode_indices: list[int]
+    ) -> None:
+        try:
+            addresses = self.prefill_coordinator_addresses()
+        except Exception:
+            LOGGER.exception("Could not read prefill coordinator addresses")
+            return
+        if not addresses:
+            LOGGER.info(
+                "No prefill coordinator is listening (expected before the first "
+                "refit); skipping handoff attestation for %d decode engines",
+                len(decode_indices),
+            )
+            return
+        timeout_s = self._config.dynamo_cfg.control_timeout_s
+        for index in decode_indices:
+            owner = self._adapter_metadata[index].get("handoff_owner")
+            if not owner:
+                continue
+            try:
+                accepted = ray.get(
+                    attester.confirm_terminated.remote(addresses, owner, timeout_s),
+                    timeout=timeout_s + 30,
+                )
+            except Exception:
+                LOGGER.exception("Could not attest decode owner %s termination", owner)
+                continue
+            if not accepted:
+                LOGGER.warning(
+                    "Prefill coordinators did not accept decode owner %s "
+                    "termination; its pinned KV blocks stay until the prefill "
+                    "engines stop (see the prefill adapter's log)",
+                    owner,
+                )
+
+    def _stop_engine(self, index: int) -> bool:
+        """Stop one engine's sidecar and policy; whether both stopped cleanly."""
+        stopped = True
+        if index < len(self._adapters):
+            adapter = self._adapters[index]
+            try:
+                ray.get(adapter.shutdown.remote(), timeout=30)
+            except Exception:
+                LOGGER.exception("Could not stop a Dynamo Megatron adapter")
+                stopped = False
+            try:
+                ray.kill(adapter, no_restart=True)
+            except Exception:
+                LOGGER.exception("Could not kill a Dynamo Megatron adapter actor")
+        if index < len(self._engines):
+            try:
+                engine_stopped = self._engines[index].shutdown()
+            except Exception:
+                LOGGER.exception("Could not stop a Megatron engine")
+                stopped = False
+            else:
+                if not engine_stopped:
+                    LOGGER.error("A Megatron engine did not shut down cleanly")
+                    stopped = False
+        return stopped
