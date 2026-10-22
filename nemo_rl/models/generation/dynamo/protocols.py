@@ -14,20 +14,25 @@
 
 """The engine seam behind ``DynamoGeneration``.
 
-Contracts that separate "what engines are behind the Dynamo frontend" from the
+Two contracts separate "what engines are behind the Dynamo frontend" from the
 controller-facing adapter. The adapter, the runtime that owns etcd / NATS /
 frontend, and the SingleController talk to these protocols only, so a fleet of
 Dynamo-managed vLLM workers and a fleet of NeMo RL's Megatron inference engines
 are interchangeable behind them. ``DynamoRefitChannel`` (vLLM) already has the
-refit shape; ``MegatronRefitChannel`` implements the same protocol.
+refit shape; ``MegatronRefitChannel`` and ``MegatronDynamoWorkerPool`` implement
+the two protocols for Megatron engines.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 import ray
 
-from nemo_rl.models.generation.dynamo.config import DynamoWorkerRole
+from nemo_rl.models.generation.dynamo.config import (
+    DynamoWorkerLayout,
+    DynamoWorkerRole,
+)
 from nemo_rl.weight_sync.membership import RefitMembership
 
 
@@ -45,6 +50,44 @@ class DynamoWorkerRecord:
     instance_id: str
     node_ip: str
     control: Any
+
+
+@runtime_checkable
+class DynamoWorkerPool(Protocol):
+    """Makes the engines exist and registers them with Dynamo.
+
+    ``workers`` is positional and comes from ``DynamoConfig.worker_layouts``:
+    engine ``i`` gets ``workers[i]`` (its role, width, and layout overrides),
+    which is also its refit rank order. Widths may differ between any two
+    engines.
+    """
+
+    def start(self, workers: Sequence[DynamoWorkerLayout]) -> list[DynamoWorkerRecord]:
+        """Bring up every engine in order and return one record each."""
+        ...
+
+    @property
+    def records(self) -> list[DynamoWorkerRecord]:
+        """Records returned by :meth:`start`, in engine order."""
+        ...
+
+    def expected_components(self) -> dict[str, int]:
+        """Dynamo component name to the number of engines that must register."""
+        ...
+
+    def is_alive(self) -> bool:
+        """Whether every engine (and its registration process) is still alive."""
+        ...
+
+    def validate(
+        self, expected: Sequence[DynamoWorkerRecord]
+    ) -> list[DynamoWorkerRecord]:
+        """Fail if the live fleet no longer matches ``expected``."""
+        ...
+
+    def shutdown(self) -> None:
+        """Tear down everything the pool owns. Idempotent."""
+        ...
 
 
 @runtime_checkable

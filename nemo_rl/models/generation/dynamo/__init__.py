@@ -19,6 +19,7 @@ from nemo_rl.models.generation.dynamo.config import (
 )
 from nemo_rl.models.generation.dynamo.dynamo_generation import DynamoGeneration
 from nemo_rl.models.generation.dynamo.protocols import (
+    DynamoWorkerPool,
     DynamoWorkerRecord,
     RefitChannel,
 )
@@ -26,6 +27,7 @@ from nemo_rl.models.generation.dynamo.protocols import (
 __all__ = [
     "DynamoCfg",
     "DynamoConfig",
+    "DynamoWorkerPool",
     "DynamoFrontendArgs",
     "DynamoGeneration",
     "DynamoWorkerArgs",
