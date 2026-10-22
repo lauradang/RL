@@ -58,6 +58,11 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     # and those vLLM workers load NeMo RL's worker extension, so the venv needs
     # nemo_rl, vLLM and ai-dynamo together.
     "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": ["dynamo"],
+    # Same venv: the sidecar launches Megatron-LM's Dynamo adapter with its own
+    # interpreter, so the adapter and the frontend share one ai-dynamo install.
+    "nemo_rl.models.generation.dynamo.megatron_worker_pool.DynamoMegatronAdapterActor": [
+        "dynamo"
+    ],
     "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": [
         "automodel"
     ],
