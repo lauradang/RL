@@ -1,0 +1,70 @@
+digraph G {
+  graph [rankdir=TB, fontname="Helvetica", nodesep=0.45, ranksep=0.5, pad=0.3, newrank=true, compound=true];
+  node  [fontname="Helvetica", fontsize=13, shape=box, style="rounded,filled", fillcolor="#ffffff", color="#333333", penwidth=1.4];
+  edge  [fontname="Helvetica", fontsize=11, color="#333333", penwidth=1.3];
+
+  subgraph cluster_sc {
+    label=<<b>SingleController</b> · NeMo RL driver>; style="rounded,filled"; fillcolor="#F7F7F7"; color="#777777";
+    MG [label=<<b>MegatronGeneration</b> (dynamo=true)<br/><font point-size="11">the trainer's generation object · owns the two below<br/>routes every refit call to the fleet · posts rollouts to the frontend</font>>, fillcolor="#E6F4EA", color="#2E7D32"];
+    RT [label=<<b>ManagedDynamoRuntime</b><br/><font point-size="11">etcd + NATS + frontend processes</font>>, fillcolor="#FDEEE9", color="#D94F30"];
+    subgraph cluster_fleet {
+      label=<<b>MegatronDynamoFleet</b> · one per run<br/><font point-size="11">builds one MegatronGeneration per engine (own one-node cluster, own TP×PP) · keeps a client per engine<br/>refit fan-out in rank order · ordered pause + pin drain · starts the endpoints · shutdown order</font>>;
+      style="rounded,filled"; fillcolor="#FDEEE9"; color="#D94F30";
+      CP [label=<<b>MegatronDynamoWorkerClient</b> · prefill-0<br/><font point-size="11">actor handles to its TP×PP workers + leader (rank 0)</font>>, fillcolor="#ffffff", color="#D94F30"];
+      CD [label=<<b>MegatronDynamoWorkerClient</b> · decode-0<br/><font point-size="11">actor handles to its TP×PP workers + leader (rank 0)</font>>, fillcolor="#ffffff", color="#D94F30"];
+    }
+  }
+
+  FE [label=<<b>Dynamo frontend</b> · prefill router<br/><font point-size="11">① HTTP request from MegatronGeneration (generate_async)</font>>, fillcolor="#E4F2F7", color="#2A7B9B"];
+  TR [label=<<b>Trainer</b> (NeMo RL)>, fillcolor="#FDEEE9", color="#D94F30"];
+
+  subgraph cluster_p {
+    label=<<b>prefill-0 engine</b> · one MegatronGeneration over its own cluster (TP×PP actors)>; style="rounded,filled"; fillcolor="#FDF8F6"; color="#D94F30";
+    PA [label="rank-0 actor also runs:\nDynamo Worker task + Megatron adapter\n(in-process, no sidecar)", fillcolor="#E6F4EA", color="#2E7D32"];
+    PC [label="coordinator\n(Megatron-LM)", shape=hexagon, fillcolor="#FDF5E0", color="#D4A843"];
+    PE [label="engine ranks\n(MegatronDynamoPolicyWorker)"];
+  }
+  subgraph cluster_d {
+    label=<<b>decode-0 engine</b> · one MegatronGeneration over its own cluster>; style="rounded,filled"; fillcolor="#F4FAF7"; color="#2D8B55";
+    DA [label="rank-0 actor:\nDynamo Worker task + adapter", fillcolor="#E6F4EA", color="#2E7D32"];
+    DC [label="coordinator", shape=hexagon, fillcolor="#FDF5E0", color="#D4A843"];
+    DE [label="engine ranks\n(MegatronDynamoPolicyWorker)"];
+  }
+  { rank=same; FE; MG; }
+  FE -> MG [style=invis, weight=0];
+  RT -> CP [style=invis]; CP -> CD [style=invis, weight=10];
+  PA -> DA [style=invis, weight=10]; PC -> DC [style=invis, weight=10]; PE -> DE [style=invis, weight=10];
+  { rank=same; RT; CP; CD; }
+  { rank=same; PA; DA; }
+  { rank=same; PC; DC; }
+  { rank=same; PE; DE; }
+
+  MG -> RT [label=" starts"];
+  MG -> CP [lhead=cluster_fleet, label=" owns; suspend / prepare /\n resume / init_collective"];
+  RT -> FE [constraint=false, label=" owns", color="#D94F30", fontcolor="#D94F30"];
+  MG -> FE [constraint=false, label=" ① rollouts (HTTP)", color="#2A7B9B", fontcolor="#2A7B9B"];
+
+  CP -> PE [weight=0, label=" refit calls over the handles:\n pause_for_refit, pinned_handoff_block_count,\n suspend / resume, init_collective, update_weights\n (decode-0 gets the same, in the fleet's order)", color="#D94F30", fontcolor="#D94F30", style=dashed];
+  CP -> PA [weight=2, label=" first resume (leader):\n start_dynamo_endpoint,\n attach_dynamo_events", color="#2E7D32", fontcolor="#2E7D32", style=dashed];
+  CD -> DE [weight=0, label="", color="#D94F30", fontcolor="#D94F30", style=dashed];
+  CD -> DA [weight=2, label=" start_dynamo_endpoint,\n attach_dynamo_events", color="#2E7D32", fontcolor="#2E7D32", style=dashed];
+
+  FE -> PA [label=" ② prefill leg"];
+  PA -> PC [label=" ③ request"];
+  PC -> PE [label=" ④"];
+  PE -> PC [label=" ⑤ done,\n KV pinned", style=dashed];
+  PC -> PA [label=" ⑥ reply\n (KV descriptor)", style=dashed];
+  PA -> FE [label=" ⑦ KV descriptor", style=dashed, constraint=false];
+  FE -> DA [label=" ⑧ decode leg\n + KV descriptor"];
+  DA -> PC [label=" ⑨ CLAIM_KV\n ⑮ RELEASE_KV", style=dashed, constraint=false, color="#D4A843", fontcolor="#8a6d1f"];
+  DA -> DC [label=" ⑩ request"];
+  DC -> DE [label=" ⑪"];
+  PE -> DE [label=" ⑫ KV read over NIXL", penwidth=3, color="#2A7B9B", fontcolor="#2A7B9B", constraint=false];
+  DE -> DC [label=" ⑬ tokens", style=dashed];
+  DC -> DA [label=" ⑭ engine_data → frontend\n → MegatronGeneration", style=dashed];
+
+  TR -> PE [label=" refit: native collective NCCL\n (RefitMembership offsets)", penwidth=3, color="#D94F30", fontcolor="#D94F30", constraint=false];
+  TR -> DE [penwidth=3, color="#D94F30", fontcolor="#D94F30", constraint=false];
+  PE -> TR [style=invis];
+  DE -> TR [style=invis];
+}
