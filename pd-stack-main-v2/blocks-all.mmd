@@ -1,0 +1,40 @@
+flowchart BT
+  E["<b>DynamicInferenceEngine</b> · Megatron-LM (exists)<br/>1 per GPU · runs the model, holds the KV cache"]
+  W["<b>PR 2</b> · <b>MegatronDynamoPolicyWorker</b> · NeMo RL Ray actor<br/>1 per GPU · builds the handoff engine for its role, receives weights<br/>PR 3: hosts the adapter, reports events · PR 4: pause / pin count / attestation"]
+  G["<b>PR 1</b> · <b>MegatronGeneration</b> (per engine) · NeMo RL<br/>TP×PP workers = one complete copy · one per Dynamo worker<br/>engine switch, per-role TP/PP layout, RefitMembership offset"]
+  FLEET["<b>PR 2</b> · <b>MegatronDynamoFleet</b> · NeMo RL<br/>builds the per-engine copies in refit-rank order, refit fan-out<br/>PR 3: starts the endpoints · PR 4: ordered pause + pin drain, shutdown order"]
+  TOP["<b>PR 2</b> · <b>MegatronGeneration</b> (dynamo=true) · NeMo RL<br/>owns the fleet, routes refits to it<br/>PR 3: starts the runtime, awaits registration · PR 5: posts rollouts"]
+  RT["<b>PR 3</b> · <b>ManagedDynamoRuntime</b> · NeMo RL<br/>etcd + NATS + frontend · readiness per role"]
+  C["<b>Coordinator</b> · Megatron-LM (exists)<br/>1 per copy · started by rank 0"]
+  I["<b>PR 3</b> · <b>InferenceClient</b> · Megatron-LM<br/>adapter's connection to the coordinator"]
+  A["<b>PR 3</b> · <b>Megatron adapter</b> (MegatronLLMEngine) · Megatron-LM code<br/>hosted by a dynamo.common.backend.Worker task<br/>on rank 0's actor loop · no sidecar"]
+  F["<b>Dynamo frontend</b> · Dynamo (exists) · prefill router<br/>picks a prefill and a decode worker"]
+  E -- "lives inside" --> W
+  W -- "TP×PP of them form" --> G
+  G -- "N per-engine copies" --> FLEET
+  FLEET -- "owned by" --> TOP
+  G -- "rank 0 starts" --> C
+  I -- "connects to" --> C
+  A -- "uses" --> I
+  W -- "rank 0 hosts" --> A
+  TOP -- "starts" --> RT
+  RT -- "owns" --> F
+  TOP -- "HTTP requests (PR 5)" --> F
+  A -- "registers prefill-0 / decode-0 with" --> F
+  subgraph L["Legend · which PR adds the box (later PRs grow it)"]
+    direction LR
+    L1["PR 1 · config + layouts"] ~~~ L2["PR 2 · fleet + worker, refit side"] ~~~ L3["PR 3 · adapter + frontend"] ~~~ L4["PR 4 · ordered pause + attestation"] ~~~ L5["PR 5 · rollouts"] ~~~ L0["already exists"]
+  end
+  classDef pr1 fill:#fdeee9,stroke:#d94f30,stroke-width:3px
+  classDef pr2 fill:#fff3e0,stroke:#ef8f00,stroke-width:3px
+  classDef pr3 fill:#e6f4ea,stroke:#2e7d32,stroke-width:3px
+  classDef pr4 fill:#ede7f6,stroke:#6a3fb5,stroke-width:3px
+  classDef pr5 fill:#e4f2f7,stroke:#2a7b9b,stroke-width:3px
+  classDef old fill:#f5f5f5,stroke:#9e9e9e,color:#555
+  class G,L1 pr1
+  class W,FLEET,TOP,L2 pr2
+  class A,I,RT,L3 pr3
+  class L4 pr4
+  class L5 pr5
+  class E,C,F,L0 old
+  style L fill:#ffffff,stroke:#cccccc,stroke-dasharray: 4 4

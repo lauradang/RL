@@ -1,0 +1,9 @@
+flowchart TB
+  M["main"] --> P1
+  P1["PR 1<br/>megatron engine switch,<br/>per-role TP/PP layouts,<br/>RefitMembership offsets"] --> P2["PR 2<br/>MegatronDynamoFleet + worker hooks:<br/>build the engines, route refits<br/>through the fleet"] --> P3["PR 3<br/>adapter on each engine's rank 0,<br/>ManagedDynamoRuntime, engines<br/>register with the frontend"] --> P4["PR 4<br/>ordered pause + pin drain,<br/>decode-termination attestation"] --> P5["PR 5<br/>rollouts through the frontend,<br/>exemplar YAML, functional test"]
+  style M fill:#ffffff,stroke:#333333
+  style P1 fill:#e6f4ea,stroke:#2e7d32
+  style P2 fill:#e6f4ea,stroke:#2e7d32
+  style P3 fill:#e6f4ea,stroke:#2e7d32
+  style P4 fill:#e6f4ea,stroke:#2e7d32
+  style P5 fill:#e6f4ea,stroke:#2e7d32

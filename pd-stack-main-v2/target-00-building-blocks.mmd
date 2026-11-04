@@ -1,0 +1,34 @@
+flowchart BT
+  E["<b>DynamicInferenceEngine</b> · Megatron-LM<br/>1 per GPU · runs the model, holds the KV cache"]
+  W["<b>MegatronDynamoPolicyWorker</b> · NeMo RL Ray actor<br/>1 per GPU · owns the engine, receives weights,<br/>builds the handoff engine for its role · pause / suspend / resume hooks"]
+  G["<b>MegatronGeneration</b> (per engine) · NeMo RL<br/>TP×PP workers = one complete copy · one per Dynamo worker"]
+  FLEET["<b>MegatronDynamoFleet</b> · NeMo RL<br/>builds the per-engine copies in refit-rank order · refit fan-out,<br/>ordered pause + pin drain · starts the endpoints · shutdown order"]
+  TOP["<b>MegatronGeneration</b> (dynamo=true) · NeMo RL<br/>owns the fleet and the ManagedDynamoRuntime · routes refits to the fleet,<br/>posts rollouts to the frontend · the only client of the frontend"]
+  C["<b>Coordinator</b> · Megatron-LM<br/>1 per copy · started by rank 0"]
+  I["<b>InferenceClient</b> · Megatron-LM<br/>adapter's and rank 0's connection to the coordinator"]
+  A["<b>Megatron adapter</b> (LLMEngine) · Megatron-LM code<br/>hosted by a dynamo.common.backend.Worker task<br/>on rank 0's actor loop (like NativeVllmEngine)"]
+  RT["<b>ManagedDynamoRuntime</b> · NeMo RL<br/>etcd + NATS + frontend · wait_for_engines per role"]
+  F["<b>Dynamo frontend</b> · prefill router<br/>picks a prefill and a decode worker"]
+  GONE["<s>DynamoGeneration · protocols.py seam · RefitChannel<br/>adapter sidecar actor · /opt/dynamo_venv</s>"]
+  E -- "lives inside" --> W
+  W -- "TP×PP of them form" --> G
+  G -- "N per-engine copies" --> FLEET
+  FLEET -- "owned by" --> TOP
+  G -- "rank 0 starts" --> C
+  I -- "connects to" --> C
+  A -- "uses" --> I
+  W -- "rank 0 hosts" --> A
+  TOP -- "starts" --> RT
+  RT -- "owns" --> F
+  A -- "registers prefill-0 / decode-0 with" --> F
+  style E fill:#fdf5e0,stroke:#d4a843
+  style W fill:#fdeee9,stroke:#d94f30
+  style G fill:#fdeee9,stroke:#d94f30
+  style FLEET fill:#fdeee9,stroke:#d94f30
+  style TOP fill:#e6f4ea,stroke:#2e7d32
+  style RT fill:#fdeee9,stroke:#d94f30
+  style C fill:#fdf5e0,stroke:#d4a843
+  style I fill:#fdf5e0,stroke:#d4a843
+  style A fill:#e6f4ea,stroke:#2e7d32
+  style F fill:#e4f2f7,stroke:#2a7b9b
+  style GONE fill:#f2f2f2,stroke:#9e9e9e,stroke-dasharray: 5 5,color:#777
