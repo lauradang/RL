@@ -1,0 +1,53 @@
+digraph G {
+  graph [rankdir=TB, fontname="Helvetica", nodesep=0.4, ranksep=0.55, pad=0.3, newrank=true, compound=true];
+  node  [fontname="Helvetica", fontsize=13, shape=box, style="rounded,filled", fillcolor="#ffffff", color="#333333", penwidth=1.4];
+  edge  [fontname="Helvetica", fontsize=11, color="#333333", penwidth=1.3];
+
+  subgraph cluster_sc {
+    label=<<b>SingleController</b> · NeMo RL driver>; style="rounded,filled"; fillcolor="#F7F7F7"; color="#777777";
+    SETUP [label=<<b>setup.py</b> (unchanged)<br/><font point-size="11">Ⓐ MegatronGeneration.reserve_http_server_addresses → dispatches to<br/><b>MegatronDynamoGeneration.reserve_http_server_addresses</b>:<br/>one port holder per engine, on the node that engine is pinned to<br/>Ⓑ Gym actors start with those URLs</font>>, fillcolor="#FDEEE9", color="#D94F30"];
+    MDG [label=<<b>MegatronDynamoGeneration</b><br/><font point-size="11">Ⓒ builds the engines with their reserved ports, starts etcd + NATS + frontend,<br/>Ⓓ configure_dynamo_gym_proxy(frontend_url) on every engine's rank 0<br/>Ⓔ prepare_for_generation lists the served URLs (dp_openai_server_base_urls)</font>>, fillcolor="#E6F4EA", color="#2E7D32"];
+  }
+
+  subgraph cluster_gym {
+    label=<<b>NeMo-Gym</b> · agent + environment actors (unchanged)>; style="rounded,filled"; fillcolor="#FDEEE9"; color="#D94F30";
+    GYM [label=<<b>policy_model: vllm_model</b><br/><font point-size="11">plain OpenAI chat completions, as on the native Megatron path<br/>spreads sessions over the engines' server URLs</font>>, fillcolor="#ffffff", color="#D94F30"];
+  }
+
+  subgraph cluster_p {
+    label=<<b>prefill-0 engine</b> · rank-0 actor (MegatronDynamoPolicyWorker)>; style="rounded,filled"; fillcolor="#FDF8F6"; color="#D94F30";
+    PSRV [label=<<b>NeMo-Gym proxy server</b> (new, this PR)<br/><font point-size="11">started by _setup_openai_api_server on the reserved port<br/>② <b>Megatron-LM chat endpoint</b> (unchanged): chat template,<br/>reasoning/tool parsers, exact-prefix splice → token ids<br/>③ <b>FrontendInferenceClient</b>: POST token-id /v1/completions</font>>, fillcolor="#E6F4EA", color="#2E7D32"];
+    PWK [label=<<b>Dynamo Worker task</b> + <b>MegatronLLMEngine</b><br/><font point-size="11">⑤ prefill leg → KV pinned, descriptor back</font>>, fillcolor="#E4F2F7", color="#2A7B9B"];
+    PE [label="engine ranks (TP×PP)\ncoordinator + DynamicInferenceEngine", fillcolor="#FDF5E0", color="#D4A843"];
+  }
+  subgraph cluster_d {
+    label=<<b>decode-0 engine</b> · rank-0 actor>; style="rounded,filled"; fillcolor="#F4FAF7"; color="#2D8B55";
+    DSRV [label=<<b>NeMo-Gym proxy server</b><br/><font point-size="11">same: every engine's rank 0 serves one</font>>, fillcolor="#E6F4EA", color="#2E7D32"];
+    DWK [label=<<b>Dynamo Worker task</b> + <b>MegatronLLMEngine</b><br/><font point-size="11">⑥ decode leg: CLAIM_KV, NIXL read, tokens + logprobs</font>>, fillcolor="#E4F2F7", color="#2A7B9B"];
+    DE [label="engine ranks (TP×PP)\ncoordinator + DynamicInferenceEngine", fillcolor="#FDF5E0", color="#D4A843"];
+  }
+
+  FE [label=<<b>Dynamo frontend</b> (Rust)<br/><font point-size="11">④ routes the token-id completion: prefill engine, then decode engine<br/>⑦ completion back: nvext.completion_token_ids, logprobs</font>>, fillcolor="#E4F2F7", color="#2A7B9B"];
+
+  { rank=same; SETUP; MDG; }
+  { rank=same; PSRV; DSRV; }
+  { rank=same; PWK; DWK; }
+  { rank=same; PE; DE; }
+  SETUP -> MDG [style=invis];
+  PSRV -> DSRV [style=invis, weight=10]; PWK -> DWK [style=invis, weight=10]; PE -> DE [style=invis, weight=10];
+
+  SETUP -> GYM [label=" Ⓑ server URLs, one per engine", color="#D94F30", fontcolor="#D94F30"];
+  MDG -> PSRV [label=" Ⓓ configure_dynamo_gym_proxy\n (frontend URL, request timeout)", style=dashed, color="#2E7D32", fontcolor="#2E7D32"];
+  MDG -> FE [label=" Ⓒ starts; native rollouts\n (generate_async) also post here", color="#D94F30", fontcolor="#D94F30", constraint=false];
+
+  GYM -> PSRV [label=" ① POST /v1/chat/completions\n (messages, tools, required_prefix_token_ids)", color="#2A7B9B", fontcolor="#2A7B9B", penwidth=2];
+  GYM -> DSRV [color="#2A7B9B", penwidth=2];
+  PSRV -> FE [label=" ③ POST /v1/completions\n prompt = token ids, logprobs: 0,\n nvext.extra_fields: completion_token_ids", color="#2A7B9B", fontcolor="#2A7B9B", penwidth=2];
+  DSRV -> FE [color="#2A7B9B", penwidth=2];
+  FE -> PWK [label=" ④ prefill leg", color="#2A7B9B", fontcolor="#2A7B9B"];
+  PWK -> PE [label=" ⑤"];
+  FE -> DWK [label=" ④ decode leg\n + KV descriptor", color="#2A7B9B", fontcolor="#2A7B9B"];
+  DWK -> DE [label=" ⑥"];
+  PE -> DE [label=" KV read over NIXL", penwidth=3, color="#2A7B9B", fontcolor="#2A7B9B", constraint=false];
+  FE -> PSRV [label=" ⑦ completion → coordinator-shaped record\n → chat response (content, reasoning_content,\n prompt/generation token ids, logprobs)", style=dashed, color="#2A7B9B", fontcolor="#2A7B9B", constraint=false];
+}
