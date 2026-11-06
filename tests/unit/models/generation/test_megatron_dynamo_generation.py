@@ -16,6 +16,7 @@
 
 import asyncio
 import copy
+import gc
 import pickle
 from types import SimpleNamespace
 from typing import Any
@@ -500,6 +501,11 @@ class _Env:
 
 @pytest.fixture
 def env(monkeypatch):
+    # A generation object a previous test left in a traceback cycle would run its
+    # __del__ shutdown during this test and log through _STATE into this env.
+    gc.collect()
+    # One build at a time keeps the fakes' engine order (and fail_engine_at) deterministic.
+    monkeypatch.setattr(MegatronDynamoGeneration, "_engine_build_concurrency", 1)
     return _Env(monkeypatch, _NODES)
 
 

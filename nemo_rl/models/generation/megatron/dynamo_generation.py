@@ -30,6 +30,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -425,6 +426,10 @@ class MegatronDynamoGeneration(GenerationInterface):
     # How often the refit pause re-reads the prefill engines' pinned handoff
     # blocks while waiting for them to drain.
     _idle_poll_interval_s: float = 0.2
+    # Engines built at once. A build mostly waits on Ray actors and the model
+    # construction, so building a 64-engine fleet one engine at a time takes
+    # hours; the refit rank order is kept by registering engines in index order.
+    _engine_build_concurrency: int = 8
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -1333,19 +1338,38 @@ class MegatronDynamoGeneration(GenerationInterface):
             policy_config_by_role[role] = role_policy_config(
                 self._policy_config, role, self._dynamo_cfg.role_overrides(role)
             )
+        # (engine_index, role, instance_id, width, policy config, cluster, port).
+        plans: list[
+            tuple[
+                int, MegatronDynamoRole, str, int, Any, RayVirtualCluster, Optional[int]
+            ]
+        ] = []
         role_counts: dict[str, int] = {}
         for engine_index, role in enumerate[MegatronDynamoRole](roles):
             ordinal = role_counts.get(role, 0)
             role_counts[role] = ordinal + 1
-            instance_id = f"{role}-{ordinal}"
-            width = widths[role]
-            engine_policy_config = cast("PolicyConfig", policy_config_by_role[role])
             cluster = clusters[engine_index]
+            # Every placed cluster is owned from here on, so a failed build
+            # still removes all placement groups at shutdown.
             self._clusters.append(cluster)
+            plans.append(
+                (
+                    engine_index,
+                    role,
+                    f"{role}-{ordinal}",
+                    widths[role],
+                    cast("PolicyConfig", policy_config_by_role[role]),
+                    cluster,
+                    # The engine's rank zero (its single model-parallel
+                    # coordinator) serves NeMo-Gym on the port reserved for
+                    # this engine, if any.
+                    self._reserved_http_server_ports.get(engine_index),
+                )
+            )
+
+        def build(plan: tuple) -> tuple[MegatronGeneration, str]:
+            _, _, instance_id, _, engine_policy_config, cluster, reserved_port = plan
             node_ip = self._engine_node_ip(cluster, instance_id)
-            # The engine's rank zero (its single model-parallel coordinator)
-            # serves NeMo-Gym on the port reserved for this engine, if any.
-            reserved_port = self._reserved_http_server_ports.get(engine_index)
             engine = MegatronGeneration(
                 config=engine_policy_config,
                 tokenizer=self._tokenizer,
@@ -1356,6 +1380,30 @@ class MegatronDynamoGeneration(GenerationInterface):
                     None if reserved_port is None else {0: reserved_port}
                 ),
             )
+            return engine, node_ip
+
+        built: dict[int, tuple[MegatronGeneration, str]] = {}
+        first_error: Optional[BaseException] = None
+        workers = max(1, min(self._engine_build_concurrency, len(plans)))
+        # Built in rounds of ``workers``; a failed round submits nothing more,
+        # so a bad engine stops the fleet instead of booking every node first.
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for round_start in range(0, len(plans), workers):
+                round_plans = plans[round_start : round_start + workers]
+                futures = {pool.submit(build, plan): plan[0] for plan in round_plans}
+                for future in as_completed(futures):
+                    try:
+                        built[futures[future]] = future.result()
+                    except BaseException as error:  # noqa: BLE001 - re-raised below
+                        first_error = first_error or error
+                if first_error is not None:
+                    break
+        # Register in launch order (the refit rank order), including what was
+        # built before a failure, so shutdown stops those engines too.
+        for engine_index, role, instance_id, width, _, _, _ in plans:
+            if engine_index not in built:
+                continue
+            engine, node_ip = built[engine_index]
             self._engines.append(engine)
             self._engine_records.append(
                 MegatronDynamoEngine.of(
@@ -1371,6 +1419,8 @@ class MegatronDynamoGeneration(GenerationInterface):
                 f"{node_ip} ({width} ranks)",
                 flush=True,
             )
+        if first_error is not None:
+            raise first_error
 
     def _engine_node_ip(self, cluster: RayVirtualCluster, instance_id: str) -> str:
         """Node every bundle of an engine's cluster sits on.
