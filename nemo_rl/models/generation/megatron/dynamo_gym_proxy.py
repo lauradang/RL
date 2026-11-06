@@ -519,8 +519,15 @@ async def serve_app(app: Any, sock: socket.socket) -> None:
     config.backlog = 2**14
     config.h2_max_concurrent_streams = 2**14
     config.bind = [f"fd://{sock.fileno()}"]
+
+    async def _until_cancelled() -> None:
+        # hypercorn installs SIGINT/SIGTERM handlers when no shutdown trigger is
+        # given, which only works on the main thread; this server runs on the
+        # engine's inference loop and stops when its task is cancelled.
+        await asyncio.Event().wait()
+
     try:
-        await serve(app, config)
+        await serve(app, config, shutdown_trigger=_until_cancelled)
     finally:
         sock.close()
 
