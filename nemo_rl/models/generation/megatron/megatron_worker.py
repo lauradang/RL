@@ -1714,10 +1714,23 @@ class MegatronGenerationRefitMixin:
                 nccl_store, global_rank, world_size, nccl_options
             )
             nccl_backend._set_sequence_number_for_group()
-            # Create the group-wide NCCL communicator now, on every rank.
-            nccl_backend.eager_connect_single_device(
-                torch.device("cuda", torch.cuda.current_device())
-            )
+            # NCCLCopyService connects on its first run, including idle ranks.
+            # Connecting here as well can reuse stale scalable-rendezvous IDs
+            # in large refit groups and fail with connection refused. Keep
+            # eager initialization for M2N, which has no first-run hook.
+            # Set NRL_MCORE_NCCL_SINGLE_INIT=0 to restore the old NCCL behavior.
+            # (Local patch carried from orybakov's 961 pipeline; not on main.)
+            single_init = os.environ.get("NRL_MCORE_NCCL_SINGLE_INIT", "1") != "0"
+            if refit_backend == "nccl_m2n" or not single_init:
+                nccl_backend.eager_connect_single_device(
+                    torch.device("cuda", torch.cuda.current_device())
+                )
+            if global_rank == 0:
+                logging.getLogger(__name__).info(
+                    "MCore refit backend=%s NRL_MCORE_NCCL_SINGLE_INIT=%s",
+                    refit_backend,
+                    int(single_init),
+                )
             pg._register_backend(
                 torch.device("cuda"),
                 ProcessGroup.BackendType.NCCL,
