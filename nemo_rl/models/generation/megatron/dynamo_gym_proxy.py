@@ -243,6 +243,32 @@ def failed_record(
     }
 
 
+# Megatron-LM's prefix-replacement metadata (megatron.core.inference.inference_request
+# PREFIX_*_FIELD): added by the chat endpoint for a multi-turn prompt, read by the
+# engine's prompt preparer. Dropped here: the frontend carries token ids only.
+_PREFIX_METADATA_FIELDS = frozenset(
+    {
+        "template_prefix_token_ids",
+        "eos_token_id",
+        "_prefix_expanded_token_count",
+        "_prefix_media_count",
+    }
+)
+_prefix_replacement_warned = False
+
+
+def _warn_prefix_replacement_skipped() -> None:
+    global _prefix_replacement_warned
+    if _prefix_replacement_warned:
+        return
+    _prefix_replacement_warned = True
+    LOGGER.warning(
+        "Megatron engines behind Dynamo serve multi-turn prompts as the chat "
+        "template renders them; the exact prior-turn token replacement "
+        "(replace_prefix_tokens) is not applied over the frontend."
+    )
+
+
 class FrontendInferenceClient:
     """An ``InferenceClient`` for Megatron-LM's endpoints that talks to the Dynamo frontend.
 
@@ -290,13 +316,13 @@ class FrontendInferenceClient:
         sampling_params: "SamplingParams",
         *,
         multi_modal_data: Any = None,
-        request_metadata: Optional[dict] = None,
+        offload_params: Optional[dict] = None,
     ) -> asyncio.Future:
         return self.add_request_with_id(
             prompt,
             sampling_params,
             multi_modal_data=multi_modal_data,
-            request_metadata=request_metadata,
+            offload_params=offload_params,
         )[1]
 
     def add_request_with_id(
@@ -305,13 +331,13 @@ class FrontendInferenceClient:
         sampling_params: "SamplingParams",
         *,
         multi_modal_data: Any = None,
-        request_metadata: Optional[dict] = None,
+        offload_params: Optional[dict] = None,
     ) -> tuple[int, asyncio.Future]:
         request_id, payload, prompt_token_ids = self._prepare(
             prompt,
             sampling_params,
             multi_modal_data=multi_modal_data,
-            request_metadata=request_metadata,
+            offload_params=offload_params,
         )
         task = asyncio.get_running_loop().create_task(
             self._complete(request_id, prompt_token_ids, payload)
@@ -325,7 +351,7 @@ class FrontendInferenceClient:
         sampling_params: "SamplingParams",
         *,
         multi_modal_data: Any = None,
-        request_metadata: Optional[dict] = None,
+        offload_params: Optional[dict] = None,
     ) -> "AsyncStream[dict]":
         # Deferred: the stream class is Megatron-LM's.
         from megatron.core.inference.async_stream import AsyncStream
@@ -334,7 +360,7 @@ class FrontendInferenceClient:
             prompt,
             sampling_params,
             multi_modal_data=multi_modal_data,
-            request_metadata=request_metadata,
+            offload_params=offload_params,
         )
         loop = asyncio.get_running_loop()
         stream: AsyncStream[dict] = AsyncStream(
@@ -365,14 +391,23 @@ class FrontendInferenceClient:
         sampling_params: "SamplingParams",
         *,
         multi_modal_data: Any,
-        request_metadata: Optional[dict],
+        offload_params: Optional[dict],
     ) -> tuple[int, dict[str, Any], list[int]]:
-        if request_metadata:
+        # ``offload_params`` is what Megatron-LM's endpoints hand the inference
+        # client: the request body's own ``offload_params`` (NeMo RL's capture
+        # admission travels there) plus, on a multi-turn chat, the prefix fields
+        # the engine's prompt preparer uses to swap the rendered prior turns
+        # for their exact tokens. None of it crosses the frontend.
+        unknown = set(offload_params or {}) - _PREFIX_METADATA_FIELDS
+        if unknown:
             raise NotImplementedError(
-                "token capture (the ng_capture admission) is not yet served for "
-                "Megatron engines behind Dynamo: request metadata does not travel "
-                "through the frontend. Set token_capture.enabled=false."
+                "request metadata does not travel through the Dynamo frontend to "
+                f"Megatron engines; this request carried {sorted(unknown)}. Token "
+                "capture (the ng_capture admission) needs token_capture.enabled=false."
             )
+        if offload_params:
+            # The prompt keeps the chat template's rendering of the prior turns.
+            _warn_prefix_replacement_skipped()
         if multi_modal_data:
             raise NotImplementedError(
                 "Megatron engines behind Dynamo serve text prompts only; the "

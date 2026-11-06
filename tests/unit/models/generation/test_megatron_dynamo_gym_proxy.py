@@ -377,9 +377,9 @@ def test_stop_cancels_every_request_in_flight(http):
             "text prompts only",
         ),
         (
-            {"prompt": [1], "request_metadata": {"ng_capture": {}}},
+            {"prompt": [1], "offload_params": {"ng_capture": {}}},
             NotImplementedError,
-            "token capture",
+            "ng_capture",
         ),
     ],
 )
@@ -393,6 +393,25 @@ def test_client_refuses_what_the_frontend_path_cannot_carry(http, kwargs, error,
     with pytest.raises(error, match=match):
         asyncio.run(run())
     assert http.calls == [] and client.next_request_id == 0
+
+
+def test_client_drops_the_chat_endpoints_prefix_metadata(http):
+    """A multi-turn chat arrives with Megatron-LM's prefix fields; the request goes out as token ids."""
+    http.replies = [_response([4])]
+    client = _client()
+
+    async def run():
+        request_id, future = client.add_request_with_id(
+            [1, 2],
+            _params(),
+            offload_params={"template_prefix_token_ids": [1], "eos_token_id": 7},
+        )
+        await future
+        return request_id
+
+    assert asyncio.run(run()) == 0
+    (call,) = http.calls
+    assert call[1]["prompt"] == [1, 2] and "offload_params" not in call[1]
 
 
 def test_client_refusals_do_not_consume_request_ids_after_a_success(http):
