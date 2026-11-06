@@ -353,13 +353,14 @@ class _FakeRuntime:
 
 
 class _FakeHolder:
-    """A ``RemoteHeldPortReservation`` actor: node from its pin, a fresh port."""
+    """A ``RemoteHeldPortReservation`` actor: node from its engine's bundle, a fresh port."""
 
-    def __init__(self, env: "_Env", resources: dict):
-        ((resource, _),) = resources.items()
-        self.node_ip = resource.removeprefix("node:")
+    def __init__(self, env: "_Env", scheduling_strategy):
+        placement_group = scheduling_strategy.placement_group
+        index = scheduling_strategy.placement_group_bundle_index
+        self.node_ip = placement_group.bundle_nodes[index]
+        self.bundle_index = index
         self.port = 5000 + len(env.holders)
-        self.resources = resources
         env.holders.append(self)
         self.address = _Remote(lambda: (self.node_ip, self.port))
 
@@ -368,8 +369,10 @@ class _FakeHolderClass:
     def __init__(self, env: "_Env"):
         self.env = env
 
-    def options(self, *, resources):
-        return SimpleNamespace(remote=lambda: _FakeHolder(self.env, resources))
+    def options(self, *, scheduling_strategy):
+        return SimpleNamespace(
+            remote=lambda: _FakeHolder(self.env, scheduling_strategy)
+        )
 
 
 class _NodeIpTask:
@@ -555,11 +558,13 @@ def test_builds_one_cluster_and_engine_per_role(env):
     assert generation.get_inference_world_size() == 6
     assert generation.num_engines == 3
     assert generation.expected_components() == {"prefill": 1, "backend": 2}
-    # Engines first, then the runtime from their environment, as for vLLM. No
-    # endpoint yet: the engines have no weights until the first refit.
+    # Every engine's cluster is placed first (the NeMo-Gym reservation shares
+    # them), then the engines, then the runtime from their environment, as for
+    # vLLM. No endpoint yet: the engines have no weights until the first refit.
     expected_log = []
     for name in _IDS:
-        expected_log += [f"cluster {name} up", f"placement {name}", f"engine {name} up"]
+        expected_log += [f"cluster {name} up", f"placement {name}"]
+    expected_log += [f"engine {name} up" for name in _IDS]
     assert env.log == expected_log + ["runtime up"] and env.endpoints == []
     assert env.runtime.frontend_python == "/venvs/mcore/bin/python"
     assert env.runtime.model_name == "Qwen/Qwen3-0.6B"
@@ -572,7 +577,7 @@ def test_builds_one_cluster_and_engine_per_role(env):
 
     cluster = env.clusters[0]
     assert cluster.kwargs == {
-        "name": f"dynamo_{generation._fleet_id}_prefill-0",
+        "name": cluster.kwargs["name"],
         "bundle_ct_per_node_list": [2],
         "use_gpus": True,
         "num_gpus_per_node": 8,
@@ -1140,11 +1145,13 @@ def _gym_config() -> dict[str, Any]:
     return config
 
 
-def test_reservation_holds_one_port_per_engine_on_its_pinned_node(env):
+def test_reservation_holds_one_port_per_engine_on_its_placed_cluster(env):
     policy = {**MEGATRON_POLICY, "generation": _gym_config()}
     cluster = SimpleNamespace(
         world_size=lambda: 6,
         num_gpus_per_node=4,
+        port_range_low=None,
+        port_range_high=None,
         node_resource_constraints=_PINNED,
     )
 
@@ -1153,29 +1160,52 @@ def test_reservation_holds_one_port_per_engine_on_its_pinned_node(env):
         policy,  # type: ignore[arg-type]
     )
 
-    # TP 2 engines tile two per node: prefill-0 and decode-0 on the first
-    # pinned node, decode-1 on the second; the same tiling _start_engines uses.
-    assert [h.node_ip for h in holders] == ["10.0.0.1", "10.0.0.1", "10.0.0.2"]
-    assert urls == [
-        "http://10.0.0.1:5000/v1",
-        "http://10.0.0.1:5001/v1",
-        "http://10.0.0.2:5002/v1",
+    # The engines' clusters are placed first (the same tiling _start_engines
+    # uses: TP 2 engines two per pinned node) and every holder sits on bundle
+    # zero of its engine's placement group, so it is on the engine's node
+    # whatever node the domain pin resolved to.
+    assert [c.name for c in env.clusters] == _IDS
+    assert [c.kwargs["node_resource_constraints"] for c in env.clusters] == [
+        _PINNED[:1],
+        _PINNED[:1],
+        _PINNED[1:],
     ]
+    assert [h.bundle_index for h in holders] == [0, 0, 0]
+    assert [h.node_ip for h in holders] == [
+        c.placement_group.bundle_nodes[0] for c in env.clusters
+    ]
+    assert urls == [f"http://{h.node_ip}:{h.port}/v1" for h in holders]
     assert ports == {0: 5000, 1: 5001, 2: 5002}
     assert holders == env.holders
+    # The engines built afterwards take the very same clusters.
+    generation = MegatronDynamoGeneration(
+        config=policy,  # type: ignore[arg-type]
+        tokenizer="tok",  # type: ignore[arg-type]
+        cluster=cluster,  # type: ignore[arg-type]
+        reserved_http_server_ports=ports,
+    )
+    assert len(env.clusters) == 3
+    assert [e.kwargs["cluster"] for e in env.engines] == env.clusters
+    generation.shutdown()
+    # Shutdown forgets the placed clusters; a rebuild places new ones.
+    assert not hasattr(cluster, "_megatron_dynamo_engine_clusters")
 
 
-def test_reservation_needs_node_pins(env):
+def test_reservation_without_node_pins_places_the_engines_anyway(env):
     policy = {**MEGATRON_POLICY, "generation": _gym_config()}
     cluster = SimpleNamespace(
-        world_size=lambda: 6, num_gpus_per_node=8, node_resource_constraints=None
+        world_size=lambda: 6,
+        num_gpus_per_node=8,
+        port_range_low=None,
+        port_range_high=None,
+        node_resource_constraints=None,
     )
-    with pytest.raises(ValueError, match="node pins"):
-        MegatronDynamoGeneration.reserve_http_server_addresses(
-            cluster,  # type: ignore[arg-type]
-            policy,  # type: ignore[arg-type]
-        )
-    assert env.holders == []
+    urls, ports, holders = MegatronDynamoGeneration.reserve_http_server_addresses(
+        cluster,  # type: ignore[arg-type]
+        policy,  # type: ignore[arg-type]
+    )
+    assert [c.kwargs["node_resource_constraints"] for c in env.clusters] == [None] * 3
+    assert len(holders) == 3 and len(urls) == 3 and ports == {0: 5000, 1: 5001, 2: 5002}
 
 
 def test_plain_megatron_reservation_dispatches_to_the_dynamo_class(env, monkeypatch):

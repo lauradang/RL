@@ -184,6 +184,85 @@ def _seconds_left(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
 
+_ENGINE_CLUSTERS_ATTR = "_megatron_dynamo_engine_clusters"
+
+
+def engine_clusters(
+    cluster: RayVirtualCluster, config: PolicyConfig
+) -> list[RayVirtualCluster]:
+    """One placed single-node cluster per engine, in launch (refit rank) order.
+
+    Each cluster's placement group is reserved here, so where an engine's
+    ranks land is fixed before anything else runs: the NeMo-Gym port holder
+    for an engine is scheduled onto bundle zero of its cluster, and the engine
+    is built on the same cluster later. The list is cached on ``cluster`` (the
+    shared inference cluster the engines take the place of) so the reservation
+    and the engine build share it; :func:`forget_engine_clusters` drops it
+    once the engines are shut down.
+
+    ``cluster.node_resource_constraints`` pin NVLink domains, not nodes: two
+    engines may share a domain, so a constraint alone cannot say which node an
+    engine takes. The placement group can.
+
+    Raises:
+        ValueError: On an engine wider than a node, or more engines than the
+            node pins hold.
+    """
+    planned = getattr(cluster, _ENGINE_CLUSTERS_ATTR, None)
+    if planned is not None:
+        return planned
+    generation_cfg = cast(MCoreGenerationConfig, config["generation"])
+    dynamo_cfg = megatron_dynamo_cfg(generation_cfg)
+    widths = engine_widths(config)
+    roles = engine_roles(
+        disaggregation_cfg(generation_cfg), cluster.world_size(), widths
+    )
+    constraints = cluster.node_resource_constraints
+    pins = engine_node_pins(
+        roles,
+        widths,
+        num_gpus_per_node=cluster.num_gpus_per_node,
+        num_pinned_nodes=None if constraints is None else len(constraints),
+    )
+    # Names these engines' placement groups apart from any other run's.
+    fleet_id = uuid.uuid4().hex[:8]
+    clusters: list[RayVirtualCluster] = []
+    role_counts: dict[str, int] = {}
+    for engine_index, role in enumerate[MegatronDynamoRole](roles):
+        ordinal = role_counts.get(role, 0)
+        role_counts[role] = ordinal + 1
+        engine_cluster = RayVirtualCluster(
+            name=f"dynamo_{fleet_id}_{role}-{ordinal}",
+            bundle_ct_per_node_list=[widths[role]],
+            use_gpus=True,
+            num_gpus_per_node=cluster.num_gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=cluster.port_range_low,
+            port_range_high=cluster.port_range_high,
+            node_resource_constraints=(
+                None if constraints is None else [constraints[pins[engine_index]]]
+            ),
+        )
+        # Reserved the way the engine will reserve them (always PACK, since
+        # Dynamo engines are never colocated; idempotent), so a split engine
+        # fails before any worker is scheduled.
+        MegatronGeneration.init_cluster_placement_groups(
+            engine_cluster,
+            cast(
+                "PolicyConfig",
+                role_policy_config(config, role, dynamo_cfg.role_overrides(role)),
+            ),
+        )
+        clusters.append(engine_cluster)
+    setattr(cluster, _ENGINE_CLUSTERS_ATTR, clusters)
+    return clusters
+
+
+def forget_engine_clusters(cluster: RayVirtualCluster) -> None:
+    """Drop the engine clusters cached on the shared inference cluster."""
+    cluster.__dict__.pop(_ENGINE_CLUSTERS_ATTR, None)
+
+
 class PinnedHandoffTimeout(TimeoutError):
     """Prefill engines still pinned handoff blocks when the pause deadline passed."""
 
@@ -417,10 +496,11 @@ class MegatronDynamoGeneration(GenerationInterface):
 
         The counterpart of ``MegatronGeneration.reserve_http_server_addresses``
         for engines behind Dynamo: each engine's rank zero serves NeMo-Gym from
-        a proxy over the frontend, so one port is held per engine, on the
-        pinned node that engine will take (``engine_node_pins``, the tiling
-        ``_start_engines`` applies). The inference cluster must carry node pins;
-        without them the node an engine lands on is not known up front.
+        a proxy over the frontend, so one port is held per engine, on the node
+        that engine's rank zero will take. The engines' clusters are placed
+        here (:func:`engine_clusters`) and the holder is scheduled onto bundle
+        zero of its engine's placement group, exactly as the plain Megatron
+        reservation pins its holders.
 
         Args:
             cluster: The inference cluster the engines take the place of.
@@ -432,34 +512,22 @@ class MegatronDynamoGeneration(GenerationInterface):
             engines' workers have adopted the sockets, then ``ray.kill``s them.
 
         Raises:
-            ValueError: The cluster has no node pins, or the engines do not fit
-                the pinned nodes.
+            ValueError: The engines do not fit the cluster.
         """
         generation_cfg = cast(MCoreGenerationConfig, config["generation"])
         validate_megatron_dynamo_generation(generation_cfg)
-        constraints = cluster.node_resource_constraints
-        if constraints is None:
-            raise ValueError(
-                "NeMo-Gym with policy.generation.dynamo=true needs an inference "
-                "cluster with node pins (the SingleController's dedicated inference "
-                "nodes): each engine's server address is reserved on the node the "
-                "engine will take."
-            )
-        widths = engine_widths(config)
-        roles = engine_roles(
-            disaggregation_cfg(generation_cfg), cluster.world_size(), widths
-        )
-        pins = engine_node_pins(
-            roles,
-            widths,
-            num_gpus_per_node=cluster.num_gpus_per_node,
-            num_pinned_nodes=len(constraints),
-        )
-        # A holder per engine on that engine's node (num_cpus=0, so it schedules
-        # on a full node); the engine's rank zero adopts the live socket later.
+        clusters = engine_clusters(cluster, config)
+        # A holder per engine on bundle zero of its placement group (num_cpus=0,
+        # so it schedules on a full bundle); the engine's rank zero adopts the
+        # live socket later.
         holders = [
-            RemoteHeldPortReservation.options(resources=dict(constraints[pin])).remote()
-            for pin in pins
+            RemoteHeldPortReservation.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=engine_cluster.get_placement_groups()[0],
+                    placement_group_bundle_index=0,
+                ),
+            ).remote()
+            for engine_cluster in clusters
         ]
         addresses = ray.get([holder.address.remote() for holder in holders])
         urls = [f"http://{node_ip}:{port}/v1" for node_ip, port in addresses]
@@ -539,12 +607,8 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._tokenizer: Optional[PreTrainedTokenizerBase] = tokenizer
         # The engines take the policy config as-is; MegatronGeneration types it.
         self._dynamo_cfg: MegatronDynamoCfg = megatron_dynamo_cfg(self.cfg)
-        # Names these engines' placement groups apart from any other run's.
-        self._fleet_id = uuid.uuid4().hex[:8]
-        self._num_gpus_per_node = cluster.num_gpus_per_node
-        self._port_range_low = cluster.port_range_low
-        self._port_range_high = cluster.port_range_high
-        self._node_resource_constraints = cluster.node_resource_constraints
+        # The shared inference cluster; the engines' placed clusters are cached on it.
+        self._inference_cluster: Optional[RayVirtualCluster] = cluster
         # Bounds the refit calls (pause and resume by their timeout_s, which
         # defaults to this, one deadline per call) and every endpoint and
         # shutdown call to an engine's workers.
@@ -610,6 +674,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         state = self.__dict__.copy()
         state["_engines"] = []
         state["_clusters"] = []
+        state["_inference_cluster"] = None
         state["_tokenizer"] = None
         state["_dynamo_runtime"] = None
         state["_is_client_copy"] = True
@@ -1257,16 +1322,10 @@ class MegatronDynamoGeneration(GenerationInterface):
         for role in roles:
             if role not in distinct_roles:
                 distinct_roles.append(role)
-        # Which pinned inference node each engine takes, when the shared
-        # inference cluster has node pins; the same tiling the NeMo-Gym server
-        # reservation used, so a reserved port sits on its engine's node.
-        constraints = self._node_resource_constraints
-        pin_index_by_engine = engine_node_pins(
-            roles,
-            widths,
-            num_gpus_per_node=self._num_gpus_per_node,
-            num_pinned_nodes=None if constraints is None else len(constraints),
-        )
+        # The engines' placed clusters, shared with the NeMo-Gym reservation
+        # (which pinned each engine's port holder to bundle zero of its cluster).
+        assert self._inference_cluster is not None, "a copy owns no engines"
+        clusters = engine_clusters(self._inference_cluster, self._policy_config)
         # Each role's engines are built from the policy config with that
         # role and its layout overrides.
         policy_config_by_role: dict[str, dict[str, Any]] = {}
@@ -1281,27 +1340,8 @@ class MegatronDynamoGeneration(GenerationInterface):
             instance_id = f"{role}-{ordinal}"
             width = widths[role]
             engine_policy_config = cast("PolicyConfig", policy_config_by_role[role])
-            cluster = RayVirtualCluster(
-                name=f"dynamo_{self._fleet_id}_{instance_id}",
-                bundle_ct_per_node_list=[width],
-                use_gpus=True,
-                num_gpus_per_node=self._num_gpus_per_node,
-                max_colocated_worker_groups=1,
-                port_range_low=self._port_range_low,
-                port_range_high=self._port_range_high,
-                node_resource_constraints=(
-                    None
-                    if constraints is None
-                    else [constraints[pin_index_by_engine[engine_index]]]
-                ),
-            )
+            cluster = clusters[engine_index]
             self._clusters.append(cluster)
-            # Reserved the way the engine will reserve them (always PACK,
-            # since Dynamo engines are never colocated; idempotent), so a
-            # split engine fails before any worker is scheduled.
-            MegatronGeneration.init_cluster_placement_groups(
-                cluster, engine_policy_config
-            )
             node_ip = self._engine_node_ip(cluster, instance_id)
             # The engine's rank zero (its single model-parallel coordinator)
             # serves NeMo-Gym on the port reserved for this engine, if any.
@@ -1428,6 +1468,8 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._engines.clear()
         self._clusters.clear()
         self._endpoints_started = False
+        if self._inference_cluster is not None:
+            forget_engine_clusters(self._inference_cluster)
         # After the engines: they leave discovery as their processes exit.
         runtime, self._dynamo_runtime = self._dynamo_runtime, None
         if runtime is not None:
