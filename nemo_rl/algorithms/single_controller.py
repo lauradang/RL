@@ -2369,6 +2369,28 @@ class SingleControllerActor:
         if errors:
             raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
 
+    async def _log_inference_request_metrics(self) -> None:
+        """Log serving latencies of the requests the engines finished this step. Never raises.
+
+        TTFT, TPOT, queue wait and end-to-end latency per engine role; each
+        call drains the engines, so the window is the time since the last step.
+        """
+        with metrics_never_fail_the_step(self._train_steps):
+            metrics = await asyncio.to_thread(self._gen.get_inference_request_metrics)
+            if not metrics:
+                return
+            summary = {
+                name: round(value, 4)
+                for name, value in metrics.items()
+                if name.endswith(
+                    ("ttft_s_p50", "tpot_s_p50", "queue_s_p50", "busy_frac")
+                )
+            }
+            print(f"inference_request_metrics={summary}", flush=True)
+            self._logger.log_metrics(
+                metrics, step=self._train_steps, prefix="inference"
+            )
+
     def _log_data_plane_metrics(self, total_step_time: float) -> None:
         """Log this step's data-plane cost. Never raises.
 
@@ -4160,6 +4182,7 @@ class SingleControllerActor:
             # the wandb step, and wandb silently discards anything logged
             # against a step it has already committed -- no exception, no
             # failed return, just an empty chart. grpo_sync had the same bug.
+            await self._log_inference_request_metrics()
             self._log_data_plane_metrics(total_time)
             # step_finished=True here since this is the final log of our current step.
             self._logger.log_metrics(

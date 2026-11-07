@@ -42,6 +42,10 @@ from nemo_rl.models.generation.megatron.dynamo_config import (
     engine_widths,
     replica_width,
 )
+from nemo_rl.models.generation.megatron.request_timings import (
+    DRAIN_TIMEOUT_S,
+    summarize_request_timings,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -425,6 +429,22 @@ class MegatronGeneration(GenerationInterface):
         """
         leader_idx = self.worker_group.get_dp_leader_worker_idx(shard_idx)
         return self.worker_group.workers[leader_idx].is_alive.remote()
+
+    def get_inference_request_metrics(self) -> dict[str, float]:
+        """Serving latencies from every engine's coordinator rank (one per DP shard)."""
+        group = self.worker_group
+        drained = ray.get(
+            [
+                group.workers[
+                    group.get_dp_leader_worker_idx(shard)
+                ].drain_request_timings.remote()
+                for shard in range(group.dp_size)
+            ],
+            timeout=DRAIN_TIMEOUT_S,
+        )
+        return summarize_request_timings(
+            {"aggregated": [engine for engine in drained if engine is not None]}
+        )
 
     def init_collective(
         self,

@@ -90,6 +90,7 @@ from nemo_rl.models.generation.megatron.config import (
     MultimodalPromptConfigOverrides,
     resolve_refit_execution_batch_bytes,
 )
+from nemo_rl.models.generation.megatron.request_timings import RequestTimingRecorder
 from nemo_rl.models.generation.megatron.utils import (
     build_image_preprocessing_config,
     build_prompt_and_multimodal_data,
@@ -360,6 +361,7 @@ class MegatronGenerationMixin:
         self._request_prompt_preparer = None
         # True between pause_for_refit and the suspend that follows it.
         self._inference_engine_paused = False
+        self._request_timings = None
 
     def _inference_config_overrides(self) -> dict[str, Any]:
         """Extra ``InferenceConfig`` kwargs; the plain engine needs none."""
@@ -783,6 +785,9 @@ class MegatronGenerationMixin:
         )
         self.dynamic_inference_engine = self._build_dynamic_inference_engine(
             text_generation_controller, self.inference_context
+        )
+        self._request_timings = RequestTimingRecorder.attach(
+            self.dynamic_inference_engine
         )
 
         self._inference_engine_initialized = True
@@ -1257,6 +1262,16 @@ class MegatronGenerationMixin:
             pixel_dtype=pixel_dtype,
             patch_size=int(self._image_preprocessing_config.patch_dim),
         )
+
+    def drain_request_timings(self) -> Optional[dict[str, Any]]:
+        """Per-request latencies the engine finished since the last drain.
+
+        None before the engine exists. Only the engine's coordinator rank
+        records, so other ranks return empty rows.
+        """
+        if self._request_timings is None:
+            return None
+        return self._request_timings.drain()
 
     def set_rollout_weight_version(self, version: int) -> None:
         """Stamp subsequent MInf requests with the trainer weight version."""

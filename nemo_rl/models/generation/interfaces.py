@@ -808,6 +808,15 @@ class GenerationInterface(ABC):
         """
         pass
 
+    def get_inference_request_metrics(self) -> dict[str, float]:
+        """Per-request serving latencies since the previous call, as flat scalars.
+
+        Keys are ``<role>/<metric>`` (for example ``aggregated/ttft_s_p50``);
+        each call starts a new window. Default implementation returns an empty
+        dict.
+        """
+        return {}
+
     def get_logger_metrics(self) -> dict[str, Any]:
         """Get logger metrics for performance reporting.
 
