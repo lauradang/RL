@@ -1,0 +1,19 @@
+sequenceDiagram
+  autonumber
+  participant SC as SingleController<br/>(VllmGeneration)
+  participant FE as Dynamo frontend<br/>(KV router)
+  participant DW as Dynamo Worker task<br/>(in the shard's actor)
+  participant NE as ★ DynamoVllmAdapter<br/>(was NativeVllmEngine)
+  participant LLM as AsyncLLM
+  SC->>FE: POST /v1/completions<br/>token ids + nvext annotation nemo_rl:rollout{greedy, stop_strings}
+  FE->>DW: one leg, to the engine with the best prefix overlap
+  DW->>NE: generate(request)
+  rect rgb(252, 228, 236)
+  Note over DW,NE: ★ updated 12 Nov: the shared DynamoEngineAdapter in engine_adapter.py<br/>dispatches to the backend serve_rollout(), for vLLM DynamoVllmAdapter
+  end
+  NE->>LLM: serve_rollout() → host._serve_rollout(TokensPrompt)<br/>(the method native generate_async calls)
+  LLM-->>NE: RolloutResult: tokens, logprobs, routed experts
+  NE-->>DW: one chunk, engine_data{rollout, gen_leader_worker_idx}
+  DW-->>FE: stream
+  FE-->>SC: completion + nvext.engine_data
+  Note over SC: rollout_output(rollout_result_from_wire(...))<br/>same GenerationOutputSpec as native

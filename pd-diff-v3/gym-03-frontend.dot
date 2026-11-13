@@ -1,0 +1,71 @@
+digraph G {
+  graph [rankdir=TB, fontname="Helvetica", nodesep=0.4, ranksep=0.5, pad=0.3, newrank=true, compound=true];
+  node  [fontname="Helvetica", fontsize=13, shape=box, style="rounded,filled", fillcolor="#ffffff", color="#333333", penwidth=1.4];
+  edge  [fontname="Helvetica", fontsize=11, color="#333333", penwidth=1.3];
+
+  subgraph cluster_sc {
+    label=<<b>SingleController</b> · NeMo RL driver>; style="rounded,filled"; fillcolor="#F7F7F7"; color="#777777";
+    RA [label=<<b>RolloutReassembler</b> · token sink<br/><font point-size="11">⑪ reads the captured token rows from the data plane<br/>by commit coordinates and builds the training batch</font>>, fillcolor="#FDEEE9", color="#D94F30"];
+    SETUP [label=<<b>setup.py</b> · startup<br/><font point-size="11">Ⓐ builds VllmGeneration with the model load deferred,<br/>takes <b>client_base_urls</b> = the frontend URL (known before any engine),<br/>Ⓑ puts the Gym dialect into env.nemo_gym (<b>_apply_dynamo_dialect</b>)</font>>, fillcolor="#FDEEE9", color="#D94F30"];
+    VG [label=<<b>VllmGeneration</b> (dynamo=true)<br/><font point-size="11">owns ManagedDynamoRuntime (etcd + NATS + frontend)<br/>and the one RayWorkerGroup of DP shards</font>>, fillcolor="#E6F4EA", color="#2E7D32"];
+  }
+
+  subgraph cluster_gym {
+    label=<<b>NeMo-Gym</b> · agent + environment actors (NeMo RL launches them)>; style="rounded,filled"; fillcolor="#FDEEE9"; color="#D94F30";
+    GYM [label=<<b>policy_model: vllm_model</b> in Gym's Dynamo dialect (Gym#4817)<br/><font point-size="11">dynamo_frontend: true · reasoning_field: reasoning_content<br/>base_url = the frontend · token-capture backend <b>dynamo_worker</b><br/><font color="#C2185B">★ Gym's extras (echoed prefix or capture admission) in ONE</font><br/><font color="#C2185B">nemo_rl:gym: annotation (GymCallExtras); results read from nvext.nemo_rl</font></font>>, fillcolor="#ffffff", color="#C2185B", penwidth=3.5];
+  }
+
+  subgraph cluster_fe {
+    label=<★ <b>Dynamo frontend process</b> · started as nemo_rl.models.generation.dynamo.vllm.frontend>; style="rounded,filled"; fillcolor="#F1F8FB"; color="#C2185B"; penwidth=3.5;
+    FE [label=<<b>dynamo.frontend</b> (Rust HTTP server + KV router)<br/><font point-size="11">/v1/completions (NeMo RL's own rollouts) unchanged<br/><font color="#C2185B">★ every chat call goes to NeMo RL's chat engine (chat_engine_factory),</font><br/><font color="#C2185B">not Dynamo's Rust renderer and parsers</font><br/>x-dynamo-session-id keeps a rollout on one engine (session_affinity_ttl_secs)</font>>, fillcolor="#E4F2F7", color="#2A7B9B"];
+    CE [label=<★ <b>NemoRLChatEngine</b> (dynamo/vllm/chat_engine.py) · NeMo RL<br/><font point-size="11">③ checks GymCallExtras and on-policy sampling<br/>⑤ prepares the prompt as natively (prepare_prompt):<br/>reads the captured prefix from TQ, splices it at the model's turn ends,<br/>clamps max_tokens to the context · ng_measure answered here (no engine)<br/>⑥ routes the final token ids through the KV router, capture plan in extra_args</font>>, fillcolor="#E6F4EA", color="#C2185B", penwidth=3.5];
+    RP [label=<★ <b>RenderPool</b> (dynamo/vllm/render_pool.py) · spawned processes<br/><font point-size="11">built from the engine args + vllm_cfg each engine publishes at registration<br/>④ render: vLLM's own chat template, video loader, capture decision<br/>⑨ respond: vLLM's reasoning + tool parsers build the reply<br/>frontend_args.render_workers (default 8)</font>>, fillcolor="#FDF5E0", color="#C2185B", penwidth=3.5];
+  }
+
+  subgraph cluster_eng {
+    label=<<b>vLLM DP-leader actor</b> (VllmAsyncGenerationWorkerImpl) · one per shard>; style="rounded,filled"; fillcolor="#F4FAF7"; color="#2D8B55";
+    WK [label=<<b>Dynamo Worker task</b> (backend SDK)<br/><font point-size="11">on the actor's event loop · start_dynamo_endpoint</font>>, fillcolor="#E4F2F7", color="#2A7B9B"];
+    NE [label=<★ <b>DynamoVllmAdapter</b> (dynamo/vllm/adapter.py)<br/><font point-size="11">on the shared DynamoEngineAdapter (dynamo/engine_adapter.py)<br/><font color="#C2185B">receives token ids only: render, splice and clamp now happen in the frontend</font><br/>⑦ Gym handler: media snapshot · begin_call · sample with the<br/>SamplingParams vLLM's chat serving built · sampler top-k · routes<br/>⑧a no capture: token fields back · ⑧b capture: ONE TQ write, commit coordinates back</font>>, fillcolor="#E6F4EA", color="#C2185B", penwidth=3.5];
+    LLM [label=<<b>AsyncLLM</b> (vLLM)<br/><font point-size="11">⑦ generate · multimodal processor</font>>, fillcolor="#FDF5E0", color="#D4A843"];
+    CAP [label=<<b>vLLM worker capture lifecycle</b><br/><font point-size="11">begin_call → stage → TQ write<br/>(the same path the native /v1/chat endpoint uses)</font>>, fillcolor="#FDEEE9", color="#D94F30"];
+  }
+
+  DP [label=<<b>Data plane</b> · TransferQueue / storage units<br/><font point-size="11">captured token rows, written from the engine process;<br/><font color="#C2185B">★ the chat engine also reads captured prefixes from here (⑤)</font><br/>⑪ the RolloutReassembler reads rows by commit coordinates</font>>, fillcolor="#FDEEE9", color="#C2185B", penwidth=3.5];
+
+  subgraph cluster_mg {
+    label=<<b>Megatron target</b> · rank-0 actor of a prefill or decode engine (PR 5025)>; style="rounded,dashed"; color="#888888"; fontcolor="#666666";
+    MWK [label=<<b>Dynamo Worker task</b><br/><font point-size="11">same hosting as vLLM</font>>, fillcolor="#E4F2F7", color="#2A7B9B"];
+    MLE [label=<<b>MegatronLLMEngine</b> adapter (Megatron-LM)<br/><font point-size="11">serves token-id /v1/completions for NeMo RL's own rollouts only</font>>, fillcolor="#FDF5E0", color="#D4A843"];
+    GAP [label=<★ <b>missing: the Megatron halves</b><br/><font point-size="11">frontend: a Megatron renderer + parsers in the render pool<br/>(the frontend process loads vLLM's chat code for every fleet today)<br/>engine: a DynamoEngineAdapter subclass under dynamo/megatron/<br/>with a Gym handler (capture via Megatron's capture object)<br/>listed by #4979 as a follow-up · P/D two-leg under one Gym call</font>>, style="rounded,dashed,filled", fillcolor="#F2F2F2", color="#C2185B", penwidth=3, fontcolor="#555555"];
+  }
+
+  LEG [label=<<font color="#C2185B">★ magenta = changed since the 5 Nov version: #4979 was redesigned on 7 Nov (updated 12 Nov)</font>>, shape=plaintext, style=""];
+
+  { rank=same; RA; SETUP; VG; }
+  { rank=same; WK; MWK; }
+  { rank=same; NE; MLE; }
+  { rank=same; LLM; CAP; GAP; }
+  RA -> SETUP [style=invis]; SETUP -> VG [style=invis];
+  WK -> MWK [style=invis, weight=5];
+
+  SETUP -> GYM [label=" Ⓒ Gym actors start with the frontend URL\n and the patched policy_model", color="#D94F30", fontcolor="#D94F30"];
+  VG -> FE [label=" starts; waits for every shard\n to register (wait_for_engines)", color="#D94F30", fontcolor="#D94F30", lhead=cluster_fe];
+  VG -> WK [label=" start_dynamo_endpoint_async\n (per DP leader)", style=dashed, color="#2E7D32", fontcolor="#2E7D32"];
+
+  GYM -> FE [dir=both, weight=3, label=" ② POST /v1/chat/completions\n messages + nemo_rl:gym: annotation\n header x-dynamo-session-id\n ⑩ reply: content, reasoning_content,\n nvext.nemo_rl (token fields or\n commit coordinates)", color="#2A7B9B", fontcolor="#2A7B9B", penwidth=2];
+  FE -> CE [label=" ③ chat call", color="#C2185B", fontcolor="#C2185B", penwidth=2];
+  CE -> RP [dir=both, label=" ④ render\n ⑨ respond", color="#C2185B", fontcolor="#C2185B", penwidth=2];
+  CE -> DP [label=" ⑤ read captured prefix", color="#C2185B", fontcolor="#C2185B", style=dashed, constraint=false];
+  CE -> WK [dir=both, label=" ⑥ token ids + capture plan\n (KV-routed, session affinity)\n ⑧ one chunk back", color="#C2185B", fontcolor="#C2185B", penwidth=2];
+  WK -> NE [label=" ⑦"];
+  NE -> LLM [label=" ⑦ chat-serving\n SamplingParams"];
+  LLM -> NE [label=" tokens, logprobs", style=dashed];
+  NE -> CAP [label=" ⑧b begin / stage\n (captured calls only)", color="#D94F30", fontcolor="#D94F30"];
+  CAP -> DP [label=" one TQ write", color="#D94F30", fontcolor="#D94F30", penwidth=2];
+  GYM -> RA [label=" ⑪ finished rollout + reward\n (+ commit coordinates when captured)", color="#D94F30", fontcolor="#D94F30", constraint=false];
+
+  CE -> MWK [label=" ⑥' the same token ids,\n routed to a Megatron engine", style=dashed, color="#888888", fontcolor="#666666"];
+  MWK -> MLE [style=dashed, color="#888888"];
+  MLE -> GAP [label=" would need", style=dashed, color="#888888", fontcolor="#666666"];
+  GAP -> LEG [style=invis];
+}

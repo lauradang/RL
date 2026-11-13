@@ -1,0 +1,65 @@
+digraph G {
+  graph [rankdir=TB, fontname="Helvetica", nodesep=0.45, ranksep=0.5, pad=0.3, newrank=true, compound=true];
+  node  [fontname="Helvetica", fontsize=13, shape=box, style="rounded,filled", fillcolor="#ffffff", color="#333333", penwidth=1.4];
+  edge  [fontname="Helvetica", fontsize=11, color="#333333", penwidth=1.3];
+
+  subgraph cluster_sc {
+    label=<<b>SingleController</b> · NeMo RL driver>; style="rounded,filled"; fillcolor="#F7F7F7"; color="#777777";
+    VG [label=<<b>VllmGeneration</b> (dynamo=true)<br/><font point-size="11">the trainer's generation object · owns the two below<br/>refit calls go straight to its worker group · posts rollouts to the frontend</font>>, fillcolor="#E6F4EA", color="#2E7D32"];
+    RT [label=<<b>ManagedDynamoRuntime</b><br/><font point-size="11">etcd + NATS + frontend processes</font>>, fillcolor="#FDEEE9", color="#D94F30"];
+    WG [label=<<b>RayWorkerGroup</b> · the one it always had<br/><font point-size="11">every DP shard, same TP×PP · actor handles + per-shard leader<br/>no fleet and no per-engine client: one group already covers all shards</font>>, fillcolor="#FDEEE9", color="#D94F30"];
+  }
+
+  FE [label=<<b>Dynamo frontend</b> · KV-aware router<br/><font point-size="11">① HTTP request from VllmGeneration (generate_async)</font><br/><font point-size="11">② picks ONE engine by prefix-cache overlap</font>>, fillcolor="#E4F2F7", color="#2A7B9B"];
+  TR [label=<<b>Trainer</b> (NeMo RL)>, fillcolor="#FDEEE9", color="#D94F30"];
+
+  subgraph cluster_0 {
+    label=<<b>vLLM shard 0</b> · one Ray actor per TP rank (NeMo RL)>; style="rounded,filled"; fillcolor="#FDF8F6"; color="#D94F30";
+    W0 [label="leader actor also runs:\nDynamo Worker task (dynamo.common.backend)", fillcolor="#E4F2F7", color="#2A7B9B"];
+    N0 [label=<★ <b>DynamoVllmAdapter</b><br/><font point-size="11">vLLM half of the shared DynamoEngineAdapter<br/>(was NativeVllmEngine) · in-process</font>>, fillcolor="#E6F4EA", color="#C2185B", penwidth=3.5];
+    E0 [label="AsyncLLM\n(the worker's own vLLM engine)", fillcolor="#FDF5E0", color="#D4A843"];
+  }
+  subgraph cluster_1 {
+    label=<<b>vLLM shard 1</b> · same shape>; style="rounded,filled"; fillcolor="#F4FAF7"; color="#2D8B55";
+    W1 [label="Dynamo Worker task", fillcolor="#E4F2F7", color="#2A7B9B"];
+    N1 [label="★ DynamoVllmAdapter", fillcolor="#E6F4EA", color="#C2185B", penwidth=3.5];
+    E1 [label="AsyncLLM", fillcolor="#FDF5E0", color="#D4A843"];
+  }
+  { rank=same; FE; VG; }
+  { rank=same; RT; WG; }
+  { rank=same; W0; W1; }
+  { rank=same; N0; N1; }
+  { rank=same; E0; E1; }
+  FE -> VG [style=invis, weight=0];
+  RT -> WG [style=invis];
+  W0 -> W1 [style=invis, weight=10]; N0 -> N1 [style=invis, weight=10]; E0 -> E1 [style=invis, weight=10];
+
+  GONE [label=<<s>prefill / decode legs · coordinator · adapter sidecar</s><br/><s>CLAIM_KV / RELEASE_KV · KV over NIXL · DynamoGeneration</s><br/><font point-size="11">none of this exists on the new base</font>>, fillcolor="#F2F2F2", color="#9E9E9E", style="rounded,filled,dashed", fontcolor="#777777"];
+
+  VG -> RT [label=" starts"];
+  VG -> WG [label=" owns; suspend / resume /\n init_collective / update_weights"];
+  RT -> FE [constraint=false, label=" owns", color="#D94F30", fontcolor="#D94F30"];
+  VG -> FE [constraint=false, label=" ① rollouts (HTTP)", color="#2A7B9B", fontcolor="#2A7B9B"];
+
+  WG -> E0 [weight=0, label=" refit calls over the handles\n (every rank of every shard)", color="#D94F30", fontcolor="#D94F30", style=dashed];
+  WG -> W0 [weight=2, label=" at startup (per DP leader):\n start_dynamo_endpoint_async\n then wait_for_engines", color="#2E7D32", fontcolor="#2E7D32", style=dashed];
+  WG -> E1 [weight=0, label="", color="#D94F30", fontcolor="#D94F30", style=dashed];
+  WG -> W1 [weight=2, label=" start_dynamo_endpoint_async", color="#2E7D32", fontcolor="#2E7D32", style=dashed];
+
+  FE -> W0 [label=" ③ the whole rollout\n (one leg)"];
+  W0 -> N0 [label=" ④ generate(request)"];
+  N0 -> E0 [label=" ⑤ serve_rollout() → _serve_rollout()\n (same code as native)"];
+  E0 -> N0 [label=" ⑥ tokens, logprobs,\n routed experts", style=dashed];
+  N0 -> W0 [label=" ⑦ one chunk:\n engine_data", style=dashed];
+  W0 -> FE [label=" ⑧ completion → VllmGeneration\n assembles output", style=dashed, constraint=false];
+  FE -> W1 [label=" or ③'", style=dotted, color="#888888", fontcolor="#888888"];
+  W1 -> N1 -> E1 [style=dotted, color="#888888"];
+
+  TR -> E0 [label=" refit: native NCCL weights\n (every train step, unchanged)", penwidth=3, color="#D94F30", fontcolor="#D94F30", constraint=false];
+  TR -> E1 [penwidth=3, color="#D94F30", fontcolor="#D94F30", constraint=false];
+  E0 -> TR [style=invis];
+  E1 -> TR [style=invis];
+  GONE -> FE [style=invis];
+  LEG [label=<<font color="#C2185B">★ magenta border = changed since the 5 Nov version (updated 12 Nov)</font>>, shape=plaintext, style=""];
+  GONE -> LEG [style=invis];
+}

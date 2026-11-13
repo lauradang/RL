@@ -1,0 +1,21 @@
+sequenceDiagram
+  autonumber
+  participant SU as setup_single_controller
+  participant VG as VllmGeneration
+  participant RT as ManagedDynamoRuntime
+  participant WK as vLLM workers (per DP leader)
+  participant DWk as Dynamo Worker task
+  participant WS as CollectiveWeightSynchronizer
+  SU->>VG: build (backend: vllm, dynamo: true)
+  VG->>RT: start() → etcd, NATS, dynamo.frontend (workers' venv)
+  VG->>WK: build worker group exactly as native (+ kv_events_config, SnapshotStatLogger)
+  loop each DP leader
+    VG->>WK: start_dynamo_endpoint_async(namespace, engine_env)
+    rect rgb(252, 228, 236)
+    WK->>DWk: ★ start_dynamo_endpoint(DynamoVllmAdapter(host))<br/>→ Worker(adapter, config).run() on the actor loop
+    end
+    DWk->>RT: register in etcd (component backend / endpoint generate)
+  end
+  VG->>RT: wait_for_engines(dp_size): /health instances + model on /v1/models
+  Note over VG,RT: every poll also asks each leader dynamo_endpoint_error()
+  SU->>WS: init_communicator → native NCCL group (unchanged)
