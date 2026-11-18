@@ -220,6 +220,10 @@ policy:
       tensor_model_parallel_size: 2
 ```
 
+For hybrid (Mamba) models, `mcore_generation_config.prefix_caching_mamba_gb`
+sets the Mamba prefix-cache budget of the prefill engines only. Decode engines
+always run without one: they import each handoff straight into live SSM state.
+
 With `T` trainer ranks, the refit collective places the trainer ranks first,
 then the engines in launch order, each starting where the previous one ended:
 the prefill engine at `T..T+3`, the decode engines at `T+4..T+5` and
