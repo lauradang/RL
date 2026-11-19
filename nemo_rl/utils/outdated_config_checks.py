@@ -247,6 +247,9 @@ def reject_outdated_dynamo_backend(config: dict[str, Any]) -> None:
     dynamo_cfg = generation.get("dynamo_cfg")
     if isinstance(dynamo_cfg, dict):
         for key, replacement in _REMOVED_DYNAMO_CFG_KEYS.items():
+            # Megatron engines behind Dynamo keep their own control_timeout_s.
+            if key == "control_timeout_s" and generation.get("backend") == "megatron":
+                continue
             if key in dynamo_cfg:
                 problems.append(
                     f"policy.generation.dynamo_cfg.{key} was removed: {replacement}."
