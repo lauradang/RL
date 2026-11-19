@@ -242,6 +242,11 @@ def merged_inference_megatron_cfg(
         "activation_checkpointing": False,
         "context_parallel_size": 1,
     }
+    # MCore rejects sequence parallelism (SP) without tensor parallelism (TP).
+    # A generation layout at TP=1 can still inherit SP from a TP>1 training
+    # layout (or from a shared layout other TP>1 engines use), so turn it off.
+    if merged["tensor_model_parallel_size"] == 1:
+        merged["sequence_parallel"] = False
     # inference_optimized layers hard-require SP with TP>1. Raise with the
     # config key: the colocated build bypasses validate_and_set_config, so this
     # merge is the only spot the inference cfg gets a named error instead of a

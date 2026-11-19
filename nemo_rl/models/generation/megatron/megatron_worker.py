@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 import gc
 import importlib
 import logging
@@ -90,6 +91,7 @@ from nemo_rl.models.generation.megatron.config import (
     MultimodalPromptConfigOverrides,
     resolve_refit_execution_batch_bytes,
 )
+from nemo_rl.models.generation.megatron.request_timings import RequestTimingRecorder
 from nemo_rl.models.generation.megatron.utils import (
     build_image_preprocessing_config,
     build_prompt_and_multimodal_data,
@@ -360,6 +362,7 @@ class MegatronGenerationMixin:
         self._request_prompt_preparer = None
         # True between pause_for_refit and the suspend that follows it.
         self._inference_engine_paused = False
+        self._request_timings = None
 
     def _inference_config_overrides(self) -> dict[str, Any]:
         """Extra ``InferenceConfig`` kwargs; the plain engine needs none."""
@@ -783,6 +786,9 @@ class MegatronGenerationMixin:
         )
         self.dynamic_inference_engine = self._build_dynamic_inference_engine(
             text_generation_controller, self.inference_context
+        )
+        self._request_timings = RequestTimingRecorder.attach(
+            self.dynamic_inference_engine
         )
 
         self._inference_engine_initialized = True
@@ -1264,6 +1270,19 @@ class MegatronGenerationMixin:
             patch_size=int(self._image_preprocessing_config.patch_dim),
         )
 
+    def drain_request_timings(self) -> Optional[dict[str, Any]]:
+        """Per-request latencies the engine finished since the last drain.
+
+        None before the engine exists and on every rank but the engine's
+        coordinator, which is the only one that records; an empty drain from
+        another rank would count as an idle engine.
+        """
+        if self._request_timings is None or not getattr(
+            self.dynamic_inference_engine, "is_mp_coordinator", False
+        ):
+            return None
+        return self._request_timings.drain()
+
     def set_rollout_weight_version(self, version: int) -> None:
         """Stamp subsequent MInf requests with the trainer weight version."""
         if type(version) is not int or version < 0:
@@ -1605,6 +1624,10 @@ class MegatronGenerationMixin:
 class MegatronGenerationRefitMixin:
     """Refit collective, weight transfer, and engine suspend/resume around refits."""
 
+    # How long the receiving side waits for its engine loop to reach the refit
+    # hold (NRL_FREEZE_ENGINE_LOOP_ON_REFIT=1) before copying without it.
+    _engine_loop_hold_wait_s: float = 5.0
+
     def _init_generation_refit_state(self) -> None:
         """Reset every refit attribute to its unprepared state.
 
@@ -1720,10 +1743,23 @@ class MegatronGenerationRefitMixin:
                 nccl_store, global_rank, world_size, nccl_options
             )
             nccl_backend._set_sequence_number_for_group()
-            # Create the group-wide NCCL communicator now, on every rank.
-            nccl_backend.eager_connect_single_device(
-                torch.device("cuda", torch.cuda.current_device())
-            )
+            # NCCLCopyService connects on its first run, including idle ranks.
+            # Connecting here as well can reuse stale scalable-rendezvous IDs
+            # in large refit groups and fail with connection refused. Keep
+            # eager initialization for M2N, which has no first-run hook.
+            # Set NRL_MCORE_NCCL_SINGLE_INIT=0 to restore the old NCCL behavior.
+            # (Local patch carried from orybakov's 961 pipeline; not on main.)
+            single_init = os.environ.get("NRL_MCORE_NCCL_SINGLE_INIT", "1") != "0"
+            if refit_backend == "nccl_m2n" or not single_init:
+                nccl_backend.eager_connect_single_device(
+                    torch.device("cuda", torch.cuda.current_device())
+                )
+            if global_rank == 0:
+                logging.getLogger(__name__).info(
+                    "MCore refit backend=%s NRL_MCORE_NCCL_SINGLE_INIT=%s",
+                    refit_backend,
+                    int(single_init),
+                )
             pg._register_backend(
                 torch.device("cuda"),
                 ProcessGroup.BackendType.NCCL,
@@ -1799,17 +1835,62 @@ class MegatronGenerationRefitMixin:
         if self.refit_execution_batch_bytes is None:
             raise RuntimeError("Native MCore refit was not initialized.")
 
-        swap_model_weights(
-            src_model,
-            dst_model,
-            refit_method=self.refit_copy_service,
-            group=self.refit_pg,
-            src_rank_offset=0,
-            dst_rank_offset=self.refit_dst_rank_offset,
-            execution_batch_bytes=self.refit_execution_batch_bytes,
-        )
+        with self._engine_loop_held(enabled=not is_source):
+            swap_model_weights(
+                src_model,
+                dst_model,
+                refit_method=self.refit_copy_service,
+                group=self.refit_pg,
+                src_rank_offset=0,
+                dst_rank_offset=self.refit_dst_rank_offset,
+                execution_batch_bytes=self.refit_execution_batch_bytes,
+            )
 
         return True
+
+    @contextlib.contextmanager
+    def _engine_loop_held(self, *, enabled: bool):
+        """Hold the engine's event loop still for the weight copy (opt-in).
+
+        Set ``NRL_FREEZE_ENGINE_LOOP_ON_REFIT=1`` to turn it on. The suspended
+        engine loop, and anything else served from ``_inference_loop`` (the
+        HTTP server, a Dynamo worker, the NeMo-Gym proxy), keeps waking up and
+        taking the GIL from the thread that queues the copy, which can make
+        the copy many times slower. Megatron's own RL loop copies while its
+        engine loop is not running; this does the same by parking the loop
+        thread on an event, which releases the GIL, until the copy is done.
+        """
+        # Training workers share this mixin and never start an engine loop.
+        loop = getattr(self, "_inference_loop", None)
+        if (
+            not enabled
+            or loop is None
+            or os.environ.get("NRL_FREEZE_ENGINE_LOOP_ON_REFIT") != "1"
+        ):
+            yield
+            return
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold() -> None:
+            held.set()
+            release.wait()
+
+        loop.call_soon_threadsafe(hold)
+        # A tensor-parallel rank other than zero can be inside a step
+        # collective that waits on a rank already held, so it never reaches the
+        # hold. Copy with its loop running after a short wait rather than
+        # stalling the refit.
+        if not held.wait(timeout=self._engine_loop_hold_wait_s):
+            print(
+                f"[Rank {self.rank}] engine loop did not reach the refit hold "
+                f"within {self._engine_loop_hold_wait_s} s; copying with it running",
+                flush=True,
+            )
+        try:
+            yield
+        finally:
+            release.set()
 
     def init_nccl_reshard_comm_groups_generation(
         self,

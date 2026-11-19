@@ -68,6 +68,10 @@ from nemo_rl.models.generation.megatron.dynamo_rollouts import (
     generate_through_frontend,
 )
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
+from nemo_rl.models.generation.megatron.request_timings import (
+    DRAIN_TIMEOUT_S,
+    summarize_request_timings,
+)
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
@@ -333,6 +337,9 @@ class MegatronDynamoEngine:
 
     def liveness_ref(self) -> ray.ObjectRef:
         return self.leader.is_alive.remote()
+
+    def drain_request_timings(self) -> ray.ObjectRef:
+        return self.leader.drain_request_timings.remote()
 
 
 class MegatronDynamoGeneration(GenerationInterface):
@@ -676,6 +683,19 @@ class MegatronDynamoGeneration(GenerationInterface):
     def num_engines(self) -> int:
         """How many engines run, each a refit shard of its own."""
         return len(self._engine_records)
+
+    def get_inference_request_metrics(self) -> dict[str, float]:
+        """Serving latencies per role (``prefill``, ``decode``) across every engine."""
+        records = self._engine_records
+        drained = ray.get(
+            [record.drain_request_timings() for record in records],
+            timeout=DRAIN_TIMEOUT_S,
+        )
+        by_role: dict[str, list[dict[str, Any]]] = {}
+        for record, engine in zip(records, drained):
+            if engine is not None:
+                by_role.setdefault(record.role, []).append(engine)
+        return summarize_request_timings(by_role)
 
     def _prefill_indices(self) -> list[int]:
         return [

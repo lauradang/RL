@@ -425,6 +425,30 @@ class TestFortyNodeScenario:
         with pytest.raises(ValueError, match="must be divisible by"):
             select_segment_nodes(forty_node_topology, segment_size=8, num_nodes=25)
 
+    def test_constraints_pin_the_selected_nodes_not_just_their_domain(
+        self, monkeypatch
+    ):
+        # Inference and the nodes left after it share one domain, so the domain
+        # alone would let an inference placement group take a leftover node.
+        topology = _make_topology({"domain_A": list(range(4))})
+        ips = {nid: f"10.0.0.{index}" for index, nid in enumerate(sorted(topology))}
+        monkeypatch.setattr(virtual_cluster.ray, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            virtual_cluster.ray,
+            "nodes",
+            lambda: [
+                {"NodeID": nid, "NodeManagerAddress": ip, "Alive": True}
+                for nid, ip in ips.items()
+            ],
+        )
+        constraints, remaining, _ = virtual_cluster.prepare_segment_topology(
+            2, 2, topology=topology, role="inference"
+        )
+        selected = [nid for nid in sorted(topology) if nid not in remaining]
+        assert constraints == [
+            {"domain_A": 0.001, f"node:{ips[nid]}": 0.001} for nid in selected
+        ]
+
     def test_inference_nodes_not_divisible_by_instance_size_is_skipped(
         self, forty_node_topology
     ):

@@ -34,10 +34,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import heapq
 import importlib
+import itertools
 import logging
+import os
 import socket
 import time
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -257,6 +261,48 @@ def failed_record(
     }
 
 
+class _GroupOrderedGate:
+    """Caps in-flight frontend calls and releases waiters oldest prompt group first.
+
+    Diagnostic for NRL_DYNAMO_GROUP_GATE_LIMIT: answers to one prompt share a
+    group key (a hash of the prompt tokens), and groups are ranked by when this
+    proxy first saw them, so a group's answers reach the frontend together.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._active = 0
+        self._waiters: list = []
+        self._group_rank: dict[int, int] = {}
+        self._arrival = itertools.count()
+
+    def _rank(self, prompt_token_ids: list[int]) -> int:
+        key = zlib.crc32(repr(prompt_token_ids).encode())
+        return self._group_rank.setdefault(key, len(self._group_rank))
+
+    async def acquire(self, prompt_token_ids: list[int]) -> None:
+        rank = self._rank(prompt_token_ids)
+        if self._active < self._limit and not self._waiters:
+            self._active += 1
+            return
+        future = asyncio.get_running_loop().create_future()
+        heapq.heappush(self._waiters, (rank, next(self._arrival), future))
+        try:
+            await future
+        except asyncio.CancelledError:
+            if future.done() and not future.cancelled():
+                self.release()
+            raise
+
+    def release(self) -> None:
+        while self._waiters:
+            _, _, future = heapq.heappop(self._waiters)
+            if not future.done():
+                future.set_result(None)
+                return
+        self._active -= 1
+
+
 class FrontendInferenceClient:
     """An ``InferenceClient`` for Megatron-LM's endpoints that talks to the Dynamo frontend.
 
@@ -284,6 +330,8 @@ class FrontendInferenceClient:
         self._request_timeout_s = request_timeout_s
         self._tasks: dict[int, asyncio.Task] = {}
         self.next_request_id = 0
+        gate_limit = int(os.environ.get("NRL_DYNAMO_GROUP_GATE_LIMIT", "0"))
+        self._gate = _GroupOrderedGate(gate_limit) if gate_limit > 0 else None
 
     @property
     def completions_url(self) -> str:
@@ -416,6 +464,17 @@ class FrontendInferenceClient:
     async def _complete(
         self, request_id: int, prompt_token_ids: list[int], payload: dict[str, Any]
     ) -> dict[str, Any]:
+        if self._gate is None:
+            return await self._complete_ungated(request_id, prompt_token_ids, payload)
+        await self._gate.acquire(prompt_token_ids)
+        try:
+            return await self._complete_ungated(request_id, prompt_token_ids, payload)
+        finally:
+            self._gate.release()
+
+    async def _complete_ungated(
+        self, request_id: int, prompt_token_ids: list[int], payload: dict[str, Any]
+    ) -> dict[str, Any]:
         """One completion through the frontend, retried on transient failures."""
         started = time.perf_counter()
         response: dict[str, Any] = {}
@@ -428,14 +487,15 @@ class FrontendInferenceClient:
                 or attempt == dynamo_rollouts._HTTP_MAX_ATTEMPTS
             ):
                 break
+            delay_s = dynamo_rollouts.retry_delay_s(attempt)
             LOGGER.warning(
                 "Gym completion attempt %d/%d through the frontend failed; retrying in %.1fs: %s",
                 attempt,
                 dynamo_rollouts._HTTP_MAX_ATTEMPTS,
-                dynamo_rollouts._HTTP_RETRY_DELAY_S,
+                delay_s,
                 format_error(response),
             )
-            await asyncio.sleep(dynamo_rollouts._HTTP_RETRY_DELAY_S)
+            await asyncio.sleep(delay_s)
         if isinstance(response, dict) and response.get("status") == "error":
             return failed_record(
                 prompt_token_ids,

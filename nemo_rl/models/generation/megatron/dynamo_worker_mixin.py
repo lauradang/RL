@@ -14,6 +14,7 @@
 """Worker-side hooks for a Megatron engine served through Dynamo."""
 
 import asyncio
+import importlib
 import logging
 import os
 import uuid
@@ -64,12 +65,43 @@ class GymProxyTarget:
     request_timeout_s: Optional[float]
 
 
+def _expose_megatron_inference_package() -> None:
+    """Make ``megatron.inference`` importable from the Megatron-LM source tree.
+
+    The ``megatron-core`` distribution packages only ``megatron.core`` and
+    ``megatron.training`` (Megatron-LM's ``[tool.setuptools.packages.find]``),
+    so ``megatron.inference`` never reaches a venv's ``megatron.__path__``. The
+    editable install points ``megatron.core`` at the Megatron-LM checkout, where
+    ``megatron/inference`` sits next to ``megatron/core``; adding that directory
+    to the already-imported ``megatron`` package's search path is enough. A
+    wheel install (no source tree beside ``core``) changes nothing here.
+    """
+    import megatron
+    import megatron.core
+
+    megatron_dir = Path(megatron.core.__file__).resolve().parents[1]
+    if not (megatron_dir / "inference").is_dir():
+        return
+    package_path = getattr(megatron, "__path__", None)
+    if package_path is not None and str(megatron_dir) not in list(package_path):
+        package_path.append(str(megatron_dir))
+        importlib.invalidate_caches()
+
+
 def require_megatron_dynamo_integration() -> None:
     """Fail before model setup if this Megatron-LM cannot serve an engine behind Dynamo.
 
     The engine is only built at the first refit, after the model has loaded, so
     a missing integration would otherwise surface late.
     """
+    try:
+        import megatron.inference.integrations.dynamo.dynamic_engine  # noqa: F401
+    except ImportError:
+        # An editable megatron-core install exposes only megatron.core and
+        # megatron.training; retry with the source tree's megatron.inference.
+        _expose_megatron_inference_package()
+    else:
+        return
     try:
         import megatron.inference.integrations.dynamo.dynamic_engine  # noqa: F401
     except ImportError as e:

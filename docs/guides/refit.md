@@ -200,6 +200,8 @@ policy:
       refit_backend: nccl  # gloo | nccl | nccl_m2n (nvshmem is broken; see #3646)
 ```
 
+On the receiving engines, the copy shares the Python process with the engine's event loop (and the HTTP server or other services that run on it), which keeps waking up and taking the GIL from the thread that drives the copy. If the native refit is much slower on non-colocated engines than the transfer size suggests, set `NRL_FREEZE_ENGINE_LOOP_ON_REFIT=1` in the worker environment: each receiving rank then parks its engine loop for the length of the copy. It is off by default.
+
 For NCCL reshard with Megatron policy training and vLLM generation:
 
 ```yaml

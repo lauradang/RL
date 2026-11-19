@@ -298,6 +298,23 @@ def test_inference_optimized_pins_generation_etp_to_one() -> None:
 
 
 @pytest.mark.mcore
+def test_tp1_generation_turns_inherited_sequence_parallel_off() -> None:
+    """TP=1 generation under a TP>1 training layout with SP does not keep SP."""
+    config = deepcopy(basic_megatron_test_config)
+    config["megatron_cfg"]["tensor_model_parallel_size"] = 2
+    config["megatron_cfg"]["sequence_parallel"] = True
+    config["generation"]["mcore_generation_config"]["tensor_model_parallel_size"] = 1
+
+    merged = merged_inference_megatron_cfg(config)
+
+    assert merged["tensor_model_parallel_size"] == 1
+    assert merged["sequence_parallel"] is False
+    # TP>1 generation keeps the SP it inherits.
+    config["generation"]["mcore_generation_config"]["tensor_model_parallel_size"] = 2
+    assert merged_inference_megatron_cfg(config)["sequence_parallel"] is True
+
+
+@pytest.mark.mcore
 def test_inference_optimized_rejects_explicit_generation_etp_above_one() -> None:
     config = deepcopy(basic_megatron_test_config)
     config["generation"]["mcore_generation_config"]["transformer_impl"] = (

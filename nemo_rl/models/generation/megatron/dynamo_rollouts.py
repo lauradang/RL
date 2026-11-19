@@ -38,8 +38,13 @@ from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 
 LOGGER = logging.getLogger(__name__)
 
-_HTTP_MAX_ATTEMPTS = 3
+# A weight update pauses every engine for a few seconds, and while the prefill
+# engine is paused the frontend answers "no endpoints". Back off long enough
+# (about 90 s in total) for requests sent then to wait the update out instead
+# of failing.
+_HTTP_MAX_ATTEMPTS = 8
 _HTTP_RETRY_DELAY_S = 1.0
+_HTTP_MAX_RETRY_DELAY_S = 30.0
 _RETRYABLE_HTTP_STATUS_CODES = {408, 429}
 # The frontend caps the stop strings of one request.
 _MAX_STOP_STRINGS = 32
@@ -95,6 +100,11 @@ def format_error(response: dict[str, Any]) -> str:
     if "raw" in response:
         return str(response["raw"])
     return str(response)
+
+
+def retry_delay_s(attempt: int) -> float:
+    """Seconds to wait after failed attempt ``attempt`` (1-based), doubling each time."""
+    return min(_HTTP_RETRY_DELAY_S * 2 ** (attempt - 1), _HTTP_MAX_RETRY_DELAY_S)
 
 
 def is_retryable(response: Any) -> bool:
@@ -186,14 +196,15 @@ async def post_completion(
         response = await async_http_post_json(url, payload, timeout_s)
         if not is_retryable(response) or attempt == _HTTP_MAX_ATTEMPTS:
             break
+        delay_s = retry_delay_s(attempt)
         LOGGER.warning(
             "Dynamo completion attempt %d/%d failed; retrying in %.1fs: %s",
             attempt,
             _HTTP_MAX_ATTEMPTS,
-            _HTTP_RETRY_DELAY_S,
+            delay_s,
             format_error(response),
         )
-        await asyncio.sleep(_HTTP_RETRY_DELAY_S)
+        await asyncio.sleep(delay_s)
     return parse_completion_response(response, request_url=url)
 
 

@@ -14,6 +14,9 @@
 
 """Canonical HF receive hooks for Megatron inference storage."""
 
+import asyncio
+import threading
+import time
 from collections import Counter
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -338,3 +341,86 @@ def test_quantized_fused_destination_commits_values_and_scales_on_current_stream
         old_data = destination._rowwise_data.clone()
         assert worker._generation_m2n_pending == {}
     assert observed_streams == [stream, stream]
+
+
+@pytest.fixture
+def running_loop():
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    yield loop
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+    loop.close()
+
+
+def _loop_turns(loop, ticks: list[int]) -> None:
+    """Count the loop's turns, as the engine loop would take the GIL."""
+
+    def tick() -> None:
+        ticks.append(1)
+        loop.call_later(0.001, tick)
+
+    loop.call_soon_threadsafe(tick)
+
+
+@pytest.mark.parametrize("enabled_env", ["1", None])
+def test_engine_loop_is_held_during_the_refit_copy_only_when_asked(
+    running_loop, monkeypatch, enabled_env
+):
+    if enabled_env is None:
+        monkeypatch.delenv("NRL_FREEZE_ENGINE_LOOP_ON_REFIT", raising=False)
+    else:
+        monkeypatch.setenv("NRL_FREEZE_ENGINE_LOOP_ON_REFIT", enabled_env)
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    worker._inference_loop = running_loop
+    worker.rank = 0
+    ticks: list[int] = []
+    _loop_turns(running_loop, ticks)
+    time.sleep(0.05)
+
+    with worker._engine_loop_held(enabled=True):
+        during_start = len(ticks)
+        time.sleep(0.05)
+        during = len(ticks) - during_start
+    time.sleep(0.05)
+
+    if enabled_env == "1":
+        assert during == 0
+    else:
+        assert during > 0
+    # Released (or never held): the loop keeps turning afterwards.
+    assert len(ticks) > during_start + during
+
+
+def test_engine_loop_hold_gives_up_when_the_loop_never_gets_there(
+    running_loop, monkeypatch, capsys
+):
+    monkeypatch.setenv("NRL_FREEZE_ENGINE_LOOP_ON_REFIT", "1")
+    worker = object.__new__(MegatronGenerationRefitMixin)
+    worker._inference_loop = running_loop
+    worker._engine_loop_hold_wait_s = 0.05
+    worker.rank = 3
+    # The loop is busy (as a rank stuck in a step collective would be).
+    busy = threading.Event()
+    running_loop.call_soon_threadsafe(busy.wait)
+
+    entered = False
+    with worker._engine_loop_held(enabled=True):
+        entered = True
+    busy.set()
+
+    assert entered
+    assert "did not reach the refit hold" in capsys.readouterr().out
+
+
+def test_sending_side_and_trainers_never_hold_a_loop(monkeypatch):
+    monkeypatch.setenv("NRL_FREEZE_ENGINE_LOOP_ON_REFIT", "1")
+    trainer = object.__new__(MegatronGenerationRefitMixin)
+    with trainer._engine_loop_held(enabled=True):
+        pass
+    loop = MagicMock()
+    trainer._inference_loop = loop
+    with trainer._engine_loop_held(enabled=False):
+        pass
+    loop.call_soon_threadsafe.assert_not_called()

@@ -544,6 +544,34 @@ def test_dynamo_worker_requires_the_megatron_dynamo_integration(monkeypatch):
         require_megatron_dynamo_integration()
 
 
+@pytest.mark.parametrize("has_inference", [True, False])
+def test_megatron_inference_is_exposed_from_the_source_tree(
+    monkeypatch, tmp_path, has_inference
+):
+    """An editable megatron-core leaves megatron.inference off the package path."""
+    source = tmp_path / "megatron"
+    (source / "core").mkdir(parents=True)
+    (source / "core" / "__init__.py").write_text("")
+    if has_inference:
+        (source / "inference").mkdir()
+    package = types.ModuleType("megatron")
+    package.__path__ = [str(tmp_path / "site-packages" / "megatron")]
+    core = types.ModuleType("megatron.core")
+    core.__file__ = str(source / "core" / "__init__.py")
+    package.core = core
+    monkeypatch.setitem(sys.modules, "megatron", package)
+    monkeypatch.setitem(sys.modules, "megatron.core", core)
+
+    dynamo_worker_mixin._expose_megatron_inference_package()
+    # Idempotent: a second call adds nothing.
+    dynamo_worker_mixin._expose_megatron_inference_package()
+
+    expected = [str(tmp_path / "site-packages" / "megatron")]
+    if has_inference:
+        expected.append(str(source.resolve()))
+    assert package.__path__ == expected
+
+
 def test_attach_dynamo_events_retries_until_ready_and_pins_the_address(
     dynamo_endpoint_env,
 ):

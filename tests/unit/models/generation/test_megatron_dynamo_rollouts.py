@@ -187,12 +187,27 @@ def test_completion_retry_predicate(response, expected) -> None:
     assert rollouts.is_retryable(response) is expected
 
 
+def test_completion_retries_outlast_a_weight_update() -> None:
+    delays = [rollouts.retry_delay_s(a) for a in range(1, rollouts._HTTP_MAX_ATTEMPTS)]
+    assert delays == sorted(delays)
+    assert max(delays) <= rollouts._HTTP_MAX_RETRY_DELAY_S
+    # A weight update pauses the engines for a few seconds; requests sent then
+    # must keep retrying well past it.
+    assert sum(delays) >= 60.0
+
+
 @pytest.mark.parametrize(
     ("statuses", "token_ids", "error", "attempts"),
     [
         pytest.param([503, None], [8], None, 2, id="recovers"),
         pytest.param([400], None, "HTTP 400", 1, id="nonretryable"),
-        pytest.param([503, 503, 503], None, "HTTP 503", 3, id="exhausted"),
+        pytest.param(
+            [503] * rollouts._HTTP_MAX_ATTEMPTS,
+            None,
+            "HTTP 503",
+            rollouts._HTTP_MAX_ATTEMPTS,
+            id="exhausted",
+        ),
     ],
 )
 def test_completion_retries_transient_failures(

@@ -750,6 +750,18 @@ def select_segment_nodes(
     return selected_node_ids, remaining_node_ids
 
 
+def _node_ips(node_ids: Sequence[str]) -> dict[str, str]:
+    """IP of each alive Ray node in ``node_ids``; empty when Ray is not running."""
+    if not ray.is_initialized():
+        return {}
+    wanted = set(node_ids)
+    return {
+        node["NodeID"]: node["NodeManagerAddress"]
+        for node in ray.nodes()
+        if node.get("Alive", False) and node.get("NodeID") in wanted
+    }
+
+
 def prepare_segment_topology(
     segment_size: int | None,
     num_nodes: int,
@@ -799,7 +811,16 @@ def prepare_segment_topology(
     selected_node_ids, remaining_node_ids = select_segment_nodes(
         topology, segment_size, num_nodes
     )
-    node_resource_constraints = [{topology[nid][0]: 0.001} for nid in selected_node_ids]
+    # The domain alone does not name a node: when the nodes left for another
+    # role share a domain with these, a placement group asking for "node i"
+    # could take theirs. Pinning Ray's per-node resource as well keeps each
+    # logical node on the node selected for it.
+    node_ips = _node_ips(selected_node_ids)
+    node_resource_constraints = [
+        {topology[nid][0]: 0.001}
+        | ({f"node:{node_ips[nid]}": 0.001} if nid in node_ips else {})
+        for nid in selected_node_ids
+    ]
     print(
         f"  ✓ Topology-aware allocation: {num_nodes} {role} nodes in "
         f"{len(set(topology[nid][0] for nid in selected_node_ids))} NVLink domains "
