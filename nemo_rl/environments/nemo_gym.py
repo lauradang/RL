@@ -485,7 +485,8 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         return False
 
     generation_config = master_config.policy["generation"]
-    if dynamo_enabled(generation_config):
+    # Megatron engines behind Dynamo serve Gym through their own frontend proxy.
+    if dynamo_enabled(generation_config) and generation_config["backend"] != "megatron":
         raise ValueError(
             "policy.generation.dynamo=true does not serve NeMo-Gym rollouts yet. "
             "Set policy.generation.dynamo=false to run this NeMo-Gym config on "
